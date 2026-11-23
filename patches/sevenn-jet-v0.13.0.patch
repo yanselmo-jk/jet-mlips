@@ -1,0 +1,4795 @@
+diff --git a/sevenn/_const.py b/sevenn/_const.py
+index 0e411d7..8447242 100644
+--- a/sevenn/_const.py
++++ b/sevenn/_const.py
+@@ -132,6 +132,9 @@ DEFAULT_E3_EQUIVARIANT_MODEL_CONFIG = {
+     KEY.USE_FLASH_TP: False,
+     KEY.CUEQUIVARIANCE_CONFIG: {},
+     KEY.USE_OEQ: False,
++    KEY.USE_JET: False,
++    KEY.JET_RADIAL_TABLE: 0,
++    KEY.JET_EXACT_BACKWARD: 'split',
+ }
+ 
+ 
+@@ -180,6 +183,9 @@ MODEL_CONFIG_CONDITION = {
+     KEY.USE_FLASH_TP: bool,
+     KEY.CUEQUIVARIANCE_CONFIG: dict,
+     KEY.USE_OEQ: bool,
++    KEY.USE_JET: bool,
++    KEY.JET_RADIAL_TABLE: int,
++    KEY.JET_EXACT_BACKWARD: str,
+ }
+ 
+ 
+diff --git a/sevenn/_keys.py b/sevenn/_keys.py
+index 31d29ae..ec8c5f9 100644
+--- a/sevenn/_keys.py
++++ b/sevenn/_keys.py
+@@ -44,6 +44,15 @@ MODAL_ATTR: Final[str] = (
+ MODAL_TYPE: Final[str] = 'modal_type'  # (1) one-hot index of modal
+ EDGE_ATTR: Final[str] = 'edge_attr'  # (from spherical harmonics)
+ EDGE_EMBEDDING: Final[str] = 'edge_embedding'  # (from edge embedding)
++BESSEL_COEFFS: Final[str] = 'bessel_coeffs'  # (n_basis,) jet inference path
++# jet inference path: dst-grouped edge order, built once per step by the first conv layer (or given
++# by the caller): rowptr int32 (n_local+1), perm int32 (E), src int32 (E); E may exceed the real edge count
++JET_ROWPTR: Final[str] = 'jet_rowptr'
++JET_PERM: Final[str] = 'jet_perm'
++JET_SRC: Final[str] = 'jet_src'
++# halo pruning (L-hop halo replication): CPU int64 [n_1, ..., n_L] of the rows each convolution
++# layer t must fill (n_L = nlocal); absent = every layer fills all rows of its input
++JET_LAYER_NOUT: Final[str] = 'jet_layer_nout'
+ 
+ # inputs of loss function
+ ENERGY: Final[str] = 'total_energy'  # (1)
+@@ -231,6 +240,9 @@ TRAIN_AVG_NUM_NEIGH = 'train_avg_num_neigh'  # deprecated
+ USE_FLASH_TP = 'use_flash_tp'
+ CUEQUIVARIANCE_CONFIG = 'cuequivariance_config'
+ USE_OEQ = 'use_oeq'
++USE_JET = 'use_jet'
++JET_RADIAL_TABLE = 'jet_radial_table'  # grid points; 0 = exact radial MLP
++JET_EXACT_BACKWARD = 'jet_exact_backward'  # exact radial MLP backward: 'split' (E x 64 fp32 buffer) or 'recompute' (no buffer)
+ 
+ _NORMALIZE_SPH = '_normalize_sph'
+ OPTIMIZE_BY_REDUCE = 'optimize_by_reduce'
+diff --git a/sevenn/calculator.py b/sevenn/calculator.py
+index 803ad77..9deef02 100644
+--- a/sevenn/calculator.py
++++ b/sevenn/calculator.py
+@@ -35,6 +35,9 @@ class SevenNetCalculator(Calculator):
+         enable_cueq: bool = False,
+         enable_flash: bool = False,
+         enable_oeq: bool = False,
++        enable_jet: bool = False,
++        radial_table: bool = True,
++        exact_backward: str = 'split',
+         compute_atomic_virial: bool = False,
+         sevennet_config: Optional[Dict] = None,  # Not used in logic, just meta info
+         **kwargs,
+@@ -63,6 +66,15 @@ class SevenNetCalculator(Calculator):
+             if True, use FlashTP to accelerate inference.
+         enable_oeq: bool, default=False
+             if True, use OpenEquivariance to accelerate inference.
++        enable_jet: bool, default=False
++            if True, use jet (fused convolution kernel) to accelerate inference.
++        radial_table: bool | int, default=True
++            jet only. Replace the per-edge radial MLP by a table over [0, cutoff] (cubic Hermite
++            interpolation): True = jet_mlip's default grid size, N = N grid points, False / 0 =
++            exact MLP. Inference only.
++        exact_backward: str, default='split'
++            jet only, exact MLP only (radial_table=0): backward of the radial MLP, 'split' (two
++            kernels, a transient E x 64 fp32 buffer) or 'recompute' (one kernel, no buffer).
+         sevennet_config: dict | None, default=None
+             Not used, but can be used to carry meta information of this calculator
+         compute_atomic_virial: bool, default=False
+@@ -88,8 +100,9 @@ class SevenNetCalculator(Calculator):
+         enable_cueq = os.getenv('SEVENNET_ENABLE_CUEQ') == '1' or enable_cueq
+         enable_flash = os.getenv('SEVENNET_ENABLE_FLASH') == '1' or enable_flash
+         enable_oeq = os.getenv('SEVENNET_ENABLE_OEQ') == '1' or enable_oeq
++        enable_jet = os.getenv('SEVENNET_ENABLE_JET') == '1' or enable_jet
+ 
+-        if not (enable_cueq or enable_flash or enable_oeq):
++        if not (enable_cueq or enable_flash or enable_oeq or enable_jet):
+             util.warn_no_tp_accelerator('SevenNetCalculator')
+ 
+         if enable_cueq and file_type == 'model_instance':
+@@ -104,6 +117,12 @@ class SevenNetCalculator(Calculator):
+             )
+             enable_oeq = False
+ 
++        if enable_jet and file_type == 'model_instance':
++            warnings.warn(
++                'file_type should be checkpoint to enable jet. jet set to False'
++            )
++            enable_jet = False
++
+         if isinstance(device, str):  # TODO: do we really need this?
+             if device == 'auto':
+                 self.device = torch.device(
+@@ -118,9 +137,18 @@ class SevenNetCalculator(Calculator):
+             cp = util.load_checkpoint(model)
+ 
+             model_loaded = cp.build_model(
+-                enable_cueq=enable_cueq, enable_flash=enable_flash, enable_oeq=enable_oeq  # noqa: E501
++                enable_cueq=enable_cueq,
++                enable_flash=enable_flash,
++                enable_oeq=enable_oeq,
++                enable_jet=enable_jet,
++                radial_table=radial_table,
++                exact_backward=exact_backward,
+             )
+             model_loaded.set_is_batch_data(False)
++            model_loaded.requires_grad_(False)
++            if enable_jet:
++                from sevenn.nn.jet_helper import optimize_for_inference
++                optimize_for_inference(model_loaded)
+ 
+             self.type_map = cp.config[KEY.TYPE_MAP]
+             self.cutoff = cp.config[KEY.CUTOFF]
+@@ -243,6 +271,7 @@ class SevenNetD3Calculator(SumCalculator):
+         enable_cueq: bool = False,
+         enable_flash: bool = False,
+         enable_oeq: bool = False,
++        enable_jet: bool = False,
+         sevennet_config: Optional[Any] = None,
+         damping_type: str = 'damp_bj',
+         functional_name: str = 'pbe',
+@@ -273,6 +302,8 @@ class SevenNetD3Calculator(SumCalculator):
+             if True, use flashTP backend.
+         enable_oeq: bool, default=False
+             if True, use OpenEquivariance backend.
++        enable_jet: bool, default=False
++            if True, use jet backend.
+         sevennet_config: dict | None, default=None
+             hold meta information
+         damping_type: str, default='damp_bj'
+@@ -307,6 +338,7 @@ class SevenNetD3Calculator(SumCalculator):
+             enable_cueq=enable_cueq,
+             enable_flash=enable_flash,
+             enable_oeq=enable_oeq,
++            enable_jet=enable_jet,
+             sevennet_config=sevennet_config,
+             **kwargs,
+         )
+diff --git a/sevenn/checkpoint.py b/sevenn/checkpoint.py
+index 0d0d57d..461ea5e 100644
+--- a/sevenn/checkpoint.py
++++ b/sevenn/checkpoint.py
+@@ -21,8 +21,13 @@ from sevenn.nn.scale import get_resolved_shift_scale
+ from sevenn.nn.sequential import AtomGraphSequential
+ 
+ 
+-def _solve_accelerator(enable_cueq: bool, enable_flash: bool, enable_oeq: bool):
+-    if sum([enable_cueq, enable_flash, enable_oeq]) > 1:
++def _solve_accelerator(
++    enable_cueq: bool,
++    enable_flash: bool,
++    enable_oeq: bool,
++    enable_jet: bool = False,
++):
++    if sum([enable_cueq, enable_flash, enable_oeq, enable_jet]) > 1:
+         raise ValueError('Only one TP accelerator can be enabled.')
+     if enable_cueq:
+         import sevenn.nn.cue_helper as cue_helper
+@@ -52,8 +57,16 @@ def _solve_accelerator(enable_cueq: bool, enable_flash: bool, enable_oeq: bool):
+                 )
+             )
+             enable_oeq = False
++    elif enable_jet:
++        import sevenn.nn.jet_helper as jet_helper
++        if not jet_helper.is_jet_available():
++            warnings.warn(
++                'jet is requested, but the package is not installed. '
++                'Fallback to e3nn.'
++            )
++            enable_jet = False
+ 
+-    return enable_cueq, enable_flash, enable_oeq
++    return enable_cueq, enable_flash, enable_oeq, enable_jet
+ 
+ 
+ def assert_atoms(
+@@ -258,6 +271,8 @@ class SevenNetCheckpoint:
+             'Elements': len(cfg.get('chemical_species', [])),
+             'cuEquivariance used': cp_using_cueq,
+             'FlashTP used': self.config.get('use_flash_tp', False),
++            'OpenEquivariance used': self.config.get(KEY.USE_OEQ, False),
++            'jet used': self.config.get(KEY.USE_JET, False),
+         }
+         if cfg.get('use_modality', False):
+             dct['Modality'] = ', '.join(list(cfg.get('_modal_map', {}).keys()))
+@@ -348,6 +363,9 @@ class SevenNetCheckpoint:
+         enable_cueq: bool = False,
+         enable_flash: bool = False,
+         enable_oeq: bool = False,
++        enable_jet: bool = False,
++        radial_table: bool = True,
++        exact_backward: str = 'split',
+         _flash_lammps: bool = False,
+     ) -> AtomGraphSequential:
+         from .model_build import build_E3_equivariant_model
+@@ -358,20 +376,29 @@ class SevenNetCheckpoint:
+             cp_using_cueq = False
+         cp_using_flash = self.config.get(KEY.USE_FLASH_TP, False)
+         cp_using_oeq = self.config.get(KEY.USE_OEQ, False)
++        cp_using_jet = self.config.get(KEY.USE_JET, False)
+ 
+-        enable_cueq, enable_flash, enable_oeq = _solve_accelerator(
+-            enable_cueq, enable_flash, enable_oeq
++        enable_cueq, enable_flash, enable_oeq, enable_jet = _solve_accelerator(
++            enable_cueq, enable_flash, enable_oeq, enable_jet
+         )
+ 
+         assert not _flash_lammps or enable_flash
+         cfg_new = self.config
+         cfg_new['_flash_lammps'] = _flash_lammps
+         cfg_new[KEY.USE_OEQ] = enable_oeq
++        cfg_new[KEY.USE_JET] = enable_jet
++        if enable_jet:
++            from sevenn.nn.jet_helper import table_size
++            cfg_new[KEY.JET_RADIAL_TABLE] = table_size(radial_table)
++        else:
++            cfg_new[KEY.JET_RADIAL_TABLE] = 0
++        cfg_new[KEY.JET_EXACT_BACKWARD] = exact_backward
+ 
+-        if (cp_using_cueq, cp_using_flash, cp_using_oeq) == (
++        if (cp_using_cueq, cp_using_flash, cp_using_oeq, cp_using_jet) == (
+             enable_cueq,
+             enable_flash,
+             enable_oeq,
++            enable_jet,
+         ):
+             # backend not given, or checkpoint backend is same as requested
+             model = build_E3_equivariant_model(cfg_new)
+@@ -388,6 +415,7 @@ class SevenNetCheckpoint:
+             cfg_new[KEY.CUEQUIVARIANCE_CONFIG] = {'use': enable_cueq}
+             cfg_new[KEY.USE_FLASH_TP] = enable_flash
+             cfg_new[KEY.USE_OEQ] = enable_oeq
++            cfg_new[KEY.USE_JET] = enable_jet
+             model = build_E3_equivariant_model(cfg_new)
+             stct_src = compat.patch_state_dict_if_old(
+                 self.model_state_dict, self.config, model
+@@ -572,6 +600,14 @@ class SevenNetCheckpoint:
+ 
+         # finally, prepare updated continuable state dict using above
+         orig_model = self.build_model(enable_cueq=False, enable_flash=False)
++        # The appended state dict is e3nn layout, so the config must not
++        # claim an accelerator.
++        dst_config[KEY.CUEQUIVARIANCE_CONFIG] = {'use': False}
++        dst_config[KEY.USE_FLASH_TP] = False
++        dst_config[KEY.USE_OEQ] = False
++        dst_config[KEY.USE_JET] = False
++        dst_config[KEY.JET_RADIAL_TABLE] = 0
++        dst_config[KEY.JET_EXACT_BACKWARD] = 'split'
+         orig_state_dict = orig_model.state_dict()
+ 
+         new_state_dict = copy_state_dict(orig_state_dict)
+diff --git a/sevenn/main/sevenn.py b/sevenn/main/sevenn.py
+index 43da4a3..14ffe5e 100644
+--- a/sevenn/main/sevenn.py
++++ b/sevenn/main/sevenn.py
+@@ -48,6 +48,7 @@ def run(args):
+     use_cue = args.enable_cueq
+     use_flash = args.enable_flash
+     use_oeq = args.enable_oeq
++    use_jet = args.enable_jet
+ 
+     if use_cue:
+         import sevenn.nn.cue_helper
+@@ -67,6 +68,12 @@ def run(args):
+         if not sevenn.nn.oeq_helper.is_oeq_available():
+             raise ImportError('OpenEquivariance not installed or no GPU found.')
+ 
++    if use_jet:
++        import sevenn.nn.jet_helper
++
++        if not sevenn.nn.jet_helper.is_jet_available():
++            raise ImportError('jet not installed.')
++
+     if working_dir is None:
+         working_dir = os.getcwd()
+     elif not os.path.isdir(working_dir):
+@@ -128,6 +135,9 @@ def run(args):
+         if use_oeq:
+             model_config[KEY.USE_OEQ] = True
+ 
++        if use_jet:
++            model_config[KEY.USE_JET] = True
++
+         logger.print_config(model_config, data_config, train_config)
+         # don't have to distinguish configs inside program
+         global_config.update(model_config)
+@@ -181,6 +191,12 @@ def cmd_parser_train(parser):
+         help='use OpenEquivariance accelerations for training',
+         action='store_true',
+     )
++    ag.add_argument(
++        '-jet',
++        '--enable_jet',
++        help='use jet (fused convolution) accelerations for training',
++        action='store_true',
++    )
+     ag.add_argument(
+         '-w',
+         '--working_dir',
+diff --git a/sevenn/main/sevenn_get_model.py b/sevenn/main/sevenn_get_model.py
+index 8f7bcdb..906e15b 100644
+--- a/sevenn/main/sevenn_get_model.py
++++ b/sevenn/main/sevenn_get_model.py
+@@ -56,6 +56,33 @@ def add_args(parser):
+         help='use OpenEquivariance. LAMMPS must be specially compiled.',
+         action='store_true',
+     )
++    ag.add_argument(
++        '-jet',
++        '--enable_jet',
++        help='use jet fused convolution. LAMMPS must be specially compiled.',
++        action='store_true',
++    )
++    ag.add_argument(
++        '--radial_table',
++        help='jet only: replace the per-edge radial MLP by a table of N grid points over [0, cutoff] '
++             '(cubic Hermite; default on, jet_mlip default size). 0 or --no-radial_table = exact MLP.',
++        type=int,
++        default=True,
++    )
++    ag.add_argument(
++        '--no-radial_table',
++        dest='radial_table',
++        help='jet only: exact radial MLP (= --radial_table 0).',
++        action='store_const',
++        const=0,
++    )
++    ag.add_argument(
++        '--exact_backward',
++        help='jet only, exact MLP only (--radial_table 0): split (default): two backward kernels, '
++             'a transient E x 64 fp32 buffer; recompute: one kernel, no buffer.',
++        choices=['split', 'recompute'],
++        default='split',
++    )
+     ag.add_argument(
+         '-mliap',
+         '--use_mliap',
+@@ -75,7 +102,12 @@ def run(args):
+     use_flash = args.enable_flash
+     use_cueq = args.enable_cueq
+     use_oeq = args.enable_oeq
++    use_jet = args.enable_jet
++    radial_table = args.radial_table
++    exact_backward = args.exact_backward
+     use_mliap = args.use_mliap
++    if exact_backward != 'split' and not use_jet:
++        raise ValueError('--exact_backward requires --enable_jet.')
+ 
+     # Check dependencies
+     if use_flash:
+@@ -96,6 +128,12 @@ def run(args):
+         if not is_oeq_available():
+             raise ImportError('OpenEquivariance not installed or no GPU found.')
+ 
++    if use_jet:
++        from sevenn.nn.jet_helper import is_jet_available
++
++        if not is_jet_available():
++            raise ImportError('jet not installed.')
++
+     if use_cueq and not use_mliap:
+         raise ValueError('cuEquivariance is only supported in ML-IAP interface.')
+ 
+@@ -119,13 +157,13 @@ def run(args):
+         from sevenn.scripts.deploy import deploy, deploy_parallel
+ 
+         if get_serial:
+-            deploy(checkpoint_path, output_prefix, modal, use_flash=use_flash, use_oeq=use_oeq)  # noqa: E501
++            deploy(checkpoint_path, output_prefix, modal, use_flash=use_flash, use_oeq=use_oeq, use_jet=use_jet, radial_table=radial_table, exact_backward=exact_backward)  # noqa: E501
+         else:
+-            deploy_parallel(checkpoint_path, output_prefix, modal, use_flash=use_flash, use_oeq=use_oeq)  # noqa: E501
++            deploy_parallel(checkpoint_path, output_prefix, modal, use_flash=use_flash, use_oeq=use_oeq, use_jet=use_jet, radial_table=radial_table, exact_backward=exact_backward)  # noqa: E501
+     else:
+         from sevenn import mliap
+ 
+-        if not (use_cueq or use_flash or use_oeq):
++        if not (use_cueq or use_flash or use_oeq or use_jet):
+             sevenn.util.warn_no_tp_accelerator(
+                 'LAMMPS ML-IAP deployment',
+             )
+@@ -139,6 +177,9 @@ def run(args):
+             use_cueq=use_cueq,
+             use_flash=use_flash,
+             use_oeq=use_oeq,
++            use_jet=use_jet,
++            radial_table=radial_table,
++            exact_backward=exact_backward,
+         )
+         torch.save(mliap_module, output_prefix)
+ 
+diff --git a/sevenn/main/sevenn_inference.py b/sevenn/main/sevenn_inference.py
+index e253194..1f4c79b 100644
+--- a/sevenn/main/sevenn_inference.py
++++ b/sevenn/main/sevenn_inference.py
+@@ -85,6 +85,12 @@ def add_args(parser):
+         help='use OpenEquivariance to accelerate inference',
+         action='store_true',
+     )
++    ag.add_argument(
++        '-jet',
++        '--enable_jet',
++        help='use jet fused convolution to accelerate inference',
++        action='store_true',
++    )
+     ag.add_argument(
+         '--kwargs',
+         nargs=argparse.REMAINDER,
+@@ -143,6 +149,11 @@ def run(args):
+         if not is_oeq_available():
+             raise ImportError('OpenEquivariance not installed or no GPU found.')
+ 
++    if args.enable_jet:
++        from sevenn.nn.jet_helper import is_jet_available
++        if not is_jet_available():
++            raise ImportError('jet not installed.')
++
+     inference(
+         cp,
+         targets,
+@@ -156,6 +167,7 @@ def run(args):
+         enable_cueq=args.enable_cueq,
+         enable_flash=args.enable_flash,
+         enable_oeq=args.enable_oeq,
++        enable_jet=args.enable_jet,
+         **fmt_kwargs,
+     )
+ 
+diff --git a/sevenn/main/sevenn_patch_lammps.py b/sevenn/main/sevenn_patch_lammps.py
+index e90b1c7..b63c3de 100644
+--- a/sevenn/main/sevenn_patch_lammps.py
++++ b/sevenn/main/sevenn_patch_lammps.py
+@@ -36,6 +36,16 @@ def add_args(parser):
+         help='Enable OpenEquivariance',
+         action='store_true',
+     )
++    ag.add_argument(
++        '--jet',
++        '--enable_jet',
++        dest='jet',
++        nargs='?',
++        const='auto',
++        default=None,
++        metavar='SO',
++        help='Enable jet; optional path to its .so (default: installed one)',
++    )
+     # cxx_standard is detected automatically
+ 
+ 
+@@ -66,6 +76,20 @@ def run(args):
+             raise ValueError(f'OEQ .so file not found: {so_oeq}')
+         print(f'  - OEQ support enabled: {so_oeq}')
+ 
++    so_jet = ''
++    if args.jet:
++        if args.jet == 'auto':
++            try:
++                import jet_mlip
++            except ImportError:
++                raise ImportError('jet import failed.')
++            so_jet = jet_mlip.library_path()
++        else:
++            so_jet = osp.abspath(args.jet)
++        if not osp.isfile(so_jet):
++            raise ValueError(f'jet .so file not found: {so_jet}')
++        print(f'  - jet support enabled: {so_jet}')
++
+     so_lammps = ''
+     if args.enable_flash:
+         try:
+@@ -112,6 +136,9 @@ def run(args):
+         assert osp.isfile(so_oeq)
+         cmd += f' {so_oeq}'
+ 
++    if args.jet:
++        cmd += f' --jet {so_jet}'
++
+     res = subprocess.run(cmd.split())
+     return res.returncode  # is it meaningless?
+ 
+diff --git a/sevenn/mliap.py b/sevenn/mliap.py
+index 513d55c..365f72b 100644
+--- a/sevenn/mliap.py
++++ b/sevenn/mliap.py
+@@ -37,7 +37,7 @@ class MLIAPWrappedConvolution(nn.Module):
+         )
+ 
+     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+-        nlocal = int(data[KEY.MLIAP_NUM_LOCAL_GHOST][0].item())
++        nlocal = data[KEY.MLIAP_NUM_LOCAL_GHOST][0]  # python int (no .item() sync)
+ 
+         data[KEY.NODE_FEATURE] = torch.narrow(data[KEY.NODE_FEATURE], 0, 0, nlocal)
+         data = self.ghost_exchange(data)
+@@ -63,7 +63,7 @@ class MLIAPWrappedIrrepsLinear(nn.Module):
+         )
+ 
+     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+-        nlocal = int(data[KEY.MLIAP_NUM_LOCAL_GHOST][0].item())
++        nlocal = data[KEY.MLIAP_NUM_LOCAL_GHOST][0]  # python int (no .item() sync)
+ 
+         for k in self._keys_to_narrow:
+             data[k] = torch.narrow(data[k], 0, 0, nlocal)
+@@ -112,6 +112,9 @@ class SevenNetMLIAPWrapper(MLIAPUnified):
+         self.use_cueq = kwargs.get('use_cueq', False)
+         self.use_flash = kwargs.get('use_flash', False)
+         self.use_oeq = kwargs.get('use_oeq', False)
++        self.use_jet = kwargs.get('use_jet', False)
++        self.radial_table = kwargs.get('radial_table', True)
++        self.exact_backward = str(kwargs.get('exact_backward', 'split'))
+         self.modal = kwargs.get('modal', None)
+ 
+         # extract configs
+@@ -151,10 +154,18 @@ class SevenNetMLIAPWrapper(MLIAPUnified):
+         if self.model is not None:
+             return  # Already initialized
+         print('[INFO] Lazy initializing SevenNet model...', flush=True)
+-        print(f'[INFO] cueq={self.use_cueq}, flashTP={self.use_flash}, oeq={self.use_oeq}', flush=True)  # noqa: E501
++        print(f'[INFO] cueq={self.use_cueq}, flashTP={self.use_flash}, oeq={self.use_oeq}, jet={self.use_jet}', flush=True)  # noqa: E501
+         model = self.cp.build_model(
+-            enable_cueq=self.use_cueq, enable_flash=self.use_flash, enable_oeq=self.use_oeq  # noqa: E501
++            enable_cueq=self.use_cueq,
++            enable_flash=self.use_flash,
++            enable_oeq=self.use_oeq,
++            enable_jet=self.use_jet,
++            radial_table=self.radial_table,
++            exact_backward=self.exact_backward,
+         )
++        if self.use_jet:
++            from sevenn.nn.jet_helper import optimize_for_inference
++            optimize_for_inference(model)
+ 
+         for k, module in model._modules.items():
+             if k.endswith('_convolution'):
+@@ -171,6 +182,7 @@ class SevenNetMLIAPWrapper(MLIAPUnified):
+         self.model = model
+         self.model.to(self.device)
+         self.model.eval()
++        self.model.requires_grad_(False)
+ 
+     # -------- unified entrypoint --------
+     def compute_forces(self, lmp_data):
+@@ -183,14 +195,15 @@ class SevenNetMLIAPWrapper(MLIAPUnified):
+         ntotal = lmp_data.ntotal
+         no_pairs = lmp_data.npairs <= 1
+ 
+-        # edge_vectors should be f32 in 7net
++        # edge_vectors should be f32 in 7net (the one fp64->fp32 copy per step).
++        # jet's conv takes int32 indices: keep LAMMPS' int32 (zero-copy view,
++        # one vstack); the e3nn/cueq convs need int64 for indexing.
++        idx_dtype = torch.int32 if self.use_jet else torch.int64
+         if no_pairs:
+             edge_vectors = torch.zeros(
+                 (0, 3), dtype=torch.float32, device=self.device
+             )
+-            edge_index = torch.zeros(
+-                (2, 0), dtype=torch.int64, device=self.device
+-            )
++            edge_index = torch.zeros((2, 0), dtype=idx_dtype, device=self.device)
+         else:
+             edge_vectors = torch.as_tensor(
+                 lmp_data.rij, dtype=torch.float32, device=self.device
+@@ -198,10 +211,10 @@ class SevenNetMLIAPWrapper(MLIAPUnified):
+             edge_index = torch.vstack(
+                 [
+                     torch.as_tensor(
+-                        lmp_data.pair_i, dtype=torch.int64, device=self.device
++                        lmp_data.pair_i, dtype=idx_dtype, device=self.device
+                     ),
+                     torch.as_tensor(
+-                        lmp_data.pair_j, dtype=torch.int64, device=self.device
++                        lmp_data.pair_j, dtype=idx_dtype, device=self.device
+                     ),
+                 ]
+             )
+@@ -209,20 +222,15 @@ class SevenNetMLIAPWrapper(MLIAPUnified):
+         elems = torch.as_tensor(
+             lmp_data.elems, dtype=torch.int64, device=self.device
+         )
+-        num_atoms = torch.as_tensor(nlocal, dtype=torch.int64, device=self.device)
+-        mliap_num_local_ghost = torch.as_tensor(
+-            [nlocal, ntotal - nlocal], dtype=torch.int64, device=self.device
+-        )
+ 
+         # data prep
+         data = {
+             KEY.EDGE_IDX: edge_index,
+             KEY.EDGE_VEC: edge_vectors,
+             KEY.ATOMIC_NUMBERS: elems,
+-            KEY.NUM_ATOMS: num_atoms,
+-            KEY.MLIAP_NUM_LOCAL_GHOST: mliap_num_local_ghost,
++            # python ints, read by the wrappers/ghost exchange without .item()
++            KEY.MLIAP_NUM_LOCAL_GHOST: (nlocal, ntotal - nlocal),
+             KEY.LAMMPS_DATA: lmp_data,
+-            KEY.USE_MLIAP: torch.as_tensor(True, dtype=torch.bool),
+         }
+ 
+         # infer
+diff --git a/sevenn/model_build.py b/sevenn/model_build.py
+index 6975e2c..94b5c79 100644
+--- a/sevenn/model_build.py
++++ b/sevenn/model_build.py
+@@ -302,11 +302,14 @@ def patch_cue(layers: OrderedDict, config: Dict[str, Any]) -> OrderedDict:
+ 
+ 
+ def patch_flash_tp(layers: OrderedDict, config: Dict[str, Any]) -> OrderedDict:
+-    import sevenn.nn.flash_helper as flash_helper
+-
+     if not config.get('use_flash_tp', False):
+         return layers
+ 
++    # Import only when used: importing flashTP_e3nn loads its LAMMPS op library,
++    # which a FlashTP-linked lmp has already registered (ML-IAP path imports sevenn
++    # inside lmp) -> "Tried to register an operator ... multiple times".
++    import sevenn.nn.flash_helper as flash_helper
++
+     if not flash_helper.is_flash_available():
+         warnings.warn(
+             (
+@@ -351,11 +354,43 @@ def patch_oeq(layers: OrderedDict, config: Dict[str, Any]) -> OrderedDict:
+     return layers
+ 
+ 
++def patch_jet(layers: OrderedDict, config: Dict[str, Any]) -> OrderedDict:
++    import sevenn.nn.jet_helper as jet_helper
++
++    if not config.get(KEY.USE_JET, False):
++        return layers
++
++    if not jet_helper.is_jet_available():
++        warnings.warn(
++            'jet is requested, but the package is not installed. '
++            'Fallback to e3nn.'
++        )
++        return layers
++
++    # every (parallel) segment has its own 'edge_embedding' in front
++    edge_embedding = layers['edge_embedding']
++    updates = {'edge_embedding': jet_helper.patch_edge_embedding(edge_embedding)}
++    for k, module in layers.items():
++        if isinstance(module, IrrepsConvolution):
++            t = k.split('_')[0]  # '{t}_convolution'
++            live_irreps = layers[f'{t}_self_interaction_2'].irreps_out
++            updates[k] = jet_helper.patch_convolution(
++                module, live_irreps, edge_embedding,
++                int(config.get(KEY.JET_RADIAL_TABLE, 0)),
++                str(config.get(KEY.JET_EXACT_BACKWARD, 'split')),
++                int(t),  # block index: indexes jet_layer_nout (halo pruning)
++            )
++
++    layers.update(updates)
++    return layers
++
++
+ def patch_modules(layers: OrderedDict, config: Dict[str, Any]) -> OrderedDict:
+     layers = patch_modality(layers, config)
+     layers = patch_cue(layers, config)
+     layers = patch_flash_tp(layers, config)
+     layers = patch_oeq(layers, config)
++    layers = patch_jet(layers, config)
+     return layers
+ 
+ 
+diff --git a/sevenn/nn/_ghost_exchange.py b/sevenn/nn/_ghost_exchange.py
+index f60fb75..86f2fe2 100644
+--- a/sevenn/nn/_ghost_exchange.py
++++ b/sevenn/nn/_ghost_exchange.py
+@@ -73,7 +73,7 @@ class MLIAPGhostExchangeModule(nn.Module):
+         lmp_data = data[KEY.LAMMPS_DATA]
+         node_features = data[self.field]
+         num_local_ghost = data[KEY.MLIAP_NUM_LOCAL_GHOST]
+-        nghost = num_local_ghost[1].item()
++        nghost = num_local_ghost[1]  # python int, set by mliap.py (no .item() sync)
+ 
+         # Assume node_features already exclude ghosts
+         local_features = node_features
+diff --git a/sevenn/nn/jet_helper.py b/sevenn/nn/jet_helper.py
+new file mode 100644
+index 0000000..3f63ce0
+--- /dev/null
++++ b/sevenn/nn/jet_helper.py
+@@ -0,0 +1,411 @@
++"""jet backend: one fused CUDA kernel per convolution layer (Bessel * cutoff
+++ radial MLP + spherical harmonics + uvu tensor product + scatter).
++
++Inference (module in eval mode): `JetEdgeEmbedding` only hands the Bessel
++coefficients over via `data[KEY.BESSEL_COEFFS]`; `JetConvolution` calls
++`jet_mlip::conv_fused` on `edge_vec` directly (no edge_attr / edge_embedding).
++Training (train mode): the original EdgeEmbedding math runs and the conv uses
++`jet_mlip::tp3`, differentiable to any order wrt x, sh and the radial weights.
++State dict keys are identical to the e3nn model (no checkpoint conversion).
++"""
++import operator
++import warnings
++from copy import deepcopy
++from typing import List, Optional, Tuple
++
++import e3nn.util.jit
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from e3nn.math import normalize2mom
++from e3nn.nn import Gate
++from e3nn.o3 import Irreps, Linear
++from e3nn.util.jit import compile_mode
++
++import sevenn._keys as KEY
++from sevenn._const import AtomGraphDataType
++
++from .convolution import IrrepsConvolution
++from .edge_embedding import BesselBasis, EdgeEmbedding, XPLORCutoff
++
++try:
++    import jet_mlip
++    import jet_mlip.ops as jet_ops
++
++    _JET_AVAILABLE = True
++except ImportError:
++    _JET_AVAILABLE = False
++
++
++def table_size(radial_table) -> int:
++    """radial_table option -> grid points: True = jet_mlip's default size, False = 0 (exact radial MLP).
++    An int > 1 is taken as the size (benchmarks)."""
++    if radial_table is True:
++        return int(jet_ops.DEFAULT_RADIAL_TABLE)
++    return int(radial_table) if radial_table else 0
++
++
++def is_jet_available() -> bool:
++    # CUDA is not required: the ops fall back to an exact (slow) torch reference
++    return _JET_AVAILABLE
++
++
++def jet_needed(func):
++    def wrapper(*args, **kwargs):
++        if is_jet_available():
++            return func(*args, **kwargs)
++        raise ImportError('jet is not available')
++
++    return wrapper
++
++
++@compile_mode('script')
++class JetEdgeEmbedding(EdgeEmbedding):
++    """EdgeEmbedding that skips Bessel / spherical harmonics in eval mode
++    (the fused op computes them) and only exposes the Bessel coefficients."""
++
++    @torch.jit.unused
++    def _forward_train(self, data: AtomGraphDataType) -> AtomGraphDataType:
++        # one kernel for Bessel * cutoff + spherical harmonics (any-order autograd)
++        rvec = data[KEY.EDGE_VEC]
++        data[KEY.EDGE_LENGTH] = torch.linalg.norm(rvec, dim=-1)
++        cut = self.cutoff_function
++        data[KEY.EDGE_EMBEDDING], data[KEY.EDGE_ATTR] = jet_ops.edge_embed(
++            rvec, self.basis_function.coeffs, cut.r_on, cut.r_cut,
++            self.spherical.lmax,
++        )
++        return data
++
++    def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
++        if self.training:
++            data = self._forward_train(data)
++        else:
++            data[KEY.BESSEL_COEFFS] = self.basis_function.coeffs
++        return data
++
++
++@compile_mode('script')
++class JetConvolution(nn.Module):
++    """Replaces IrrepsConvolution. Keeps `weight_nn` and `denominator`."""
++
++    def __init__(
++        self,
++        conv: IrrepsConvolution,
++        live_irreps: Irreps,
++        r_on: float,
++        r_cut: float,
++        radial_table: int = 0,
++        exact_backward: str = 'split',
++        layer_idx: int = -1,
++    ) -> None:
++        super().__init__()
++        assert not conv.layer_instantiated, 'already instantiated; cannot patch'
++        self.__dict__.update(deepcopy(conv.__dict__))
++        self._modules.pop('convolution', None)  # never built
++        # interaction block index t of '{t}_convolution', for jet_layer_nout (-1: never pruned)
++        self.layer_idx: int = int(layer_idx)
++        hs = self.weight_nn_kwargs['hs']
++        if self.weight_nn_kwargs['act'] is not F.silu or hs[:3] != [8, 64, 64]:
++            raise ValueError(
++                'jet needs act_radial=silu and weight_nn [8, 64, 64, *], '
++                f'got act={self.weight_nn_kwargs["act"]}, hs={hs}'
++            )
++        self.cfg = jet_mlip.config_from_sevenn_conv(conv, live_irreps)
++        if jet_ops.has_op('conv_fused'):
++            jet_ops.config_id(self.cfg)  # fail early if this config is not compiled
++        # Compiled config ids differ between jet builds, so a deployed model
++        # carries the key and resolves the id once, in the first scripted forward.
++        self.cfg_key: str = self.cfg.key
++        self.cfg_id: int = -1
++        self.r_on = float(r_on)
++        self.r_cut = float(r_cut)
++        self.act_cst = float(normalize2mom(F.silu).cst)
++        self._out_dim: int = self.cfg.out_dim
++        self.register_buffer(
++            'live_cols', self.cfg.live_weight_cols(), persistent=False
++        )
++        # Radial table (inference only): W(r) and dW/dr on a uniform grid, built from the
++        # trained weights by build_radial_table() -- lazily in eager mode, explicitly before
++        # deployment. Buffers are non-persistent: derived, and absent from any checkpoint.
++        self.radial_table: int = int(radial_table)
++        self.register_buffer('radial_tab', torch.zeros(0), persistent=False)
++        # exact-MLP backward (radial_table = 0 only), fixed at deploy time: 'split' = two kernels (grad of
++        # the hidden layer accumulated per edge in a transient E x 64 fp32 buffer), 'recompute' = one
++        # kernel that redoes the MLP backward per path group, no buffer
++        if exact_backward not in ('split', 'recompute'):
++            raise ValueError(f"exact_backward must be 'split' or 'recompute', got {exact_backward!r}")
++        if exact_backward != 'split' and self.radial_table > 0:
++            raise ValueError("exact_backward='recompute' needs the exact radial MLP (radial_table=0)")
++        self.split_bwd: bool = exact_backward == 'split'
++        # eval: the (frozen) denominator folded into the op as a float, set by train(False);
++        # train: 1.0 here and out.div(self.denominator) keeps a trainable denominator in the graph
++        self.denom: float = 1.0
++
++    @torch.jit.unused
++    def build_radial_table(self, coeffs: torch.Tensor) -> None:
++        """Fill the radial table from the current weights and the (trained) Bessel coeffs
++        (no-op if disabled or already built). fp32 only; re-run if the weights change."""
++        if self.radial_table <= 0 or self.radial_tab.numel() > 0:
++            return
++        w = self.weight_nn
++        if w is None or w.layer0.weight.dtype != torch.float32:
++            return
++        self.radial_tab = jet_ops.make_radial_table(
++            self.cfg, w.layer0.weight, w.layer1.weight,
++            w.layer2.weight[:, self.live_cols], coeffs,
++            self.r_on, self.r_cut, self.act_cst, self.radial_table,
++        )
++
++    def train(self, mode: bool = True):
++        # the table is derived from the weights: drop it whenever they may change,
++        # it is rebuilt on the next eval-mode forward
++        if mode:
++            self.radial_tab = self.radial_tab[:0]
++        self.denom = 1.0 if mode else float(self.denominator.item())
++        return super().train(mode)
++
++    def _load_from_state_dict(self, *args, **kwargs):
++        super()._load_from_state_dict(*args, **kwargs)
++        if not self.training:   # weights loaded after eval(): refresh the folded denominator
++            self.denom = float(self.denominator.item())
++
++    def instantiate(self) -> None:
++        if self.weight_nn is not None:
++            raise ValueError('Weight_nn layer already exists')
++        self.weight_nn = self.weight_nn_cls(**self.weight_nn_kwargs)
++        self.layer_instantiated = True
++
++    def _csr(
++        self, data: AtomGraphDataType, edge_src: torch.Tensor,
++        edge_dst: torch.Tensor, n_out: int, n_rows: int,
++    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """(rowptr, perm, src) int32 of the dst-grouped edge order: built by the first conv
++        layer of a step (or given by the caller) and shared through `data`; rebuilt only
++        where n_rows differs. n_rows is the number of destination rows the built CSR covers:
++        n_out normally, n_1 = nout[0] with jet_layer_nout, so that every later layer reuses
++        the prefix rowptr[:n_out+1] (edges are dst-grouped, all of them < n_1)."""
++        # shape checks guard against a data dict reused with other edges or another n_out
++        if KEY.JET_ROWPTR in data and data[KEY.JET_ROWPTR].numel() == n_rows + 1 \
++                and data[KEY.JET_PERM].numel() == edge_dst.numel():
++            return data[KEY.JET_ROWPTR][: n_out + 1], data[KEY.JET_PERM], data[KEY.JET_SRC]
++        rowptr, perm = torch.ops.jet_mlip.build_csr(edge_dst, n_rows)
++        src = edge_src.to(torch.int32)
++        data[KEY.JET_ROWPTR] = rowptr
++        data[KEY.JET_PERM] = perm
++        data[KEY.JET_SRC] = src
++        return rowptr[: n_out + 1], perm, src
++
++    @torch.jit.unused
++    def _conv_fused_eager(
++        self, data, x, edge_vec, src, dst, w1, w2, w3, coeffs, n_out: int,
++        n_rows: int,
++    ) -> torch.Tensor:
++        self.build_radial_table(coeffs)
++        csr = None
++        if x.is_cuda and jet_ops.has_op('conv_fused'):   # else: torch reference, no CSR
++            rowptr, perm, src = self._csr(data, src, dst, n_out, n_rows)
++            csr = (rowptr, perm)
++        return jet_ops.conv_fused(
++            self.cfg, x, edge_vec, src, dst, w1, w2, w3, coeffs, self.denom,
++            self.r_on, self.r_cut, self.act_cst, n_out, csr=csr,
++            table=self.radial_tab if self.radial_tab.numel() > 0 else None,
++            split_bwd=self.split_bwd,
++        )
++
++    @torch.jit.unused
++    def _forward_train(
++        self, data: AtomGraphDataType, x: torch.Tensor,
++        src: torch.Tensor, dst: torch.Tensor, n_out: int,
++    ) -> torch.Tensor:
++        sh = data[self.key_filter]
++        # prune the (64, NW_full) last-layer weight, not the (E, NW_full) output:
++        # advanced-indexing backward on the per-edge tensor was 40 % of a train step.
++        nn = self.weight_nn
++        h = data[self.key_weight_input]
++        for l in (nn.layer0, nn.layer1):
++            # e3nn _Layer with act: normalize2mom(silu)(x @ (w / sqrt(h_in*var_in))) * sqrt(var_out),
++            # the silu chain fused (fwd / bwd / bwd-bwd kernels)
++            h = jet_ops.silu_norm(
++                h @ (l.weight / (l.h_in * l.var_in) ** 0.5),
++                self.act_cst * l.var_out**0.5,
++            )
++        l2 = nn.layer2  # e3nn _Layer without act: x @ (w / sqrt(h_in*var_in/var_out))
++        w3 = l2.weight[:, self.live_cols] / (l2.h_in * l2.var_in / l2.var_out) ** 0.5
++        weight = h @ w3
++        if src.numel() == 0:
++            return x.new_zeros(n_out, self._out_dim) + (sh.sum() + weight.sum()) * 0
++        return jet_ops.tp3(self.cfg, x, sh, weight, src, dst, n_out)
++
++    def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
++        assert self.weight_nn is not None, 'Weight_nn is not instantiated'
++        x = data[self.key_x]
++        n_out = x.shape[0]  # local atoms; ghosts (if any) are appended below
++        n_rows = n_out  # rows the shared CSR covers: n_1 with jet_layer_nout, else n_out
++        if self.layer_idx >= 0 and KEY.JET_LAYER_NOUT in data:
++            # halo pruning (shared interface): block t fills nodes [0, n_{t+1}) only, the rest of
++            # the block input is a ghost that later blocks never look at
++            assert not self.training, 'jet_layer_nout (halo pruning) is inference only'
++            nout = data[KEY.JET_LAYER_NOUT]
++            assert nout.numel() > self.layer_idx, (
++                'jet_layer_nout is shorter than the model: no n_{t+1} for this block'
++            )
++            n_out = int(nout[self.layer_idx].item())
++            n_rows = int(nout[0].item())
++        if self.is_parallel:
++            x = torch.cat([x, data[KEY.NODE_FEATURE_GHOST]])
++        edge_src = data[self.key_edge_idx][1]
++        edge_dst = data[self.key_edge_idx][0]
++
++        if self.training:
++            out = self._forward_train(data, x, edge_src, edge_dst, n_out)
++            out = out.div(self.denominator)
++        else:
++            edge_vec = data[KEY.EDGE_VEC]
++            coeffs = data[KEY.BESSEL_COEFFS]
++            # conv_fused differentiates x and edge_vec only (forces); a backward
++            # that needs the weight / coefficient grads raises (use train mode)
++            w1 = self.weight_nn.layer0.weight
++            w2 = self.weight_nn.layer1.weight
++            w3 = self.weight_nn.layer2.weight[:, self.live_cols]
++            if edge_src.numel() == 0:
++                out = x.new_zeros(n_out, self._out_dim)
++                out = out + (edge_vec.sum() + x.sum()) * 0  # keep in graph
++            elif torch.jit.is_scripting():
++                if self.cfg_id < 0:  # once per process; raises if this build lacks the config
++                    self.cfg_id = torch.ops.jet_mlip.config_index(self.cfg_key)
++                rowptr, perm, src = self._csr(data, edge_src, edge_dst, n_out, n_rows)
++                tab: Optional[torch.Tensor] = None
++                if self.radial_tab.numel() > 0:
++                    tab = self.radial_tab
++                out = torch.ops.jet_mlip.conv_fused(
++                    x, edge_vec, src, rowptr, perm, w1, w2, w3, coeffs, self.denom,
++                    self.r_on, self.r_cut, self.act_cst, self.cfg_id, tab, self.split_bwd,
++                )
++            else:
++                out = self._conv_fused_eager(
++                    data, x, edge_vec, edge_src, edge_dst, w1, w2, w3, coeffs, n_out,
++                    n_rows,
++                )
++
++        data[self.key_x] = out
++        return data
++
++
++# ---- inference-time rewrites of the e3nn glue (forward bitwise identical) ----------------
++@compile_mode('script')
++class _Split(nn.Module):
++    """Gate's _Sortcut (e3nn Extract: zero-fill + copy per output) when the three outputs are
++    consecutive input ranges: views instead, so the backward is one cat."""
++
++    def __init__(self, sizes: List[int]) -> None:
++        super().__init__()
++        self.sizes = sizes
++
++    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        a, b, c = torch.split(x, self.sizes, -1)
++        return a, b, c
++
++
++def _split_gate(gate: Gate) -> None:
++    cut = gate.sc.cut
++    want, i = [], 0
++    for ins in cut.instructions:
++        want.append(tuple(range(i, i + len(ins))))
++        i += len(ins)
++    if list(cut.instructions) != want or i != len(cut.irreps_in) or len(want) != 3:
++        return   # outputs are not consecutive input ranges: keep e3nn's Extract
++    gate.sc = _Split([sum(cut.irreps_in[k].dim for k in ins) for ins in want])
++
++
++def _split_linear(lin: Linear) -> None:
++    """Rebuild e3nn's fx graph with the per-irrep `x.narrow`s replaced by one `split` + getitems.
++    Same views in the forward; the backward becomes one cat instead of a zero-filled full-size
++    copy per irrep summed with adds."""
++    from e3nn.o3._linear import _codegen_linear
++
++    if lin.weight.dim() != 1 or len(lin.irreps_in) < 2:
++        return   # f_in/f_out layouts never built by sevenn; single irrep has no narrow
++    gm, _, _ = _codegen_linear(
++        lin.irreps_in, lin.irreps_out, lin.instructions, None, None,
++        shared_weights=lin.shared_weights, optimize_einsums=lin._optimize_einsums,
++    )
++    g = gm.graph
++
++    def root(n):
++        while n.op != 'placeholder':
++            n = n.args[0]
++        return n.target
++
++    narrows = [n for n in g.nodes if n.op == 'call_method' and n.target == 'narrow'
++               and n.args[1] == -1 and root(n) == 'x']
++    if not narrows:
++        return
++    base = narrows[0].args[0]
++    narrows.sort(key=lambda n: n.args[2])
++    if any(n.args[0] is not base for n in narrows) or narrows[0].args[2] != 0 \
++            or any(a.args[2] + a.args[3] != b.args[2] for a, b in zip(narrows, narrows[1:])) \
++            or narrows[-1].args[2] + narrows[-1].args[3] != lin.irreps_in.dim:
++        return   # not a tiling of the input: keep e3nn's graph
++    with g.inserting_before(narrows[0]):
++        parts = g.call_method('split', (base, [n.args[3] for n in narrows], -1))
++    for k, n in enumerate(narrows):
++        with g.inserting_before(n):
++            item = g.call_function(operator.getitem, (parts, k))
++        n.replace_all_uses_with(item)
++        g.erase_node(n)
++    g.lint()
++    gm.recompile()
++    if e3nn.get_optimization_defaults()['jit_mode'] == 'script':   # as CodeGenMixin._codegen_register
++        gm = e3nn.util.jit.compile(gm, recurse=False)
++    lin._compiled_main = gm   # swaps the submodule; it stays listed in lin.__codegen__
++
++
++def optimize_for_inference(model: nn.Module) -> nn.Module:
++    """In-place, for jet inference models (deploy / ASE calculator / ML-IAP): e3nn Linear
++    input narrows -> split, Gate Extract -> split views. Forward bitwise identical, state_dict
++    keys unchanged; a module that cannot be rewritten is left as it is."""
++    for mod in model.modules():
++        try:
++            if isinstance(mod, Linear):
++                _split_linear(mod)
++            elif isinstance(mod, Gate):
++                _split_gate(mod)
++        except Exception as e:   # pragma: no cover - defensive, the model still works unrewritten
++            import warnings
++            warnings.warn(f'jet optimize_for_inference: {type(mod).__name__} left as is ({e})')
++    return model
++
++
++@jet_needed
++def patch_edge_embedding(edge_embedding: EdgeEmbedding) -> JetEdgeEmbedding:
++    if not isinstance(edge_embedding.basis_function, BesselBasis):
++        raise ValueError('jet supports only the bessel radial basis')
++    if not isinstance(edge_embedding.cutoff_function, XPLORCutoff):
++        raise ValueError('jet supports only the XPLOR cutoff function')
++    sph = edge_embedding.spherical
++    if not (sph.sph.normalize and sph.normalization == 'component'):
++        raise ValueError(
++            'jet supports only normalize=True, component-normalized spherical harmonics'
++        )
++    return JetEdgeEmbedding(
++        edge_embedding.basis_function,
++        edge_embedding.cutoff_function,
++        edge_embedding.spherical,
++    )
++
++
++@jet_needed
++def patch_convolution(
++    irreps_convolution: IrrepsConvolution,
++    live_irreps: Optional[Irreps],
++    edge_embedding: EdgeEmbedding,
++    radial_table: int = 0,
++    exact_backward: str = 'split',
++    layer_idx: int = -1,
++) -> JetConvolution:
++    cut = edge_embedding.cutoff_function
++    assert isinstance(cut, XPLORCutoff), 'patch_edge_embedding validates this'
++    return JetConvolution(
++        irreps_convolution, live_irreps, cut.r_on, cut.r_cut, radial_table, exact_backward,
++        layer_idx,
++    )
+diff --git a/sevenn/nn/scale.py b/sevenn/nn/scale.py
+index c8cbe87..9a57ce2 100644
+--- a/sevenn/nn/scale.py
++++ b/sevenn/nn/scale.py
+@@ -154,8 +154,12 @@ class SpeciesWiseRescale(nn.Module):
+ 
+     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+ 
++        inp = data[self.key_input]
+         indices = data[self.key_indices]
+-        data[self.key_output] = data[self.key_input] * self.scale[indices].view(
++        if indices.shape[0] != inp.shape[0]:
++            # halo pruning: atom types cover all nodes, the readout only the local atoms
++            indices = indices[: inp.shape[0]]
++        data[self.key_output] = inp * self.scale[indices].view(
+             -1, 1
+         ) + self.shift[indices].view(-1, 1)
+ 
+@@ -346,6 +350,12 @@ class ModalWiseRescale(nn.Module):
+         else:
+             modal_indices = data[self.key_modal_indices]
+         atom_indices = data[self.key_atom_indices]
++        inp = data[self.key_input]
++        if atom_indices.shape[0] != inp.shape[0]:
++            # halo pruning: atom types cover all nodes, the readout only the local atoms
++            atom_indices = atom_indices[: inp.shape[0]]
++            if modal_indices.dim() > 0 and modal_indices.shape[0] > inp.shape[0]:
++                modal_indices = modal_indices[: inp.shape[0]]
+         shift = (
+             self.shift[modal_indices, atom_indices]
+             if self.use_modal_wise_shift
+@@ -356,9 +366,7 @@ class ModalWiseRescale(nn.Module):
+             if self.use_modal_wise_scale
+             else self.scale[atom_indices]
+         )
+-        data[self.key_output] = data[self.key_input] * scale.view(
+-            -1, 1
+-        ) + shift.view(-1, 1)
++        data[self.key_output] = inp * scale.view(-1, 1) + shift.view(-1, 1)
+ 
+         return data
+ 
+diff --git a/sevenn/nn/self_connection.py b/sevenn/nn/self_connection.py
+index fdb6ff2..5e5bc15 100644
+--- a/sevenn/nn/self_connection.py
++++ b/sevenn/nn/self_connection.py
+@@ -62,6 +62,9 @@ class SelfConnectionIntro(nn.Module):
+ 
+         x = data[self.key_x]
+         operand = data[self.key_operand]
++        if operand.shape[0] != x.shape[0]:
++            # halo pruning: node attributes cover all nodes, x only the live rows
++            operand = operand[: x.shape[0]]
+         data[KEY.SELF_CONNECTION_TEMP] = self.fc_tensor_product(x, operand)
+ 
+         return data
+@@ -132,6 +135,9 @@ class SelfConnectionOutro(nn.Module):
+ 
+         x = data[self.key_x]
+         sc_temp = data[KEY.SELF_CONNECTION_TEMP]
++        if sc_temp.shape[0] != x.shape[0]:
++            # halo pruning: intro ran on the block input, conv output has n_{t+1} rows
++            sc_temp = sc_temp[: x.shape[0]]
+ 
+         data[self.key_x] = x + sc_temp
+         del data[KEY.SELF_CONNECTION_TEMP]
+diff --git a/sevenn/nn/sequential.py b/sevenn/nn/sequential.py
+index c300814..e7c1a2c 100644
+--- a/sevenn/nn/sequential.py
++++ b/sevenn/nn/sequential.py
+@@ -28,10 +28,10 @@ class _ModalInputPrepare(nn.Module):
+         self.modal_idx = modal_idx
+ 
+     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
+-        data[KEY.MODAL_TYPE] = torch.tensor(
+-            self.modal_idx,
+-            dtype=torch.int64,
+-            device=data['x'].device,
++        # torch.full fills on the device; torch.tensor copies from the host,
++        # which a CUDA graph capture (LAMMPS pair_e3gnn) cannot record
++        data[KEY.MODAL_TYPE] = torch.full(
++            (), self.modal_idx, dtype=torch.int64, device=data['x'].device
+         )
+         return data
+ 
+diff --git a/sevenn/pair_e3gnn/comm_brick.cpp b/sevenn/pair_e3gnn/comm_brick.cpp
+deleted file mode 100644
+index b31375d..0000000
+--- a/sevenn/pair_e3gnn/comm_brick.cpp
++++ /dev/null
+@@ -1,1724 +0,0 @@
+-// clang-format off
+-/* ----------------------------------------------------------------------
+-   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+-   https://www.lammps.org/, Sandia National Laboratories
+-   LAMMPS development team: developers@lammps.org
+-
+-   Copyright (2003) Sandia Corporation.  Under the terms of Contract
+-   DE-AC04-94AL85000 with Sandia Corporation, the U.S. Government retains
+-   certain rights in this software.  This software is distributed under
+-   the GNU General Public License.
+-
+-   See the README file in the top-level LAMMPS directory.
+-------------------------------------------------------------------------- */
+-
+-/* ----------------------------------------------------------------------
+-   Contributing author (triclinic) : Pieter in 't Veld (SNL)
+-------------------------------------------------------------------------- */
+-
+-#include "comm_brick.h"
+-
+-#include "atom.h"
+-#include "atom_vec.h"
+-#include "bond.h"
+-#include "compute.h"
+-#include "domain.h"
+-#include "dump.h"
+-#include "error.h"
+-#include "fix.h"
+-#include "memory.h"
+-#include "neighbor.h"
+-#include "pair.h"
+-
+-#include <cmath>
+-#include <cstring>
+-
+-#include "pair_e3gnn_parallel.h"
+-
+-using namespace LAMMPS_NS;
+-
+-#define BUFFACTOR 1.5
+-#define BUFMIN 1024
+-#define BIG 1.0e20
+-
+-/* ---------------------------------------------------------------------- */
+-
+-CommBrick::CommBrick(LAMMPS *lmp) :
+-  Comm(lmp),
+-  sendnum(nullptr), recvnum(nullptr), sendproc(nullptr), recvproc(nullptr),
+-  size_forward_recv(nullptr), size_reverse_send(nullptr), size_reverse_recv(nullptr),
+-  slablo(nullptr), slabhi(nullptr), multilo(nullptr), multihi(nullptr),
+-  multioldlo(nullptr), multioldhi(nullptr), cutghostmulti(nullptr), cutghostmultiold(nullptr),
+-  pbc_flag(nullptr), pbc(nullptr), firstrecv(nullptr), sendlist(nullptr),
+-  localsendlist(nullptr), maxsendlist(nullptr), buf_send(nullptr), buf_recv(nullptr)
+-{
+-  style = Comm::BRICK;
+-  layout = Comm::LAYOUT_UNIFORM;
+-  pbc_flag = nullptr;
+-  init_buffers();
+-}
+-
+-/* ---------------------------------------------------------------------- */
+-
+-CommBrick::~CommBrick()
+-{
+-  CommBrick::free_swap();
+-  if (mode == Comm::MULTI) {
+-    CommBrick::free_multi();
+-    memory->destroy(cutghostmulti);
+-  }
+-
+-  if (mode == Comm::MULTIOLD) {
+-    CommBrick::free_multiold();
+-    memory->destroy(cutghostmultiold);
+-  }
+-
+-  if (sendlist) for (int i = 0; i < maxswap; i++) memory->destroy(sendlist[i]);
+-  if (localsendlist) memory->destroy(localsendlist);
+-  memory->sfree(sendlist);
+-  memory->destroy(maxsendlist);
+-
+-  memory->destroy(buf_send);
+-  memory->destroy(buf_recv);
+-}
+-
+-/* ---------------------------------------------------------------------- */
+-//IMPORTANT: we *MUST* pass "*oldcomm" to the Comm initializer here, as
+-//           the code below *requires* that the (implicit) copy constructor
+-//           for Comm is run and thus creating a shallow copy of "oldcomm".
+-//           The call to Comm::copy_arrays() then converts the shallow copy
+-//           into a deep copy of the class with the new layout.
+-
+-CommBrick::CommBrick(LAMMPS * /*lmp*/, Comm *oldcomm) : Comm(*oldcomm)
+-{
+-  if (oldcomm->layout == Comm::LAYOUT_TILED)
+-    error->all(FLERR,"Cannot change to comm_style brick from tiled layout");
+-
+-  style = Comm::BRICK;
+-  layout = oldcomm->layout;
+-  Comm::copy_arrays(oldcomm);
+-  init_buffers();
+-}
+-
+-/* ----------------------------------------------------------------------
+-   initialize comm buffers and other data structs local to CommBrick
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::init_buffers()
+-{
+-  multilo = multihi = nullptr;
+-  cutghostmulti = nullptr;
+-
+-  multioldlo = multioldhi = nullptr;
+-  cutghostmultiold = nullptr;
+-
+-  buf_send = buf_recv = nullptr;
+-  maxsend = maxrecv = BUFMIN;
+-  CommBrick::grow_send(maxsend,2);
+-  memory->create(buf_recv,maxrecv,"comm:buf_recv");
+-
+-  nswap = 0;
+-  maxswap = 6;
+-  CommBrick::allocate_swap(maxswap);
+-
+-  sendlist = (int **) memory->smalloc(maxswap*sizeof(int *),"comm:sendlist");
+-  memory->create(maxsendlist,maxswap,"comm:maxsendlist");
+-  for (int i = 0; i < maxswap; i++) {
+-    maxsendlist[i] = BUFMIN;
+-    memory->create(sendlist[i],BUFMIN,"comm:sendlist[i]");
+-  }
+-}
+-
+-/* ---------------------------------------------------------------------- */
+-
+-void CommBrick::init()
+-{
+-  Comm::init();
+-
+-  int bufextra_old = bufextra;
+-  init_exchange();
+-  if (bufextra > bufextra_old) grow_send(maxsend+bufextra,2);
+-
+-  // memory for multi style communication
+-  // allocate in setup
+-
+-  if (mode == Comm::MULTI) {
+-    // If inconsitent # of collections, destroy any preexisting arrays (may be missized)
+-    if (ncollections != neighbor->ncollections) {
+-      ncollections = neighbor->ncollections;
+-      if (multilo != nullptr) {
+-        free_multi();
+-        memory->destroy(cutghostmulti);
+-      }
+-    }
+-
+-    // delete any old user cutoffs if # of collections chanaged
+-    if (cutusermulti && ncollections != ncollections_cutoff) {
+-      if(me == 0) error->warning(FLERR, "cutoff/multi settings discarded, must be defined"
+-                                        " after customizing collections in neigh_modify");
+-      memory->destroy(cutusermulti);
+-      cutusermulti = nullptr;
+-    }
+-
+-    if (multilo == nullptr) {
+-      allocate_multi(maxswap);
+-      memory->create(cutghostmulti,ncollections,3,"comm:cutghostmulti");
+-    }
+-  }
+-  if ((mode == Comm::SINGLE || mode == Comm::MULTIOLD) && multilo) {
+-    free_multi();
+-    memory->destroy(cutghostmulti);
+-  }
+-
+-  // memory for multi/old-style communication
+-
+-  if (mode == Comm::MULTIOLD && multioldlo == nullptr) {
+-    allocate_multiold(maxswap);
+-    memory->create(cutghostmultiold,atom->ntypes+1,3,"comm:cutghostmultiold");
+-  }
+-  if ((mode == Comm::SINGLE || mode == Comm::MULTI) && multioldlo) {
+-    free_multiold();
+-    memory->destroy(cutghostmultiold);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   setup spatial-decomposition communication patterns
+-   function of neighbor cutoff(s) & cutghostuser & current box size
+-   single mode sets slab boundaries (slablo,slabhi) based on max cutoff
+-   multi mode sets collection-dependent slab boundaries (multilo,multihi)
+-   multi/old mode sets type-dependent slab boundaries (multioldlo,multioldhi)
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::setup()
+-{
+-  // cutghost[] = max distance at which ghost atoms need to be acquired
+-  // for orthogonal:
+-  //   cutghost is in box coords = neigh->cutghost in all 3 dims
+-  // for triclinic:
+-  //   neigh->cutghost = distance between tilted planes in box coords
+-  //   cutghost is in lamda coords = distance between those planes
+-  // for multi:
+-  //   cutghostmulti = same as cutghost, only for each atom collection
+-  // for multi/old:
+-  //   cutghostmultiold = same as cutghost, only for each atom type
+-
+-  int i,j;
+-  int ntypes = atom->ntypes;
+-  double *prd,*sublo,*subhi;
+-
+-  double cut = get_comm_cutoff();
+-  if ((cut == 0.0) && (me == 0))
+-    error->warning(FLERR,"Communication cutoff is 0.0. No ghost atoms "
+-                   "will be generated. Atoms may get lost.");
+-
+-  if (mode == Comm::MULTI) {
+-    double **cutcollectionsq = neighbor->cutcollectionsq;
+-
+-    // build collection array for atom exchange
+-    neighbor->build_collection(0);
+-
+-    // If using multi/reduce, communicate particles a distance equal
+-    // to the max cutoff with equally sized or smaller collections
+-    // If not, communicate the maximum cutoff of the entire collection
+-    for (i = 0; i < ncollections; i++) {
+-      if (cutusermulti) {
+-        cutghostmulti[i][0] = cutusermulti[i];
+-        cutghostmulti[i][1] = cutusermulti[i];
+-        cutghostmulti[i][2] = cutusermulti[i];
+-      } else {
+-        cutghostmulti[i][0] = 0.0;
+-        cutghostmulti[i][1] = 0.0;
+-        cutghostmulti[i][2] = 0.0;
+-      }
+-
+-      for (j = 0; j < ncollections; j++){
+-        if (multi_reduce && (cutcollectionsq[j][j] > cutcollectionsq[i][i])) continue;
+-        cutghostmulti[i][0] = MAX(cutghostmulti[i][0],sqrt(cutcollectionsq[i][j]));
+-        cutghostmulti[i][1] = MAX(cutghostmulti[i][1],sqrt(cutcollectionsq[i][j]));
+-        cutghostmulti[i][2] = MAX(cutghostmulti[i][2],sqrt(cutcollectionsq[i][j]));
+-      }
+-    }
+-  }
+-
+-  if (mode == Comm::MULTIOLD) {
+-    double *cuttype = neighbor->cuttype;
+-    for (i = 1; i <= ntypes; i++) {
+-      double tmp = 0.0;
+-      if (cutusermultiold) tmp = cutusermultiold[i];
+-      cutghostmultiold[i][0] = MAX(tmp,cuttype[i]);
+-      cutghostmultiold[i][1] = MAX(tmp,cuttype[i]);
+-      cutghostmultiold[i][2] = MAX(tmp,cuttype[i]);
+-    }
+-  }
+-
+-  if (triclinic == 0) {
+-    prd = domain->prd;
+-    sublo = domain->sublo;
+-    subhi = domain->subhi;
+-    cutghost[0] = cutghost[1] = cutghost[2] = cut;
+-  } else {
+-    prd = domain->prd_lamda;
+-    sublo = domain->sublo_lamda;
+-    subhi = domain->subhi_lamda;
+-    double *h_inv = domain->h_inv;
+-    double length0,length1,length2;
+-    length0 = sqrt(h_inv[0]*h_inv[0] + h_inv[5]*h_inv[5] + h_inv[4]*h_inv[4]);
+-    cutghost[0] = cut * length0;
+-    length1 = sqrt(h_inv[1]*h_inv[1] + h_inv[3]*h_inv[3]);
+-    cutghost[1] = cut * length1;
+-    length2 = h_inv[2];
+-    cutghost[2] = cut * length2;
+-    if (mode == Comm::MULTI) {
+-      for (i = 0; i < ncollections; i++) {
+-        cutghostmulti[i][0] *= length0;
+-        cutghostmulti[i][1] *= length1;
+-        cutghostmulti[i][2] *= length2;
+-      }
+-    }
+-
+-    if (mode == Comm::MULTIOLD) {
+-      for (i = 1; i <= ntypes; i++) {
+-        cutghostmultiold[i][0] *= length0;
+-        cutghostmultiold[i][1] *= length1;
+-        cutghostmultiold[i][2] *= length2;
+-      }
+-    }
+-  }
+-
+-  // recvneed[idim][0/1] = # of procs away I recv atoms from, within cutghost
+-  //   0 = from left, 1 = from right
+-  //   do not cross non-periodic boundaries, need[2] = 0 for 2d
+-  // sendneed[idim][0/1] = # of procs away I send atoms to
+-  //   0 = to left, 1 = to right
+-  //   set equal to recvneed[idim][1/0] of neighbor proc
+-  // maxneed[idim] = max procs away any proc recvs atoms in either direction
+-  // layout = UNIFORM = uniform sized sub-domains:
+-  //   maxneed is directly computable from sub-domain size
+-  //     limit to procgrid-1 for non-PBC
+-  //   recvneed = maxneed except for procs near non-PBC
+-  //   sendneed = recvneed of neighbor on each side
+-  // layout = NONUNIFORM = non-uniform sized sub-domains:
+-  //   compute recvneed via updown() which accounts for non-PBC
+-  //   sendneed = recvneed of neighbor on each side
+-  //   maxneed via Allreduce() of recvneed
+-
+-  int *periodicity = domain->periodicity;
+-  int left,right;
+-
+-  if (layout == Comm::LAYOUT_UNIFORM) {
+-    maxneed[0] = static_cast<int> (cutghost[0] * procgrid[0] / prd[0]) + 1;
+-    maxneed[1] = static_cast<int> (cutghost[1] * procgrid[1] / prd[1]) + 1;
+-    maxneed[2] = static_cast<int> (cutghost[2] * procgrid[2] / prd[2]) + 1;
+-    if (domain->dimension == 2) maxneed[2] = 0;
+-    if (!periodicity[0]) maxneed[0] = MIN(maxneed[0],procgrid[0]-1);
+-    if (!periodicity[1]) maxneed[1] = MIN(maxneed[1],procgrid[1]-1);
+-    if (!periodicity[2]) maxneed[2] = MIN(maxneed[2],procgrid[2]-1);
+-
+-    if (!periodicity[0]) {
+-      recvneed[0][0] = MIN(maxneed[0],myloc[0]);
+-      recvneed[0][1] = MIN(maxneed[0],procgrid[0]-myloc[0]-1);
+-      left = myloc[0] - 1;
+-      if (left < 0) left = procgrid[0] - 1;
+-      sendneed[0][0] = MIN(maxneed[0],procgrid[0]-left-1);
+-      right = myloc[0] + 1;
+-      if (right == procgrid[0]) right = 0;
+-      sendneed[0][1] = MIN(maxneed[0],right);
+-    } else recvneed[0][0] = recvneed[0][1] =
+-             sendneed[0][0] = sendneed[0][1] = maxneed[0];
+-
+-    if (!periodicity[1]) {
+-      recvneed[1][0] = MIN(maxneed[1],myloc[1]);
+-      recvneed[1][1] = MIN(maxneed[1],procgrid[1]-myloc[1]-1);
+-      left = myloc[1] - 1;
+-      if (left < 0) left = procgrid[1] - 1;
+-      sendneed[1][0] = MIN(maxneed[1],procgrid[1]-left-1);
+-      right = myloc[1] + 1;
+-      if (right == procgrid[1]) right = 0;
+-      sendneed[1][1] = MIN(maxneed[1],right);
+-    } else recvneed[1][0] = recvneed[1][1] =
+-             sendneed[1][0] = sendneed[1][1] = maxneed[1];
+-
+-    if (!periodicity[2]) {
+-      recvneed[2][0] = MIN(maxneed[2],myloc[2]);
+-      recvneed[2][1] = MIN(maxneed[2],procgrid[2]-myloc[2]-1);
+-      left = myloc[2] - 1;
+-      if (left < 0) left = procgrid[2] - 1;
+-      sendneed[2][0] = MIN(maxneed[2],procgrid[2]-left-1);
+-      right = myloc[2] + 1;
+-      if (right == procgrid[2]) right = 0;
+-      sendneed[2][1] = MIN(maxneed[2],right);
+-    } else recvneed[2][0] = recvneed[2][1] =
+-             sendneed[2][0] = sendneed[2][1] = maxneed[2];
+-
+-  } else {
+-    recvneed[0][0] = updown(0,0,myloc[0],prd[0],periodicity[0],xsplit);
+-    recvneed[0][1] = updown(0,1,myloc[0],prd[0],periodicity[0],xsplit);
+-    left = myloc[0] - 1;
+-    if (left < 0) left = procgrid[0] - 1;
+-    sendneed[0][0] = updown(0,1,left,prd[0],periodicity[0],xsplit);
+-    right = myloc[0] + 1;
+-    if (right == procgrid[0]) right = 0;
+-    sendneed[0][1] = updown(0,0,right,prd[0],periodicity[0],xsplit);
+-
+-    recvneed[1][0] = updown(1,0,myloc[1],prd[1],periodicity[1],ysplit);
+-    recvneed[1][1] = updown(1,1,myloc[1],prd[1],periodicity[1],ysplit);
+-    left = myloc[1] - 1;
+-    if (left < 0) left = procgrid[1] - 1;
+-    sendneed[1][0] = updown(1,1,left,prd[1],periodicity[1],ysplit);
+-    right = myloc[1] + 1;
+-    if (right == procgrid[1]) right = 0;
+-    sendneed[1][1] = updown(1,0,right,prd[1],periodicity[1],ysplit);
+-
+-    if (domain->dimension == 3) {
+-      recvneed[2][0] = updown(2,0,myloc[2],prd[2],periodicity[2],zsplit);
+-      recvneed[2][1] = updown(2,1,myloc[2],prd[2],periodicity[2],zsplit);
+-      left = myloc[2] - 1;
+-      if (left < 0) left = procgrid[2] - 1;
+-      sendneed[2][0] = updown(2,1,left,prd[2],periodicity[2],zsplit);
+-      right = myloc[2] + 1;
+-      if (right == procgrid[2]) right = 0;
+-      sendneed[2][1] = updown(2,0,right,prd[2],periodicity[2],zsplit);
+-    } else recvneed[2][0] = recvneed[2][1] =
+-             sendneed[2][0] = sendneed[2][1] = 0;
+-
+-    int all[6];
+-    MPI_Allreduce(&recvneed[0][0],all,6,MPI_INT,MPI_MAX,world);
+-    maxneed[0] = MAX(all[0],all[1]);
+-    maxneed[1] = MAX(all[2],all[3]);
+-    maxneed[2] = MAX(all[4],all[5]);
+-  }
+-
+-  // allocate comm memory
+-
+-  nswap = 2 * (maxneed[0]+maxneed[1]+maxneed[2]);
+-  if (nswap > maxswap) grow_swap(nswap);
+-
+-  // setup parameters for each exchange:
+-  // sendproc = proc to send to at each swap
+-  // recvproc = proc to recv from at each swap
+-  // for mode SINGLE:
+-  //   slablo/slabhi = boundaries for slab of atoms to send at each swap
+-  //   use -BIG/midpt/BIG to ensure all atoms included even if round-off occurs
+-  //   if round-off, atoms recvd across PBC can be < or > than subbox boundary
+-  //   note that borders() only loops over subset of atoms during each swap
+-  //   treat all as PBC here, non-PBC is handled in borders() via r/s need[][]
+-  // for mode MULTI:
+-  //   multilo/multihi is same, with slablo/slabhi for each atom type
+-  // pbc_flag: 0 = nothing across a boundary, 1 = something across a boundary
+-  // pbc = -1/0/1 for PBC factor in each of 3/6 orthogonal/triclinic dirs
+-  // for triclinic, slablo/hi and pbc_border will be used in lamda (0-1) coords
+-  // 1st part of if statement is sending to the west/south/down
+-  // 2nd part of if statement is sending to the east/north/up
+-
+-  int dim,ineed;
+-
+-  int iswap = 0;
+-  for (dim = 0; dim < 3; dim++) {
+-    for (ineed = 0; ineed < 2*maxneed[dim]; ineed++) {
+-      pbc_flag[iswap] = 0;
+-      pbc[iswap][0] = pbc[iswap][1] = pbc[iswap][2] =
+-        pbc[iswap][3] = pbc[iswap][4] = pbc[iswap][5] = 0;
+-
+-      if (ineed % 2 == 0) {
+-        sendproc[iswap] = procneigh[dim][0];
+-        recvproc[iswap] = procneigh[dim][1];
+-        if (mode == Comm::SINGLE) {
+-          if (ineed < 2) slablo[iswap] = -BIG;
+-          else slablo[iswap] = 0.5 * (sublo[dim] + subhi[dim]);
+-          slabhi[iswap] = sublo[dim] + cutghost[dim];
+-        } else if (mode == Comm::MULTI) {
+-          for (i = 0; i < ncollections; i++) {
+-            if (ineed < 2) multilo[iswap][i] = -BIG;
+-            else multilo[iswap][i] = 0.5 * (sublo[dim] + subhi[dim]);
+-            multihi[iswap][i] = sublo[dim] + cutghostmulti[i][dim];
+-          }
+-        } else {
+-          for (i = 1; i <= ntypes; i++) {
+-            if (ineed < 2) multioldlo[iswap][i] = -BIG;
+-            else multioldlo[iswap][i] = 0.5 * (sublo[dim] + subhi[dim]);
+-            multioldhi[iswap][i] = sublo[dim] + cutghostmultiold[i][dim];
+-          }
+-        }
+-        if (myloc[dim] == 0) {
+-          pbc_flag[iswap] = 1;
+-          pbc[iswap][dim] = 1;
+-          if (triclinic) {
+-            if (dim == 1) pbc[iswap][5] = 1;
+-            else if (dim == 2) pbc[iswap][4] = pbc[iswap][3] = 1;
+-          }
+-        }
+-
+-      } else {
+-        sendproc[iswap] = procneigh[dim][1];
+-        recvproc[iswap] = procneigh[dim][0];
+-        if (mode == Comm::SINGLE) {
+-          slablo[iswap] = subhi[dim] - cutghost[dim];
+-          if (ineed < 2) slabhi[iswap] = BIG;
+-          else slabhi[iswap] = 0.5 * (sublo[dim] + subhi[dim]);
+-        } else if (mode == Comm::MULTI) {
+-          for (i = 0; i < ncollections; i++) {
+-            multilo[iswap][i] = subhi[dim] - cutghostmulti[i][dim];
+-            if (ineed < 2) multihi[iswap][i] = BIG;
+-            else multihi[iswap][i] = 0.5 * (sublo[dim] + subhi[dim]);
+-          }
+-        } else {
+-          for (i = 1; i <= ntypes; i++) {
+-            multioldlo[iswap][i] = subhi[dim] - cutghostmultiold[i][dim];
+-            if (ineed < 2) multioldhi[iswap][i] = BIG;
+-            else multioldhi[iswap][i] = 0.5 * (sublo[dim] + subhi[dim]);
+-          }
+-        }
+-        if (myloc[dim] == procgrid[dim]-1) {
+-          pbc_flag[iswap] = 1;
+-          pbc[iswap][dim] = -1;
+-          if (triclinic) {
+-            if (dim == 1) pbc[iswap][5] = -1;
+-            else if (dim == 2) pbc[iswap][4] = pbc[iswap][3] = -1;
+-          }
+-        }
+-      }
+-
+-      iswap++;
+-    }
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   walk up/down the extent of nearby processors in dim and dir
+-   loc = myloc of proc to start at
+-   dir = 0/1 = walk to left/right
+-   do not cross non-periodic boundaries
+-   is not called for z dim in 2d
+-   return how many procs away are needed to encompass cutghost away from loc
+-------------------------------------------------------------------------- */
+-
+-int CommBrick::updown(int dim, int dir, int loc, double prd, int periodicity, double *split)
+-{
+-  int index,count;
+-  double frac,delta;
+-
+-  if (dir == 0) {
+-    frac = cutghost[dim]/prd;
+-    index = loc - 1;
+-    delta = 0.0;
+-    count = 0;
+-    while (delta < frac) {
+-      if (index < 0) {
+-        if (!periodicity) break;
+-        index = procgrid[dim] - 1;
+-      }
+-      count++;
+-      delta += split[index+1] - split[index];
+-      index--;
+-    }
+-
+-  } else {
+-    frac = cutghost[dim]/prd;
+-    index = loc + 1;
+-    delta = 0.0;
+-    count = 0;
+-    while (delta < frac) {
+-      if (index >= procgrid[dim]) {
+-        if (!periodicity) break;
+-        index = 0;
+-      }
+-      count++;
+-      delta += split[index+1] - split[index];
+-      index++;
+-    }
+-  }
+-
+-  return count;
+-}
+-
+-/* ----------------------------------------------------------------------
+-   forward communication of atom coords every timestep
+-   other per-atom attributes may also be sent via pack/unpack routines
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::forward_comm(int /*dummy*/)
+-{
+-  int n;
+-  MPI_Request request;
+-  AtomVec *avec = atom->avec;
+-  double **x = atom->x;
+-  double *buf;
+-
+-  // exchange data with another proc
+-  // if other proc is self, just copy
+-  // if comm_x_only set, exchange or copy directly to x, don't unpack
+-
+-  for (int iswap = 0; iswap < nswap; iswap++) {
+-    if (sendproc[iswap] != me) {
+-      if (comm_x_only) {
+-        if (size_forward_recv[iswap]) {
+-          buf = x[firstrecv[iswap]];
+-          MPI_Irecv(buf,size_forward_recv[iswap],MPI_DOUBLE,recvproc[iswap],0,world,&request);
+-        }
+-        n = avec->pack_comm(sendnum[iswap],sendlist[iswap],buf_send,pbc_flag[iswap],pbc[iswap]);
+-        if (n) MPI_Send(buf_send,n,MPI_DOUBLE,sendproc[iswap],0,world);
+-        if (size_forward_recv[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      } else if (ghost_velocity) {
+-        if (size_forward_recv[iswap])
+-          MPI_Irecv(buf_recv,size_forward_recv[iswap],MPI_DOUBLE,recvproc[iswap],0,world,&request);
+-        n = avec->pack_comm_vel(sendnum[iswap],sendlist[iswap],buf_send,pbc_flag[iswap],pbc[iswap]);
+-        if (n) MPI_Send(buf_send,n,MPI_DOUBLE,sendproc[iswap],0,world);
+-        if (size_forward_recv[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-        avec->unpack_comm_vel(recvnum[iswap],firstrecv[iswap],buf_recv);
+-      } else {
+-        if (size_forward_recv[iswap])
+-          MPI_Irecv(buf_recv,size_forward_recv[iswap],MPI_DOUBLE,
+-                    recvproc[iswap],0,world,&request);
+-        n = avec->pack_comm(sendnum[iswap],sendlist[iswap],buf_send,pbc_flag[iswap],pbc[iswap]);
+-        if (n) MPI_Send(buf_send,n,MPI_DOUBLE,sendproc[iswap],0,world);
+-        if (size_forward_recv[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-        avec->unpack_comm(recvnum[iswap],firstrecv[iswap],buf_recv);
+-      }
+-
+-    } else {
+-      if (comm_x_only) {
+-        if (sendnum[iswap])
+-          avec->pack_comm(sendnum[iswap],sendlist[iswap],
+-                          x[firstrecv[iswap]],pbc_flag[iswap],pbc[iswap]);
+-      } else if (ghost_velocity) {
+-        avec->pack_comm_vel(sendnum[iswap],sendlist[iswap],buf_send,pbc_flag[iswap],pbc[iswap]);
+-        avec->unpack_comm_vel(recvnum[iswap],firstrecv[iswap],buf_send);
+-      } else {
+-        avec->pack_comm(sendnum[iswap],sendlist[iswap],buf_send,pbc_flag[iswap],pbc[iswap]);
+-        avec->unpack_comm(recvnum[iswap],firstrecv[iswap],buf_send);
+-      }
+-    }
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   reverse communication of forces on atoms every timestep
+-   other per-atom attributes may also be sent via pack/unpack routines
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::reverse_comm()
+-{
+-  int n;
+-  MPI_Request request;
+-  AtomVec *avec = atom->avec;
+-  double **f = atom->f;
+-  double *buf;
+-
+-  // exchange data with another proc
+-  // if other proc is self, just copy
+-  // if comm_f_only set, exchange or copy directly from f, don't pack
+-
+-  for (int iswap = nswap-1; iswap >= 0; iswap--) {
+-    if (sendproc[iswap] != me) {
+-      if (comm_f_only) {
+-        if (size_reverse_recv[iswap])
+-          MPI_Irecv(buf_recv,size_reverse_recv[iswap],MPI_DOUBLE,sendproc[iswap],0,world,&request);
+-        if (size_reverse_send[iswap]) {
+-          buf = f[firstrecv[iswap]];
+-          MPI_Send(buf,size_reverse_send[iswap],MPI_DOUBLE,recvproc[iswap],0,world);
+-        }
+-        if (size_reverse_recv[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      } else {
+-        if (size_reverse_recv[iswap])
+-          MPI_Irecv(buf_recv,size_reverse_recv[iswap],MPI_DOUBLE,sendproc[iswap],0,world,&request);
+-        n = avec->pack_reverse(recvnum[iswap],firstrecv[iswap],buf_send);
+-        if (n) MPI_Send(buf_send,n,MPI_DOUBLE,recvproc[iswap],0,world);
+-        if (size_reverse_recv[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      }
+-      avec->unpack_reverse(sendnum[iswap],sendlist[iswap],buf_recv);
+-
+-    } else {
+-      if (comm_f_only) {
+-        if (sendnum[iswap])
+-          avec->unpack_reverse(sendnum[iswap],sendlist[iswap],f[firstrecv[iswap]]);
+-      } else {
+-        avec->pack_reverse(recvnum[iswap],firstrecv[iswap],buf_send);
+-        avec->unpack_reverse(sendnum[iswap],sendlist[iswap],buf_send);
+-      }
+-    }
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   exchange: move atoms to correct processors
+-   atoms exchanged with all 6 stencil neighbors
+-   send out atoms that have left my box, receive ones entering my box
+-   atoms will be lost if not inside a stencil proc's box
+-     can happen if atom moves outside of non-periodic boundary
+-     or if atom moves more than one proc away
+-   this routine called before every reneighboring
+-   for triclinic, atoms must be in lamda coords (0-1) before exchange is called
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::exchange()
+-{
+-  int i,m,nsend,nrecv,nrecv1,nrecv2,nlocal;
+-  double lo,hi,value;
+-  double **x;
+-  double *sublo,*subhi;
+-  MPI_Request request;
+-  AtomVec *avec = atom->avec;
+-
+-  // clear global->local map for owned and ghost atoms
+-  // b/c atoms migrate to new procs in exchange() and
+-  //   new ghosts are created in borders()
+-  // map_set() is done at end of borders()
+-  // clear ghost count and any ghost bonus data internal to AtomVec
+-
+-  if (map_style != Atom::MAP_NONE) atom->map_clear();
+-  atom->nghost = 0;
+-  atom->avec->clear_bonus();
+-
+-  // ensure send buf has extra space for a single atom
+-  // only need to reset if a fix can dynamically add to size of single atom
+-
+-  if (maxexchange_fix_dynamic) {
+-    int bufextra_old = bufextra;
+-    init_exchange();
+-    if (bufextra > bufextra_old) grow_send(maxsend+bufextra,2);
+-  }
+-
+-  // subbox bounds for orthogonal or triclinic
+-
+-  if (triclinic == 0) {
+-    sublo = domain->sublo;
+-    subhi = domain->subhi;
+-  } else {
+-    sublo = domain->sublo_lamda;
+-    subhi = domain->subhi_lamda;
+-  }
+-
+-  // loop over dimensions
+-
+-  int dimension = domain->dimension;
+-
+-  for (int dim = 0; dim < dimension; dim++) {
+-
+-    // fill buffer with atoms leaving my box, using < and >=
+-    // when atom is deleted, fill it in with last atom
+-
+-    x = atom->x;
+-    lo = sublo[dim];
+-    hi = subhi[dim];
+-    nlocal = atom->nlocal;
+-    i = nsend = 0;
+-
+-    while (i < nlocal) {
+-      if (x[i][dim] < lo || x[i][dim] >= hi) {
+-        if (nsend > maxsend) grow_send(nsend,1);
+-        nsend += avec->pack_exchange(i,&buf_send[nsend]);
+-        avec->copy(nlocal-1,i,1);
+-        nlocal--;
+-      } else i++;
+-    }
+-    atom->nlocal = nlocal;
+-
+-    // send/recv atoms in both directions
+-    // send size of message first so receiver can realloc buf_recv if needed
+-    // if 1 proc in dimension, no send/recv
+-    //   set nrecv = 0 so buf_send atoms will be lost
+-    // if 2 procs in dimension, single send/recv
+-    // if more than 2 procs in dimension, send/recv to both neighbors
+-
+-    if (procgrid[dim] == 1) nrecv = 0;
+-    else {
+-      MPI_Sendrecv(&nsend,1,MPI_INT,procneigh[dim][0],0,
+-                   &nrecv1,1,MPI_INT,procneigh[dim][1],0,world,MPI_STATUS_IGNORE);
+-      nrecv = nrecv1;
+-      if (procgrid[dim] > 2) {
+-        MPI_Sendrecv(&nsend,1,MPI_INT,procneigh[dim][1],0,
+-                     &nrecv2,1,MPI_INT,procneigh[dim][0],0,world,MPI_STATUS_IGNORE);
+-        nrecv += nrecv2;
+-      }
+-      if (nrecv > maxrecv) grow_recv(nrecv);
+-
+-      MPI_Irecv(buf_recv,nrecv1,MPI_DOUBLE,procneigh[dim][1],0,world,&request);
+-      MPI_Send(buf_send,nsend,MPI_DOUBLE,procneigh[dim][0],0,world);
+-      MPI_Wait(&request,MPI_STATUS_IGNORE);
+-
+-      if (procgrid[dim] > 2) {
+-        MPI_Irecv(&buf_recv[nrecv1],nrecv2,MPI_DOUBLE,procneigh[dim][0],0,world,&request);
+-        MPI_Send(buf_send,nsend,MPI_DOUBLE,procneigh[dim][1],0,world);
+-        MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      }
+-    }
+-
+-    // check incoming atoms to see if they are in my box
+-    // if so, add to my list
+-    // box check is only for this dimension,
+-    //   atom may be passed to another proc in later dims
+-
+-    m = 0;
+-    while (m < nrecv) {
+-      value = buf_recv[m+dim+1];
+-      if (value >= lo && value < hi) m += avec->unpack_exchange(&buf_recv[m]);
+-      else m += static_cast<int> (buf_recv[m]);
+-    }
+-  }
+-
+-  if (atom->firstgroupname) atom->first_reorder();
+-}
+-
+-/* ----------------------------------------------------------------------
+-   borders: list nearby atoms to send to neighboring procs at every timestep
+-   one list is created for every swap that will be made
+-   as list is made, actually do swaps
+-   this does equivalent of a forward_comm(), so don't need to explicitly
+-     call forward_comm() on reneighboring timestep
+-   this routine is called before every reneighboring
+-   for triclinic, atoms must be in lamda coords (0-1) before borders is called
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::borders()
+-{
+-  int i,n,itype,icollection,iswap,dim,ineed,twoneed;
+-  int nsend,nrecv,sendflag,nfirst,nlast,ngroup,nprior;
+-  double lo,hi;
+-  int *type;
+-  int *collection;
+-  double **x;
+-  double *buf,*mlo,*mhi;
+-  MPI_Request request;
+-  AtomVec *avec = atom->avec;
+-
+-  // After exchanging/sorting, need to reconstruct collection array for border communication
+-  if (mode == Comm::MULTI) neighbor->build_collection(0);
+-
+-  // do swaps over all 3 dimensions
+-
+-  iswap = 0;
+-  smax = rmax = 0;
+-
+-  for (dim = 0; dim < 3; dim++) {
+-    nlast = 0;
+-    twoneed = 2*maxneed[dim];
+-    for (ineed = 0; ineed < twoneed; ineed++) {
+-
+-      // find atoms within slab boundaries lo/hi using <= and >=
+-      // check atoms between nfirst and nlast
+-      //   for first swaps in a dim, check owned and ghost
+-      //   for later swaps in a dim, only check newly arrived ghosts
+-      // store sent atom indices in sendlist for use in future timesteps
+-
+-      x = atom->x;
+-      if (mode == Comm::SINGLE) {
+-        lo = slablo[iswap];
+-        hi = slabhi[iswap];
+-      } else if (mode == Comm::MULTI) {
+-        collection = neighbor->collection;
+-        mlo = multilo[iswap];
+-        mhi = multihi[iswap];
+-      } else {
+-        type = atom->type;
+-        mlo = multioldlo[iswap];
+-        mhi = multioldhi[iswap];
+-      }
+-      if (ineed % 2 == 0) {
+-        nfirst = nlast;
+-        nlast = atom->nlocal + atom->nghost;
+-      }
+-
+-      nsend = 0;
+-
+-      // sendflag = 0 if I do not send on this swap
+-      // sendneed test indicates receiver no longer requires data
+-      // e.g. due to non-PBC or non-uniform sub-domains
+-
+-      if (ineed/2 >= sendneed[dim][ineed % 2]) sendflag = 0;
+-      else sendflag = 1;
+-
+-      // find send atoms according to SINGLE vs MULTI
+-      // all atoms eligible versus only atoms in bordergroup
+-      // can only limit loop to bordergroup for first sends (ineed < 2)
+-      // on these sends, break loop in two: owned (in group) and ghost
+-
+-      if (sendflag) {
+-        if (!bordergroup || ineed >= 2) {
+-          if (mode == Comm::SINGLE) {
+-            for (i = nfirst; i < nlast; i++)
+-              if (x[i][dim] >= lo && x[i][dim] <= hi) {
+-                if (nsend == maxsendlist[iswap]) grow_list(iswap,nsend);
+-                sendlist[iswap][nsend++] = i;
+-              }
+-          } else if (mode == Comm::MULTI) {
+-            for (i = nfirst; i < nlast; i++) {
+-              icollection = collection[i];
+-              if (x[i][dim] >= mlo[icollection] && x[i][dim] <= mhi[icollection]) {
+-                if (nsend == maxsendlist[iswap]) grow_list(iswap,nsend);
+-                sendlist[iswap][nsend++] = i;
+-              }
+-            }
+-          } else {
+-            for (i = nfirst; i < nlast; i++) {
+-              itype = type[i];
+-              if (x[i][dim] >= mlo[itype] && x[i][dim] <= mhi[itype]) {
+-                if (nsend == maxsendlist[iswap]) grow_list(iswap,nsend);
+-                sendlist[iswap][nsend++] = i;
+-              }
+-            }
+-          }
+-
+-        } else {
+-          if (mode == Comm::SINGLE) {
+-            ngroup = atom->nfirst;
+-            for (i = 0; i < ngroup; i++)
+-              if (x[i][dim] >= lo && x[i][dim] <= hi) {
+-                if (nsend == maxsendlist[iswap]) grow_list(iswap,nsend);
+-                sendlist[iswap][nsend++] = i;
+-              }
+-            for (i = atom->nlocal; i < nlast; i++)
+-              if (x[i][dim] >= lo && x[i][dim] <= hi) {
+-                if (nsend == maxsendlist[iswap]) grow_list(iswap,nsend);
+-                sendlist[iswap][nsend++] = i;
+-              }
+-          } else if (mode == Comm::MULTI) {
+-            ngroup = atom->nfirst;
+-            for (i = 0; i < ngroup; i++) {
+-              icollection = collection[i];
+-              if (x[i][dim] >= mlo[icollection] && x[i][dim] <= mhi[icollection]) {
+-                if (nsend == maxsendlist[iswap]) grow_list(iswap,nsend);
+-                sendlist[iswap][nsend++] = i;
+-              }
+-            }
+-            for (i = atom->nlocal; i < nlast; i++) {
+-              icollection = collection[i];
+-              if (x[i][dim] >= mlo[icollection] && x[i][dim] <= mhi[icollection]) {
+-                if (nsend == maxsendlist[iswap]) grow_list(iswap,nsend);
+-                sendlist[iswap][nsend++] = i;
+-              }
+-            }
+-          } else {
+-            ngroup = atom->nfirst;
+-            for (i = 0; i < ngroup; i++) {
+-              itype = type[i];
+-              if (x[i][dim] >= mlo[itype] && x[i][dim] <= mhi[itype]) {
+-                if (nsend == maxsendlist[iswap]) grow_list(iswap,nsend);
+-                sendlist[iswap][nsend++] = i;
+-              }
+-            }
+-            for (i = atom->nlocal; i < nlast; i++) {
+-              itype = type[i];
+-              if (x[i][dim] >= mlo[itype] && x[i][dim] <= mhi[itype]) {
+-                if (nsend == maxsendlist[iswap]) grow_list(iswap,nsend);
+-                sendlist[iswap][nsend++] = i;
+-              }
+-            }
+-          }
+-        }
+-      }
+-
+-      // pack up list of border atoms
+-
+-      if (nsend*size_border > maxsend) grow_send(nsend*size_border,0);
+-      if (ghost_velocity)
+-        n = avec->pack_border_vel(nsend,sendlist[iswap],buf_send,pbc_flag[iswap],pbc[iswap]);
+-      else
+-        n = avec->pack_border(nsend,sendlist[iswap],buf_send,pbc_flag[iswap],pbc[iswap]);
+-
+-      // swap atoms with other proc
+-      // no MPI calls except SendRecv if nsend/nrecv = 0
+-      // put incoming ghosts at end of my atom arrays
+-      // if swapping with self, simply copy, no messages
+-
+-      if (sendproc[iswap] != me) {
+-        MPI_Sendrecv(&nsend,1,MPI_INT,sendproc[iswap],0,
+-                     &nrecv,1,MPI_INT,recvproc[iswap],0,world,MPI_STATUS_IGNORE);
+-        if (nrecv*size_border > maxrecv) grow_recv(nrecv*size_border);
+-        if (nrecv) MPI_Irecv(buf_recv,nrecv*size_border,MPI_DOUBLE,
+-                             recvproc[iswap],0,world,&request);
+-        if (n) MPI_Send(buf_send,n,MPI_DOUBLE,sendproc[iswap],0,world);
+-        if (nrecv) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-        buf = buf_recv;
+-      } else {
+-        nrecv = nsend;
+-        buf = buf_send;
+-      }
+-
+-      // unpack buffer
+-
+-      if (ghost_velocity)
+-        avec->unpack_border_vel(nrecv,atom->nlocal+atom->nghost,buf);
+-      else
+-        avec->unpack_border(nrecv,atom->nlocal+atom->nghost,buf);
+-
+-      // set all pointers & counters
+-
+-      smax = MAX(smax,nsend);
+-      rmax = MAX(rmax,nrecv);
+-      sendnum[iswap] = nsend;
+-      recvnum[iswap] = nrecv;
+-      size_forward_recv[iswap] = nrecv*size_forward;
+-      size_reverse_send[iswap] = nrecv*size_reverse;
+-      size_reverse_recv[iswap] = nsend*size_reverse;
+-      firstrecv[iswap] = atom->nlocal + atom->nghost;
+-      nprior = atom->nlocal + atom->nghost;
+-      atom->nghost += nrecv;
+-      if (neighbor->style == Neighbor::MULTI) neighbor->build_collection(nprior);
+-
+-      iswap++;
+-    }
+-  }
+-
+-  // For molecular systems we lose some bits for local atom indices due
+-  // to encoding of special pairs in neighbor lists. Check for overflows.
+-
+-  if ((atom->molecular != Atom::ATOMIC)
+-      && ((atom->nlocal + atom->nghost) > NEIGHMASK))
+-    error->one(FLERR,"Per-processor number of atoms is too large for "
+-               "molecular neighbor lists");
+-
+-  // ensure send/recv buffers are long enough for all forward & reverse comm
+-
+-  int max = MAX(maxforward*smax,maxreverse*rmax);
+-  if (max > maxsend) grow_send(max,0);
+-  max = MAX(maxforward*rmax,maxreverse*smax);
+-  if (max > maxrecv) grow_recv(max);
+-
+-  // reset global->local map
+-
+-  if (map_style != Atom::MAP_NONE) atom->map_set();
+-}
+-
+-/* ----------------------------------------------------------------------
+-   forward communication invoked by a Pair
+-   nsize used only to set recv buffer limit
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::forward_comm(Pair *pair)
+-{
+-  int iswap,n;
+-  double *buf;
+-  MPI_Request request;
+-
+-  int nsize = pair->comm_forward;
+-
+-  for (iswap = 0; iswap < nswap; iswap++) {
+-
+-    // pack buffer
+-
+-    n = pair->pack_forward_comm(sendnum[iswap],sendlist[iswap],buf_send,pbc_flag[iswap],pbc[iswap]);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (recvnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*recvnum[iswap],MPI_DOUBLE,recvproc[iswap],0,world,&request);
+-      if (sendnum[iswap])
+-        MPI_Send(buf_send,n,MPI_DOUBLE,sendproc[iswap],0,world);
+-      if (recvnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    pair->unpack_forward_comm(recvnum[iswap],firstrecv[iswap],buf);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   reverse communication invoked by a Pair
+-   nsize used only to set recv buffer limit
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::reverse_comm(Pair *pair)
+-{
+-  int iswap,n;
+-  double *buf;
+-  MPI_Request request;
+-
+-  int nsize = MAX(pair->comm_reverse,pair->comm_reverse_off);
+-
+-  for (iswap = nswap-1; iswap >= 0; iswap--) {
+-
+-    // pack buffer
+-
+-    n = pair->pack_reverse_comm(recvnum[iswap],firstrecv[iswap],buf_send);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (sendnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*sendnum[iswap],MPI_DOUBLE,sendproc[iswap],0,world,&request);
+-      if (recvnum[iswap])
+-        MPI_Send(buf_send,n,MPI_DOUBLE,recvproc[iswap],0,world);
+-      if (sendnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    pair->unpack_reverse_comm(sendnum[iswap],sendlist[iswap],buf);
+-  }
+-}
+-
+-void CommBrick::forward_comm(PairE3GNNParallel *pair)
+-{
+-  int iswap,n;
+-  MPI_Request request;
+-
+-  const bool comm_preprocess_done = pair->is_comm_preprocess_done();
+-  const int nsize = pair->get_x_dim();
+-  float *buf_send_, *buf_recv_;
+-  if(pair->use_cuda_mpi_()) {
+-    DeviceBuffManager::getInstance().get_buffer(maxsend+bufextra, maxrecv,buf_send_, buf_recv_);
+-  } else {
+-    buf_send_ = reinterpret_cast<float*>(buf_send);
+-    buf_recv_ = reinterpret_cast<float*>(buf_recv);
+-  }
+-  if(!comm_preprocess_done) {
+-    pair->notify_proc_ids(sendproc, recvproc);
+-  }
+-  if (nswap > 6) error->all(FLERR,"PairE3GNNParallel: Cell size is too small. Please use a single GPU or make a supercell");
+-
+-  for (iswap = 0; iswap < nswap; iswap++) {
+-    if(sendproc[iswap] == me) continue;
+-
+-    if(!comm_preprocess_done) {
+-      pair->pack_forward_init(sendnum[iswap], sendlist[iswap], iswap);
+-      pair->unpack_forward_init(recvnum[iswap], firstrecv[iswap], iswap);
+-    } else {
+-      n = pair->pack_forward_comm_gnn(buf_send_, iswap);
+-
+-      if (recvnum[iswap])
+-        MPI_Irecv(buf_recv_,nsize*recvnum[iswap],MPI_FLOAT,recvproc[iswap],0,world,&request);
+-      if (sendnum[iswap])
+-        MPI_Send(buf_send_,n,MPI_FLOAT,sendproc[iswap],0,world);
+-      if (recvnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-
+-      pair->unpack_forward_comm_gnn(buf_recv_, iswap);
+-    }
+-  }
+-}
+-
+-void CommBrick::reverse_comm(PairE3GNNParallel *pair)
+-{
+-  int iswap,n;
+-  MPI_Request request;
+-
+-  const bool comm_preprocess_done = pair->is_comm_preprocess_done();
+-  int nsize = pair->get_x_dim();
+-  float *buf_send_, *buf_recv_;
+-  if(pair->use_cuda_mpi_()) {
+-    DeviceBuffManager::getInstance().get_buffer(maxsend+bufextra, maxrecv,buf_send_, buf_recv_);
+-  } else {
+-    buf_send_ = reinterpret_cast<float*>(buf_send);
+-    buf_recv_ = reinterpret_cast<float*>(buf_recv);
+-  }
+-
+-  for (iswap = nswap-1; iswap >= 0; iswap--) {
+-    if(sendproc[iswap] == me) continue;
+-    n = pair->pack_reverse_comm_gnn(buf_send_, iswap);
+-
+-    if (sendnum[iswap])
+-      MPI_Irecv(buf_recv_,nsize*sendnum[iswap],MPI_FLOAT,sendproc[iswap],0,world,&request);
+-    if (recvnum[iswap])
+-      MPI_Send(buf_send_,n,MPI_FLOAT,recvproc[iswap],0,world);
+-    if (sendnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-
+-    pair->unpack_reverse_comm_gnn(buf_recv_, iswap);
+-  }
+-}
+-/* ----------------------------------------------------------------------
+-   forward communication invoked by a Bond
+-   nsize used only to set recv buffer limit
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::forward_comm(Bond *bond)
+-{
+-  int iswap,n;
+-  double *buf;
+-  MPI_Request request;
+-
+-  int nsize = bond->comm_forward;
+-
+-  for (iswap = 0; iswap < nswap; iswap++) {
+-
+-    // pack buffer
+-
+-    n = bond->pack_forward_comm(sendnum[iswap],sendlist[iswap],buf_send,pbc_flag[iswap],pbc[iswap]);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (recvnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*recvnum[iswap],MPI_DOUBLE,recvproc[iswap],0,world,&request);
+-      if (sendnum[iswap])
+-        MPI_Send(buf_send,n,MPI_DOUBLE,sendproc[iswap],0,world);
+-      if (recvnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    bond->unpack_forward_comm(recvnum[iswap],firstrecv[iswap],buf);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   reverse communication invoked by a Bond
+-   nsize used only to set recv buffer limit
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::reverse_comm(Bond *bond)
+-{
+-  int iswap,n;
+-  double *buf;
+-  MPI_Request request;
+-
+-  int nsize = MAX(bond->comm_reverse,bond->comm_reverse_off);
+-
+-  for (iswap = nswap-1; iswap >= 0; iswap--) {
+-
+-    // pack buffer
+-
+-    n = bond->pack_reverse_comm(recvnum[iswap],firstrecv[iswap],buf_send);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (sendnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*sendnum[iswap],MPI_DOUBLE,sendproc[iswap],0,world,&request);
+-      if (recvnum[iswap])
+-        MPI_Send(buf_send,n,MPI_DOUBLE,recvproc[iswap],0,world);
+-      if (sendnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    bond->unpack_reverse_comm(sendnum[iswap],sendlist[iswap],buf);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   forward communication invoked by a Fix
+-   size/nsize used only to set recv buffer limit
+-   size = 0 (default) -> use comm_forward from Fix
+-   size > 0 -> Fix passes max size per atom
+-   the latter is only useful if Fix does several comm modes,
+-     some are smaller than max stored in its comm_forward
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::forward_comm(Fix *fix, int size)
+-{
+-  int iswap,n,nsize;
+-  double *buf;
+-  MPI_Request request;
+-
+-  if (size) nsize = size;
+-  else nsize = fix->comm_forward;
+-
+-  for (iswap = 0; iswap < nswap; iswap++) {
+-
+-    // pack buffer
+-
+-    n = fix->pack_forward_comm(sendnum[iswap],sendlist[iswap],buf_send,pbc_flag[iswap],pbc[iswap]);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (recvnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*recvnum[iswap],MPI_DOUBLE,recvproc[iswap],0,world,&request);
+-      if (sendnum[iswap])
+-        MPI_Send(buf_send,n,MPI_DOUBLE,sendproc[iswap],0,world);
+-      if (recvnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    fix->unpack_forward_comm(recvnum[iswap],firstrecv[iswap],buf);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   reverse communication invoked by a Fix
+-   size/nsize used only to set recv buffer limit
+-   size = 0 (default) -> use comm_forward from Fix
+-   size > 0 -> Fix passes max size per atom
+-   the latter is only useful if Fix does several comm modes,
+-     some are smaller than max stored in its comm_forward
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::reverse_comm(Fix *fix, int size)
+-{
+-  int iswap,n,nsize;
+-  double *buf;
+-  MPI_Request request;
+-
+-  if (size) nsize = size;
+-  else nsize = fix->comm_reverse;
+-
+-  for (iswap = nswap-1; iswap >= 0; iswap--) {
+-
+-    // pack buffer
+-
+-    n = fix->pack_reverse_comm(recvnum[iswap],firstrecv[iswap],buf_send);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (sendnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*sendnum[iswap],MPI_DOUBLE,sendproc[iswap],0,world,&request);
+-      if (recvnum[iswap])
+-        MPI_Send(buf_send,n,MPI_DOUBLE,recvproc[iswap],0,world);
+-      if (sendnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    fix->unpack_reverse_comm(sendnum[iswap],sendlist[iswap],buf);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   reverse communication invoked by a Fix with variable size data
+-   query fix for pack size to ensure buf_send is big enough
+-   handshake sizes before each Irecv/Send to ensure buf_recv is big enough
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::reverse_comm_variable(Fix *fix)
+-{
+-  int iswap,nsend,nrecv;
+-  double *buf;
+-  MPI_Request request;
+-
+-  for (iswap = nswap-1; iswap >= 0; iswap--) {
+-
+-    // pack buffer
+-
+-    nsend = fix->pack_reverse_comm_size(recvnum[iswap],firstrecv[iswap]);
+-    if (nsend > maxsend) grow_send(nsend,0);
+-    nsend = fix->pack_reverse_comm(recvnum[iswap],firstrecv[iswap],buf_send);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      MPI_Sendrecv(&nsend,1,MPI_INT,recvproc[iswap],0,
+-                   &nrecv,1,MPI_INT,sendproc[iswap],0,world,MPI_STATUS_IGNORE);
+-
+-      if (sendnum[iswap]) {
+-        if (nrecv > maxrecv) grow_recv(nrecv);
+-        MPI_Irecv(buf_recv,maxrecv,MPI_DOUBLE,sendproc[iswap],0,world,&request);
+-      }
+-      if (recvnum[iswap])
+-        MPI_Send(buf_send,nsend,MPI_DOUBLE,recvproc[iswap],0,world);
+-      if (sendnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    fix->unpack_reverse_comm(sendnum[iswap],sendlist[iswap],buf);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   forward communication invoked by a Compute
+-   nsize used only to set recv buffer limit
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::forward_comm(Compute *compute)
+-{
+-  int iswap,n;
+-  double *buf;
+-  MPI_Request request;
+-
+-  int nsize = compute->comm_forward;
+-
+-  for (iswap = 0; iswap < nswap; iswap++) {
+-
+-    // pack buffer
+-
+-    n = compute->pack_forward_comm(sendnum[iswap],sendlist[iswap],
+-                                   buf_send,pbc_flag[iswap],pbc[iswap]);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (recvnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*recvnum[iswap],MPI_DOUBLE,recvproc[iswap],0,world,&request);
+-      if (sendnum[iswap])
+-        MPI_Send(buf_send,n,MPI_DOUBLE,sendproc[iswap],0,world);
+-      if (recvnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    compute->unpack_forward_comm(recvnum[iswap],firstrecv[iswap],buf);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   reverse communication invoked by a Compute
+-   nsize used only to set recv buffer limit
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::reverse_comm(Compute *compute)
+-{
+-  int iswap,n;
+-  double *buf;
+-  MPI_Request request;
+-
+-  int nsize = compute->comm_reverse;
+-
+-  for (iswap = nswap-1; iswap >= 0; iswap--) {
+-
+-    // pack buffer
+-
+-    n = compute->pack_reverse_comm(recvnum[iswap],firstrecv[iswap],buf_send);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (sendnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*sendnum[iswap],MPI_DOUBLE,sendproc[iswap],0,world,&request);
+-      if (recvnum[iswap])
+-        MPI_Send(buf_send,n,MPI_DOUBLE,recvproc[iswap],0,world);
+-      if (sendnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    compute->unpack_reverse_comm(sendnum[iswap],sendlist[iswap],buf);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   forward communication invoked by a Dump
+-   nsize used only to set recv buffer limit
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::forward_comm(Dump *dump)
+-{
+-  int iswap,n;
+-  double *buf;
+-  MPI_Request request;
+-
+-  int nsize = dump->comm_forward;
+-
+-  for (iswap = 0; iswap < nswap; iswap++) {
+-
+-    // pack buffer
+-
+-    n = dump->pack_forward_comm(sendnum[iswap],sendlist[iswap],
+-                                buf_send,pbc_flag[iswap],pbc[iswap]);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (recvnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*recvnum[iswap],MPI_DOUBLE,recvproc[iswap],0,world,&request);
+-      if (sendnum[iswap])
+-        MPI_Send(buf_send,n,MPI_DOUBLE,sendproc[iswap],0,world);
+-      if (recvnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    dump->unpack_forward_comm(recvnum[iswap],firstrecv[iswap],buf);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   reverse communication invoked by a Dump
+-   nsize used only to set recv buffer limit
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::reverse_comm(Dump *dump)
+-{
+-  int iswap,n;
+-  double *buf;
+-  MPI_Request request;
+-
+-  int nsize = dump->comm_reverse;
+-
+-  for (iswap = nswap-1; iswap >= 0; iswap--) {
+-
+-    // pack buffer
+-
+-    n = dump->pack_reverse_comm(recvnum[iswap],firstrecv[iswap],buf_send);
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (sendnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*sendnum[iswap],MPI_DOUBLE,sendproc[iswap],0,world,&request);
+-      if (recvnum[iswap])
+-        MPI_Send(buf_send,n,MPI_DOUBLE,recvproc[iswap],0,world);
+-      if (sendnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    dump->unpack_reverse_comm(sendnum[iswap],sendlist[iswap],buf);
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   forward communication of N values in per-atom array
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::forward_comm_array(int nsize, double **array)
+-{
+-  int i,j,k,m,iswap,last;
+-  double *buf;
+-  MPI_Request request;
+-
+-  // ensure send/recv bufs are big enough for nsize
+-  // based on smax/rmax from most recent borders() invocation
+-
+-  if (nsize > maxforward) {
+-    maxforward = nsize;
+-    if (maxforward*smax > maxsend) grow_send(maxforward*smax,0);
+-    if (maxforward*rmax > maxrecv) grow_recv(maxforward*rmax);
+-  }
+-
+-  for (iswap = 0; iswap < nswap; iswap++) {
+-
+-    // pack buffer
+-
+-    m = 0;
+-    for (i = 0; i < sendnum[iswap]; i++) {
+-      j = sendlist[iswap][i];
+-      for (k = 0; k < nsize; k++)
+-        buf_send[m++] = array[j][k];
+-    }
+-
+-    // exchange with another proc
+-    // if self, set recv buffer to send buffer
+-
+-    if (sendproc[iswap] != me) {
+-      if (recvnum[iswap])
+-        MPI_Irecv(buf_recv,nsize*recvnum[iswap],MPI_DOUBLE,recvproc[iswap],0,world,&request);
+-      if (sendnum[iswap])
+-        MPI_Send(buf_send,nsize*sendnum[iswap],MPI_DOUBLE,sendproc[iswap],0,world);
+-      if (recvnum[iswap]) MPI_Wait(&request,MPI_STATUS_IGNORE);
+-      buf = buf_recv;
+-    } else buf = buf_send;
+-
+-    // unpack buffer
+-
+-    m = 0;
+-    last = firstrecv[iswap] + recvnum[iswap];
+-    for (i = firstrecv[iswap]; i < last; i++)
+-      for (k = 0; k < nsize; k++)
+-        array[i][k] = buf[m++];
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   realloc the size of the send buffer as needed with BUFFACTOR and bufextra
+-   flag = 0, don't need to realloc with copy, just free/malloc w/ BUFFACTOR
+-   flag = 1, realloc with BUFFACTOR
+-   flag = 2, free/malloc w/out BUFFACTOR
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::grow_send(int n, int flag)
+-{
+-  if (flag == 0) {
+-    maxsend = static_cast<int> (BUFFACTOR * n);
+-    memory->destroy(buf_send);
+-    memory->create(buf_send,maxsend+bufextra,"comm:buf_send");
+-  } else if (flag == 1) {
+-    maxsend = static_cast<int> (BUFFACTOR * n);
+-    memory->grow(buf_send,maxsend+bufextra,"comm:buf_send");
+-  } else {
+-    memory->destroy(buf_send);
+-    memory->grow(buf_send,maxsend+bufextra,"comm:buf_send");
+-  }
+-}
+-
+-/* ----------------------------------------------------------------------
+-   free/malloc the size of the recv buffer as needed with BUFFACTOR
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::grow_recv(int n)
+-{
+-  maxrecv = static_cast<int> (BUFFACTOR * n);
+-  memory->destroy(buf_recv);
+-  memory->create(buf_recv,maxrecv,"comm:buf_recv");
+-}
+-
+-/* ----------------------------------------------------------------------
+-   realloc the size of the iswap sendlist as needed with BUFFACTOR
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::grow_list(int iswap, int n)
+-{
+-  maxsendlist[iswap] = static_cast<int> (BUFFACTOR * n);
+-  memory->grow(sendlist[iswap],maxsendlist[iswap],"comm:sendlist[iswap]");
+-}
+-
+-/* ----------------------------------------------------------------------
+-   realloc the buffers needed for swaps
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::grow_swap(int n)
+-{
+-  free_swap();
+-  allocate_swap(n);
+-  if (mode == Comm::MULTI) {
+-    free_multi();
+-    allocate_multi(n);
+-  }
+-
+-  if (mode == Comm::MULTIOLD) {
+-    free_multiold();
+-    allocate_multiold(n);
+-  }
+-
+-
+-  sendlist = (int **)
+-    memory->srealloc(sendlist,n*sizeof(int *),"comm:sendlist");
+-  memory->grow(maxsendlist,n,"comm:maxsendlist");
+-  for (int i = maxswap; i < n; i++) {
+-    maxsendlist[i] = BUFMIN;
+-    memory->create(sendlist[i],BUFMIN,"comm:sendlist[i]");
+-  }
+-  maxswap = n;
+-}
+-
+-/* ----------------------------------------------------------------------
+-   allocation of swap info
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::allocate_swap(int n)
+-{
+-  memory->create(sendnum,n,"comm:sendnum");
+-  memory->create(recvnum,n,"comm:recvnum");
+-  memory->create(sendproc,n,"comm:sendproc");
+-  memory->create(recvproc,n,"comm:recvproc");
+-  memory->create(size_forward_recv,n,"comm:size");
+-  memory->create(size_reverse_send,n,"comm:size");
+-  memory->create(size_reverse_recv,n,"comm:size");
+-  memory->create(slablo,n,"comm:slablo");
+-  memory->create(slabhi,n,"comm:slabhi");
+-  memory->create(firstrecv,n,"comm:firstrecv");
+-  memory->create(pbc_flag,n,"comm:pbc_flag");
+-  memory->create(pbc,n,6,"comm:pbc");
+-}
+-
+-/* ----------------------------------------------------------------------
+-   allocation of multi-collection swap info
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::allocate_multi(int n)
+-{
+-  multilo = memory->create(multilo,n,ncollections,"comm:multilo");
+-  multihi = memory->create(multihi,n,ncollections,"comm:multihi");
+-}
+-
+-/* ----------------------------------------------------------------------
+-   allocation of multi/old-type swap info
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::allocate_multiold(int n)
+-{
+-  multioldlo = memory->create(multioldlo,n,atom->ntypes+1,"comm:multioldlo");
+-  multioldhi = memory->create(multioldhi,n,atom->ntypes+1,"comm:multioldhi");
+-}
+-
+-
+-/* ----------------------------------------------------------------------
+-   free memory for swaps
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::free_swap()
+-{
+-  memory->destroy(sendnum);
+-  memory->destroy(recvnum);
+-  memory->destroy(sendproc);
+-  memory->destroy(recvproc);
+-  memory->destroy(size_forward_recv);
+-  memory->destroy(size_reverse_send);
+-  memory->destroy(size_reverse_recv);
+-  memory->destroy(slablo);
+-  memory->destroy(slabhi);
+-  memory->destroy(firstrecv);
+-  memory->destroy(pbc_flag);
+-  memory->destroy(pbc);
+-}
+-
+-/* ----------------------------------------------------------------------
+-   free memory for multi-collection swaps
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::free_multi()
+-{
+-  memory->destroy(multilo);
+-  memory->destroy(multihi);
+-  multilo = multihi = nullptr;
+-}
+-
+-/* ----------------------------------------------------------------------
+-   free memory for multi/old-type swaps
+-------------------------------------------------------------------------- */
+-
+-void CommBrick::free_multiold()
+-{
+-  memory->destroy(multioldlo);
+-  memory->destroy(multioldhi);
+-  multioldlo = multioldhi = nullptr;
+-}
+-
+-/* ----------------------------------------------------------------------
+-   extract data potentially useful to other classes
+-------------------------------------------------------------------------- */
+-
+-void *CommBrick::extract(const char *str, int &dim)
+-{
+-  dim = 0;
+-  if (strcmp(str,"localsendlist") == 0) {
+-    int i, iswap, isend;
+-    dim = 1;
+-    if (!localsendlist)
+-      memory->create(localsendlist,atom->nlocal,"comm:localsendlist");
+-    else
+-      memory->grow(localsendlist,atom->nlocal,"comm:localsendlist");
+-
+-    for (i = 0; i < atom->nlocal; i++)
+-      localsendlist[i] = 0;
+-
+-    for (iswap = 0; iswap < nswap; iswap++)
+-      for (isend = 0; isend < sendnum[iswap]; isend++)
+-        if (sendlist[iswap][isend] < atom->nlocal)
+-          localsendlist[sendlist[iswap][isend]] = 1;
+-
+-    return (void *) localsendlist;
+-  }
+-
+-  return nullptr;
+-}
+-
+-/* ----------------------------------------------------------------------
+-   return # of bytes of allocated memory
+-------------------------------------------------------------------------- */
+-
+-double CommBrick::memory_usage()
+-{
+-  double bytes = 0;
+-  bytes += (double)nprocs * sizeof(int);    // grid2proc
+-  for (int i = 0; i < nswap; i++)
+-    bytes += memory->usage(sendlist[i],maxsendlist[i]);
+-  bytes += memory->usage(buf_send,maxsend+bufextra);
+-  bytes += memory->usage(buf_recv,maxrecv);
+-  return bytes;
+-}
+diff --git a/sevenn/pair_e3gnn/comm_brick.h b/sevenn/pair_e3gnn/comm_brick.h
+deleted file mode 100644
+index 7fd1010..0000000
+--- a/sevenn/pair_e3gnn/comm_brick.h
++++ /dev/null
+@@ -1,104 +0,0 @@
+-/* -*- c++ -*- ----------------------------------------------------------
+-   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+-   https://www.lammps.org/, Sandia National Laboratories
+-   LAMMPS development team: developers@lammps.org
+-
+-   Copyright (2003) Sandia Corporation.  Under the terms of Contract
+-   DE-AC04-94AL85000 with Sandia Corporation, the U.S. Government retains
+-   certain rights in this software.  This software is distributed under
+-   the GNU General Public License.
+-
+-   See the README file in the top-level LAMMPS directory.
+-------------------------------------------------------------------------- */
+-
+-#ifndef LMP_COMM_BRICK_H
+-#define LMP_COMM_BRICK_H
+-
+-#include "comm.h"
+-
+-namespace LAMMPS_NS {
+-
+-class CommBrick : public Comm {
+-public:
+-  CommBrick(class LAMMPS *);
+-  CommBrick(class LAMMPS *, class Comm *);
+-
+-  ~CommBrick() override;
+-
+-  void init() override;
+-  void setup() override;                     // setup 3d comm pattern
+-  void forward_comm(int dummy = 0) override; // forward comm of atom coords
+-  void reverse_comm() override;              // reverse comm of forces
+-  void exchange() override;                  // move atoms to new procs
+-  void borders() override;                   // setup list of atoms to comm
+-
+-  void forward_comm(class Pair *) override; // forward comm from a Pair
+-  void reverse_comm(class Pair *) override; // reverse comm from a Pair
+-  void forward_comm(class Bond *) override; // forward comm from a Bond
+-  void reverse_comm(class Bond *) override; // reverse comm from a Bond
+-  void forward_comm(class Fix *, int size = 0) override; // forward comm from a Fix
+-  void reverse_comm(class Fix *, int size = 0) override; // reverse comm from a Fix
+-  void reverse_comm_variable(class Fix *) override; // variable size reverse comm from a Fix
+-  void forward_comm(class Compute *) override; // forward from a Compute
+-  void reverse_comm(class Compute *) override; // reverse from a Compute
+-  void forward_comm(class Dump *) override;    // forward comm from a Dump
+-  void reverse_comm(class Dump *) override;    // reverse comm from a Dump
+-
+-  void forward_comm_array(int, double **) override; // forward comm of array
+-  void *extract(const char *, int &) override;
+-  double memory_usage() override;
+-
+-  // patched from SevenNet //
+-  void forward_comm(class PairE3GNNParallel *);
+-  void reverse_comm(class PairE3GNNParallel *);
+-  // patched from SevenNet //
+-
+-protected:
+-  int nswap;                   // # of swaps to perform = sum of maxneed
+-  int recvneed[3][2];          // # of procs away I recv atoms from
+-  int sendneed[3][2];          // # of procs away I send atoms to
+-  int maxneed[3];              // max procs away any proc needs, per dim
+-  int maxswap;                 // max # of swaps memory is allocated for
+-  int *sendnum, *recvnum;      // # of atoms to send/recv in each swap
+-  int *sendproc, *recvproc;    // proc to send/recv to/from at each swap
+-  int *size_forward_recv;      // # of values to recv in each forward comm
+-  int *size_reverse_send;      // # to send in each reverse comm
+-  int *size_reverse_recv;      // # to recv in each reverse comm
+-  double *slablo, *slabhi;     // bounds of slab to send at each swap
+-  double **multilo, **multihi; // bounds of slabs for multi-collection swap
+-  double **multioldlo, **multioldhi; // bounds of slabs for multi-type swap
+-  double **cutghostmulti;            // cutghost on a per-collection basis
+-  double **cutghostmultiold;         // cutghost on a per-type basis
+-  int *pbc_flag;                     // general flag for sending atoms thru PBC
+-  int **pbc;                         // dimension flags for PBC adjustments
+-
+-  int *firstrecv;     // where to put 1st recv atom in each swap
+-  int **sendlist;     // list of atoms to send in each swap
+-  int *localsendlist; // indexed list of local sendlist atoms
+-  int *maxsendlist;   // max size of send list for each swap
+-
+-  double *buf_send;     // send buffer for all comm
+-  double *buf_recv;     // recv buffer for all comm
+-  int maxsend, maxrecv; // current size of send/recv buffer
+-  int smax, rmax;       // max size in atoms of single borders send/recv
+-
+-  // NOTE: init_buffers is called from a constructor and must not be made virtual
+-  void init_buffers();
+-
+-  int updown(int, int, int, double, int, double *);
+-  // compare cutoff to procs
+-  virtual void grow_send(int, int);    // reallocate send buffer
+-  virtual void grow_recv(int);         // free/allocate recv buffer
+-  virtual void grow_list(int, int);    // reallocate one sendlist
+-  virtual void grow_swap(int);         // grow swap, multi, and multi/old arrays
+-  virtual void allocate_swap(int);     // allocate swap arrays
+-  virtual void allocate_multi(int);    // allocate multi arrays
+-  virtual void allocate_multiold(int); // allocate multi/old arrays
+-  virtual void free_swap();            // free swap arrays
+-  virtual void free_multi();           // free multi arrays
+-  virtual void free_multiold();        // free multi/old arrays
+-};
+-
+-} // namespace LAMMPS_NS
+-
+-#endif
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn.cpp b/sevenn/pair_e3gnn/pair_e3gnn.cpp
+index 587f427..cfed125 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn.cpp
++++ b/sevenn/pair_e3gnn/pair_e3gnn.cpp
+@@ -16,14 +16,27 @@
+ ------------------------------------------------------------------------- */
+ 
+ #include <ATen/ops/from_blob.h>
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstring>
+ #include <c10/core/Scalar.h>
+ #include <c10/core/TensorOptions.h>
++#include <numeric>
+ #include <string>
++#include <unordered_map>
++#include <vector>
+ 
+ #include <torch/script.h>
+ #include <torch/torch.h>
+ 
++#include <ATen/cuda/CUDAGraph.h>
++#include <c10/cuda/CUDACachingAllocator.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAStream.h>
++
+ #include "atom.h"
++#include "comm.h"
+ #include "domain.h"
+ #include "error.h"
+ #include "force.h"
+@@ -31,6 +44,8 @@
+ #include "neigh_list.h"
+ #include "neigh_request.h"
+ #include "neighbor.h"
++#include "update.h"
++#include "utils.h"
+ 
+ #include "pair_e3gnn.h"
+ 
+@@ -60,18 +75,55 @@ PairE3GNN::PairE3GNN(LAMMPS *lmp) : Pair(lmp) {
+   if (lmp->logfile) {
+     fprintf(lmp->logfile, "PairE3GNN using device : %s\n", device_name.c_str());
+   }
++
++  // CUDA graph replay of the device part of compute(); SEVENN_CUDA_GRAPH=0 disables
++  const char *graph_flag = std::getenv("SEVENN_CUDA_GRAPH");
++  use_graph = device.is_cuda() && !(graph_flag && std::strcmp(graph_flag, "0") == 0);
++  if (device.is_cuda())
++    stream = c10::cuda::getStreamFromPool();
++  // SEVENN_TIMING=1: per-step host / GPU breakdown of compute(), printed at the end of each run
++  const char *timing_flag = std::getenv("SEVENN_TIMING");
++  timing = device.is_cuda() && timing_flag && std::strcmp(timing_flag, "0") != 0;
++  if (timing) {
++    cudaEventCreate(&tev[0]);
++    cudaEventCreate(&tev[1]);
++  }
+ }
+ 
+ PairE3GNN::~PairE3GNN() {
+   if (allocated) {
+     memory->destroy(setflag);
+     memory->destroy(cutsq);
++    memory->destroy(cutghost);
+     memory->destroy(map);
+     // memory->destroy(elements);
+   }
+ }
+ 
+ void PairE3GNN::compute(int eflag, int vflag) {
++  using clk = std::chrono::steady_clock;
++  clk::time_point t0;
++  double tstep[6] = {}; // prep, edges, launch, wait, post (host ms), gpu (ms between the events)
++  bool captured = false;
++  auto lap = [&](int k) {
++    if (!timing) return;
++    const auto t = clk::now();
++    tstep[k] = std::chrono::duration<double, std::milli>(t - t0).count();
++    t0 = t;
++  };
++  if (timing) t0 = clk::now();
++  // hybrid/overlay with d3 after e3gnn: one rank starts the D3 work now, so its kernels overlap
++  // the edge build below; several ranks start it after the GPU work is launched (d3_start), so
++  // the D3 host part (gather, pack, CN allreduce) overlaps the GPU instead. Every rank calls it
++  // at the same point of compute(), so the D3 collectives stay matched.
++  const bool d3_here = d3_prelaunch && d3_pair->compute_flag;
++  if (d3_here && comm->nprocs == 1) d3_prelaunch(d3_pair);
++  bool d3_started = !d3_here || comm->nprocs == 1;
++  auto d3_start = [&] {
++    if (d3_started) return;
++    d3_prelaunch(d3_pair);
++    d3_started = true;
++  };
+   // compute
+   /*
+      This compute function is ispired/modified from stress branch of pair-nequip
+@@ -81,172 +133,447 @@ void PairE3GNN::compute(int eflag, int vflag) {
+     ev_setup(eflag, vflag);
+   else
+     evflag = vflag_fdotr = 0;
+-
+-  // remove consecutive guard, addressed by
+-  // tag_map: LAMMPS tag -> graph node index
+-  // graph_index_to_i: graph node index -> LAMMPS local index
+-  // if (atom->tag_consecutive() == 0) {
+-  //   error->all(FLERR, "Pair e3gnn requires consecutive atom IDs");
+-  // }
++  // graph mode runs everything on one side stream (capture needs one); eager
++  // mode stays on the default stream (FlashTP kernels launch on it)
++  c10::cuda::OptionalCUDAStreamGuard stream_guard(
++      use_graph ? std::optional<c10::Stream>(*stream) : std::nullopt);
+ 
+   double **x = atom->x;
+   double **f = atom->f;
+   int *type = atom->type;
+-  int nlocal = list->inum; // same as nlocal, Why? is it different from atom->nlocal?
+   int *ilist = list->ilist;
+-  int inum = list->inum;
++  const int nloc = list->inum; // local atoms = rows [0, nloc); same as atom->nlocal
++  const int nall = atom->nlocal + atom->nghost;
++  // graph rows: one per tag (halo: hop-ordered groups with padding rows between them, see
++  // build_halo_nodes()), [0, ncenters) carry the edges (n_1); on one rank both are the local atoms
++  int nlocal = nloc;
++  int ncenters = nloc;
++  if (nloc == 0) { d3_start(); return; } // an empty rank (MPI): no energy, no forces; a captured graph stays valid
+ 
+   // tag ignore PBC
+   tagint *tag = atom->tag;
+ 
+-  std::unordered_map<tagint, int> tag_map;
+-  std::vector<int> graph_index_to_i(nlocal);
+-
+-  long num_atoms[1] = {nlocal};
+-
+   int *numneigh = list->numneigh;      // j loop cond
+   int **firstneigh = list->firstneigh; // j list
+ 
+-  int bound;
+-  if (this->nedges_bound == -1) {
+-    bound = std::accumulate(numneigh, numneigh + nlocal, 0);
+-  } else {
+-    bound = this->nedges_bound;
++  // tag -> graph row. Tags are 1..natoms in typical runs: a plain
++  // vector indexed by tag replaces the per-pair unordered_map lookup.
++  // Fallback to the map when tags are not consecutive. -1: j is not a node
++  // (a ghost beyond the halo, or, on one rank, the old 'not found').
++  const bool tags_consecutive = atom->tag_consecutive();
++  std::unordered_map<tagint, int> tag_map;
++  if (halo) {
++    // the row set (order, padding) is fixed until the next neighbor build; rebuilding it only
++    // there is what lets a captured graph survive the rebuilds
++    if (neighbor->ncalls != node_ncalls) {
++      build_halo_nodes();
++      node_ncalls = neighbor->ncalls;
++    }
++    nlocal = (int)halo_pad[0];
++    ncenters = (int)halo_pad[1];
++    // atomic_energy has the padded n_L rows: 1 on the local atoms' rows, 0 on the padding
++    if (!in_emask.defined() || in_emask.numel() != halo_pad.back())
++      in_emask = torch::zeros({halo_pad.back()}, FLOAT_TYPE.device(device));
++    in_emask.zero_();
++    in_emask.narrow(0, 0, nloc).fill_(1);
++  } else if (tags_consecutive) {
++    tag_to_graph.assign(atom->natoms + 1, -1);
+   }
+-  const int nedges_upper_bound = bound;
+-
+-  std::vector<long> node_type;
+ 
+-  float edge_vec[nedges_upper_bound][3];
+-  long edge_idx_src[nedges_upper_bound];
+-  long edge_idx_dst[nedges_upper_bound];
+-
+-  for (int ii = 0; ii < inum; ii++) {
+-    // populate tag_map of local atoms
+-    const int i = ilist[ii];
++  const int *node_i = halo ? node_to_i.data() : ilist;
++  graph_index_to_i.resize(nlocal);
++
++  // grow-only pinned host buffers (H2D copies below are then truly async)
++  const auto pin = torch::TensorOptions().pinned_memory(device.is_cuda());
++  const auto i32 = torch::TensorOptions().dtype(torch::kInt32);
++  if (host_type.numel() < nlocal)
++    host_type = torch::empty({nlocal}, INTEGER_TYPE.merge_in(pin));
++  long *node_type = host_type.data_ptr<long>();
++
++  for (int ii = 0; ii < nlocal; ii++) {
++    // populate tag_map of the nodes
++    const int i = node_i[ii];
++    if (i < 0) { // halo padding row: valid type index, no edges
++      node_type[ii] = 0;
++      continue;
++    }
+     const int itag = tag[i];
+     const int itype = type[i];
+-    tag_map[itag] = ii;
+-    graph_index_to_i[ii] = i;
+-    node_type.push_back(map[itype]);
++    if (!halo) { // halo: build_halo_nodes() already mapped the tags
++      if (tags_consecutive)
++        tag_to_graph[itag] = ii;
++      else
++        tag_map[itag] = ii;
++      graph_index_to_i[ii] = i;
++    }
++    node_type[ii] = map[itype];
+   }
+-
+-  int nedges = 0;
+-  // loop over neighbors, build graph
+-  for (int ii = 0; ii < inum; ii++) {
+-    const int i = ilist[ii];
+-    const int i_graph_idx = ii;
++  lap(0);
++  auto tag_lookup = [&](tagint jtag) -> int {
++    if (tags_consecutive) return tag_to_graph[jtag];
++    const auto found = tag_map.find(jtag);
++    return found == tag_map.end() ? -1 : found->second;
++  };
++
++  // visit neighbors j of node_i[ii] that are nodes and inside the cutoff
++  auto for_edges = [&](int ii, auto &&fn) {
++    const int i = node_i[ii];
++    if (i < 0) return; // halo padding row
+     const int *jlist = firstneigh[i];
+     const int jnum = numneigh[i];
+-
+     for (int jj = 0; jj < jnum; jj++) {
+-      int j = jlist[jj];
+-      const int jtag = tag[j];
+-      j &= NEIGHMASK;
+-
+-      const auto found = tag_map.find(jtag);
+-      if (found == tag_map.end()) continue;
+-      const int j_graph_idx = found->second;
++      const int j = jlist[jj] & NEIGHMASK;
++      const int j_graph_idx = tag_lookup(tag[j]);
++      if (j_graph_idx < 0) continue;
+ 
+       // we have to calculate Rij to check cutoff in lammps side
+       const double delij[3] = {x[j][0] - x[i][0], x[j][1] - x[i][1],
+                                x[j][2] - x[i][2]};
+       const double Rij =
+           delij[0] * delij[0] + delij[1] * delij[1] + delij[2] * delij[2];
+-
+-      if (Rij < cutoff_square) {
+-        // if given j is not inside cutoff
+-        if (nedges >= nedges_upper_bound) {
+-          error->all(FLERR, "nedges exceeded nedges_upper_bound");
++      if (Rij < cutoff_square) fn(j_graph_idx, delij);
++    }
++  };
++  // edge buffers: std::vector-like grow-only pinned tensors instead of the old
++  // stack VLAs. src/dst are int32 on host, converted to int64 on the device.
++  // Capacities are rounded up to a multiple of 8192: the CUDA graph is
++  // captured per bucket, and a neighbor rebuild rarely crosses one.
++  auto bucket = [](long e) { return (e + 8191) / 8192 * 8192; };
++  float *edge_vec = nullptr; // raw pointers: data_ptr<T>() is too slow per edge
++  int *edge_idx_src = nullptr;
++  int *edge_idx_dst = nullptr;
++  auto grow_edges = [&](long cap) {
++    if (!host_edge_vec.defined() || host_edge_vec.size(0) < cap) { // cap may be 0
++      host_edge_vec = torch::empty({cap, 3}, FLOAT_TYPE.merge_in(pin));
++      host_edge_src = torch::empty({cap}, i32.merge_in(pin));
++      host_edge_dst = torch::empty({cap}, i32.merge_in(pin));
++    }
++    edge_vec = host_edge_vec.data_ptr<float>();
++    edge_idx_src = host_edge_src.data_ptr<int>();
++    edge_idx_dst = host_edge_dst.data_ptr<int>();
++  };
++  auto write_edge = [&](int e, int src, int dst, const double *d) {
++    edge_idx_src[e] = src;
++    edge_idx_dst[e] = dst;
++    float *v = edge_vec + 3 * e;
++    v[0] = d[0];
++    v[1] = d[1];
++    v[2] = d[2];
++  };
++
++  long nedges = 0;
++  // GPU edge path (gpu_edges): the host uploads the neighbor list once per rebuild and only
++  // x (and the node types) per step; jet_mlip::edge_build inside the graph writes the edge list
++  // (same order as the serial host loop, bitwise the same vec) into in_nbr / in_ctr /
++  // in_edge_vec of capacity graph_ecap (rounded to 8192, ~1.14x the edge count). Rows past the
++  // edge count are never visited by the conv kernels (rowptr stops at the count), so their
++  // dE/dr is exactly 0 and stale indices (< nlocal, valid) reduce nothing; if the count grows
++  // past the capacity the model ran on a truncated list: regrow, recapture, recompute.
++  const bool gpu = gpu_edges;
++  bool realloc = false; // a reallocated graph input invalidates the captured graph
++  auto grow = [&](torch::Tensor &t, long rows, long cols, torch::TensorOptions opt) {
++    if (t.defined() && t.size(0) >= rows) return false;
++    const long n = rows + rows / 4 + 1024; // headroom: nall and the candidate count drift per rebuild
++    t = cols ? torch::empty({n, cols}, opt) : torch::empty({n}, opt);
++    return true;
++  };
++  if (gpu) {
++    if (neighbor->ncalls != gpu_ncalls) {
++      // candidates = the full list masked with NEIGHMASK, in center order; center = node_to_i;
++      // owner[j] = graph row of the node with tag[j] (-1: not a node)
++      long ncand = 0;
++      for (int ii = 0; ii < ncenters; ii++)
++        if (node_i[ii] >= 0) ncand += numneigh[node_i[ii]];
++      grow(host_x, nall, 3, torch::TensorOptions().dtype(torch::kDouble).merge_in(pin));
++      grow(host_owner, nall, 0, i32.merge_in(pin));
++      grow(host_center, ncenters, 0, i32.merge_in(pin));
++      grow(host_cand_ptr, ncenters + 1, 0, i32.merge_in(pin));
++      grow(host_cand_j, ncand, 0, i32.merge_in(pin));
++      realloc |= grow(in_x, nall, 3, torch::TensorOptions().dtype(torch::kDouble).device(device));
++      realloc |= grow(in_owner, nall, 0, i32.device(device));
++      realloc |= grow(in_center, ncenters, 0, i32.device(device));
++      realloc |= grow(in_cand_ptr, ncenters + 1, 0, i32.device(device));
++      realloc |= grow(in_cand_j, ncand, 0, i32.device(device));
++      int *owner = host_owner.data_ptr<int>();
++      for (int j = 0; j < nall; j++) owner[j] = tag_lookup(tag[j]);
++      int *center = host_center.data_ptr<int>();
++      int *cptr = host_cand_ptr.data_ptr<int>();
++      int *cj = host_cand_j.data_ptr<int>();
++      long k = 0;
++      cptr[0] = 0;
++      for (int ii = 0; ii < ncenters; ii++) {
++        const int i = node_i[ii];
++        if (i >= 0) {
++          const int *jlist = firstneigh[i];
++          for (int jj = 0; jj < numneigh[i]; jj++) cj[k++] = jlist[jj] & NEIGHMASK;
+         }
+-        edge_idx_src[nedges] = i_graph_idx;
+-        edge_idx_dst[nedges] = j_graph_idx;
+-        edge_vec[nedges][0] = delij[0];
+-        edge_vec[nedges][1] = delij[1];
+-        edge_vec[nedges][2] = delij[2];
+-        nedges++;
++        center[ii] = i < 0 ? 0 : i; // a padding row: valid index, empty candidate range
++        cptr[ii + 1] = k;
+       }
+-    } // j loop end
+-  }   // i loop end
+-
+-  // convert data to Tensor
+-  auto inp_node_type = torch::from_blob(node_type.data(), nlocal, INTEGER_TYPE);
+-  auto inp_num_atoms = torch::from_blob(num_atoms, {1}, INTEGER_TYPE);
+-
+-  auto edge_idx_src_tensor =
+-      torch::from_blob(edge_idx_src, {nedges}, INTEGER_TYPE);
+-  auto edge_idx_dst_tensor =
+-      torch::from_blob(edge_idx_dst, {nedges}, INTEGER_TYPE);
+-  auto inp_edge_index =
+-      torch::stack({edge_idx_src_tensor, edge_idx_dst_tensor});
++      in_owner.narrow(0, 0, nall).copy_(host_owner.narrow(0, 0, nall), true);
++      in_center.narrow(0, 0, ncenters).copy_(host_center.narrow(0, 0, ncenters), true);
++      in_cand_ptr.narrow(0, 0, ncenters + 1).copy_(host_cand_ptr.narrow(0, 0, ncenters + 1), true);
++      in_cand_j.narrow(0, 0, ncand).copy_(host_cand_j.narrow(0, 0, ncand), true);
++      gpu_ncalls = neighbor->ncalls;
++      trebuilds++;
++    }
++    std::memcpy(host_x.data_ptr<double>(), &x[0][0], sizeof(double) * 3 * nall);
++    in_x.narrow(0, 0, nall).copy_(host_x.narrow(0, 0, nall), true);
++  } else if (comm->nthreads > 1) {
++    // OpenMP graph build: count edges per i, prefix sum, fill in parallel
++    const int nthreads = comm->nthreads;
++    edge_offset.assign(ncenters + 1, 0);
++#pragma omp parallel for num_threads(nthreads)
++    for (int ii = 0; ii < ncenters; ii++) {
++      int cnt = 0;
++      for_edges(ii, [&](int, const double *) { cnt++; });
++      edge_offset[ii + 1] = cnt;
++    }
++    for (int ii = 0; ii < ncenters; ii++) edge_offset[ii + 1] += edge_offset[ii];
++    nedges = edge_offset[ncenters];
++    grow_edges(bucket(nedges));
++#pragma omp parallel for num_threads(nthreads)
++    for (int ii = 0; ii < ncenters; ii++) {
++      int e = edge_offset[ii];
++      for_edges(ii, [&](int jg, const double *d) { write_edge(e++, ii, jg, d); });
++    }
++  } else {
++    // serial graph build, one pass; the centers' numneigh sum is an exact upper bound
++    long ncand = 0;
++    for (int ii = 0; ii < ncenters; ii++)
++      if (node_i[ii] >= 0) ncand += numneigh[node_i[ii]];
++    grow_edges(bucket(ncand));
++    for (int ii = 0; ii < ncenters; ii++) {
++      for_edges(ii, [&](int jg, const double *d) { write_edge(nedges++, ii, jg, d); });
++    }
++  }
+ 
+-  auto inp_edge_vec = torch::from_blob(edge_vec, {nedges, 3}, FLOAT_TYPE);
++  lap(1);
++  // halo: the captured graph is keyed by the padded row counts P_0..P_L and, below, by the edge
++  // capacity; on one rank by nlocal alone
++  auto graph_key_differs = [&] {
++    if (!halo) return nlocal != graph_nlocal;
++    if ((int)graph_npad.size() != num_conv + 1) return true;
++    for (int k = 0; k <= num_conv; k++)
++      if (halo_pad[k] != graph_npad[k]) return true;
++    return false;
++  };
++  // Keep the captured capacity while the edges fit with less than two buckets of
++  // padding: nedges hovering at a bucket edge recaptured the graph every few steps.
++  const bool keep_ecap = !graph_key_differs() && nedges <= graph_ecap && graph_ecap - nedges < 2 * 8192;
++  long ecap = gpu ? (graph_ecap < 0 ? 8192 : graph_ecap) : keep_ecap ? graph_ecap : bucket(nedges);
++
++  // device part: (edge build,) forward, dE/dr, force + virial reduction. Results land in
++  // the dev_* members; under CUDA graph capture they are graph-pool tensors that every
++  // replay() refreshes in place. dev_out packs what the host needs into one D2H copy.
++  const torch::Tensor layer_tensor =
++      halo ? torch::tensor(std::vector<long>(halo_pad.begin() + 1, halo_pad.end())) : torch::Tensor();
++  auto device_part = [&](torch::Tensor x_dev, torch::Tensor ev, torch::Tensor src32,
++                         torch::Tensor dst32) {
++    torch::Dict<std::string, torch::Tensor> input_dict;
++    if (gpu) {
++      // halo: the x / owner rows and the center / cand_ptr rows are the padded (or grown)
++      // capacities, so suffix sizes baked into the capture stay valid across rebuilds
++      torch::jit::Stack args{halo ? in_x : in_x.narrow(0, 0, nall),
++                             in_cand_ptr.narrow(0, 0, ncenters + 1), in_cand_j,
++                             in_center.narrow(0, 0, ncenters), halo ? in_owner : in_owner.narrow(0, 0, nall),
++                             cutoff_square, in_rowptr, in_nbr, in_ctr, in_edge_vec, in_total};
++      edge_build_op->callBoxed(args);
++      in_rowptr.clamp_max_((int)ecap); // count > capacity: visit only what was written (then regrow)
++      // the model reuses this CSR (dst-grouped already, so perm is the identity) instead of sorting
++      input_dict.insert("jet_rowptr", in_rowptr);
++      input_dict.insert("jet_perm", in_perm);
++      input_dict.insert("jet_src", in_nbr);
++    }
++    ev = ev.detach().requires_grad_(true);
++    auto edge_index = torch::stack({src32, dst32}).to(torch::kInt64); // model expects int64 (2, nedges)
++    input_dict.insert("x", x_dev);
++    input_dict.insert("edge_index", edge_index);
++    input_dict.insert("edge_vec", ev);
++    input_dict.insert("num_atoms", torch::full({1}, (long)nlocal, INTEGER_TYPE.device(device)));
++    input_dict.insert("nlocal", torch::full({1}, (long)nloc, INTEGER_TYPE));
++    if (halo) // per-layer node counts: nodes are (padded) prefixes, n_k_pad <= n_{k-1}_pad
++      input_dict.insert("jet_layer_nout", layer_tensor);
++
++    auto output = model.forward({input_dict}).toGenericDict();
++    dev_atomic_energy = output.at("atomic_energy").toTensor();
++    // halo: this rank owns the energy of its local atoms only (the ghost nodes' rows are the
++    // neighbours' rows of the same graph); the pads are masked out
++    dev_energy = halo ? (dev_atomic_energy.reshape({-1}) * in_emask).sum()
++                      : output.at("inferred_total_energy").toTensor().squeeze();
++    dev_dEdr = torch::autograd::grad({dev_energy}, {ev})[0].to(torch::kFloat);
++
++    torch::NoGradGuard no_grad; // force/virial reduction below needs no graph
++    dev_edge_src = edge_index[0];
++    dev_edge_dst = edge_index[1];
++    // force reduction on the device, only (nlocal, 3) comes back to the host. Ghost
++    // nodes (halo) get a force on their one LAMMPS image, which reverse comm folds
++    // onto the owner.
++    dev_force = torch::zeros({nlocal, 3}, dev_dEdr.options());
++    dev_force.index_add_(0, dev_edge_src, dev_dEdr);
++    dev_force.index_add_(0, dev_edge_dst, dev_dEdr, -1.0);
++    // virial from edge contributions: (E, 6) voigt rows and their sum
++    auto rij = ev.detach();
++    dev_voigt = torch::cat({rij * dev_dEdr,
++                            (rij.select(1, 0) * dev_dEdr.select(1, 1)).unsqueeze(-1),
++                            (rij.select(1, 1) * dev_dEdr.select(1, 2)).unsqueeze(-1),
++                            (rij.select(1, 2) * dev_dEdr.select(1, 0)).unsqueeze(-1)}, 1);
++    dev_virial = torch::neg(torch::sum(dev_voigt, 0));
++    // one D2H per step: force (3N), energy, virial (6), edge count (GPU edges; 0 otherwise)
++    dev_out = torch::cat({dev_force.flatten(), dev_energy.reshape({1}), dev_virial}).to(torch::kDouble);
++    dev_out = torch::cat({dev_out, gpu ? in_total.to(torch::kDouble) : torch::zeros({1}, dev_out.options())});
++  };
++  auto capture = [&](auto &&run) { // warm-up (lazy inits: kernel attributes, cublas, ...) then capture
++    at::cuda::MempoolId_t pool{0, 0};
++    try {
++      for (int i = 0; i < 2; i++) run();
++      stream->synchronize();
++      // return the warm-up runs' cached blocks before the capture fills its own pool: otherwise both
++      // coexist for the capture (7net-omni table, 5632 atoms, H200: a 6.1 GB transient over 4.0 GB steady)
++      c10::cuda::CUDACachingAllocator::emptyCache();
++      graph = std::make_unique<at::cuda::CUDAGraph>();
++      pool = at::cuda::graph_pool_handle(); // own id: CUDAGraph::pool() is unavailable after a failed capture
++      graph->capture_begin(pool);
++      run();
++      graph->capture_end();
++      captured = true;
++      // return the capture run's leftovers in the eager pool; the graph's private pool stays allocated.
++      // 7net-omni exact, 5632 atoms, H200: 5.8 -> 3.8 GB resident.
++      c10::cuda::CUDACachingAllocator::emptyCache();
++      utils::logmesg(lmp, "PairE3GNN: CUDA graph captured (rows {}, edge capacity {})\n", nlocal, ecap);
++    } catch (const std::exception &e) {
++      // e.g. a host->device copy inside the model (not capturable): eager for the rest of the run.
++      // An invalidated capture makes capture_end throw at cudaStreamEndCapture, before it ends the
++      // allocator's capture into the graph pool; end and release that pool here, or the next
++      // emptyCache aborts the process (captures_underway.empty() assert).
++      if (graph) try { graph->capture_end(); } catch (...) {
++        const auto dev = c10::cuda::current_device();
++        c10::cuda::CUDACachingAllocator::endAllocateToPool(dev, pool);
++        c10::cuda::CUDACachingAllocator::releasePool(dev, pool);
++      }
++      graph.reset();
++      use_graph = false;
++      cudaGetLastError(); // clear the capture error left by the failing call
++      const std::string msg = e.what();
++      utils::logmesg(lmp, "PairE3GNN: CUDA graph capture failed, using the eager path ({})\n",
++                     msg.substr(0, msg.find('\n')));
++    }
++  };
++  auto drop_graph = [&] {
++    // Free the old graph's private pool: drop the graph and the dev_* outputs that
++    // live in it, then return the cached blocks. The allocator frees dead pools only
++    // on an OOM retry, and WSL never reports one (cudaMalloc spills to host memory),
++    // so every recapture used to keep its pool.
++    graph.reset();
++    dev_energy = dev_atomic_energy = dev_dEdr = dev_edge_src = dev_edge_dst = dev_force =
++        dev_voigt = dev_virial = dev_out = torch::Tensor();
++    c10::cuda::CUDACachingAllocator::emptyCache();
++  };
++  const long nout = 3L * nlocal + 8;
++  if (host_out.numel() < nout)
++    host_out = torch::empty({nout}, torch::TensorOptions().dtype(torch::kDouble).merge_in(pin));
++  auto d2h = [&] { // the one D2H copy and the one sync of the step
++    host_out.narrow(0, 0, nout).copy_(dev_out, true);
++    c10::cuda::getCurrentCUDAStream().synchronize();
++  };
++
++  if (timing) cudaEventRecord(tev[0], c10::cuda::getCurrentCUDAStream());
++  if (gpu) {
++    for (;;) {
++      if (graph_key_differs() || ecap != graph_ecap || realloc) {
++        drop_graph();
++        in_type = torch::empty({nlocal}, INTEGER_TYPE.device(device));
++        in_rowptr = torch::empty({ncenters + 1}, i32.device(device));
++        in_total = torch::empty({1}, i32.device(device));
++        in_nbr = torch::zeros({ecap}, i32.device(device)); // tail rows: valid index 0, finite vec
++        in_ctr = torch::zeros({ecap}, i32.device(device));
++        in_edge_vec = torch::zeros({ecap, 3}, FLOAT_TYPE.device(device));
++        in_perm = torch::arange(ecap, i32.device(device));
++        graph_nlocal = nlocal;
++        graph_npad = halo_pad;
++        graph_ecap = ecap;
++        realloc = false;
++      }
++      in_type.copy_(host_type.slice(0, 0, nlocal), true);
++      auto run = [&] { device_part(in_type, in_edge_vec, in_ctr, in_nbr); };
++      if (use_graph && !graph) capture(run);
++      if (graph) graph->replay(); else run();
++      if (timing) cudaEventRecord(tev[1], c10::cuda::getCurrentCUDAStream());
++      lap(2);
++      d3_start(); // the D3 host part now overlaps this GPU work, up to the d2h wait
++      d2h();
++      lap(3);
++      nedges = (long)host_out.data_ptr<double>()[nout - 1];
++      if (nedges <= ecap) break;
++      ecap = bucket(nedges + nedges / 7);
++      tregrows++;
++      captured = true; // not a steady-state step
++    }
++  } else {
++    if (use_graph && nlocal > 0) {
++      // edges padded to ecap with src = dst = e % ncenters and |r| = cutoff: the
++      // XPLOR cutoff is 0 there, the bias-free radial MLP gives W = 0, so a
++      // padding edge adds nothing to energy and its dE/dr is 0 (double root of
++      // the cutoff at r_cut). Spread over the nodes: the node-centric jet
++      // kernels serialize the edges of one node (all padding on one node made
++      // the graph 3x slower than eager); build_csr sorts by dst anyway.
++      // The node rows are padded in halo mode (in_type spans nlocal) and nout prunes the
++      // conv, so the padding edges stay inside the CSR's n_1 rows.
++      const double pad[3] = {cutoff, 0.0, 0.0};
++      for (long e = nedges; e < ecap; e++) write_edge(e, e % ncenters, e % ncenters, pad);
++      if (graph_key_differs() || ecap != graph_ecap || !graph) {
++        drop_graph();
++        in_type = torch::empty({nlocal}, INTEGER_TYPE.device(device));
++        in_edge_vec = torch::empty({ecap, 3}, FLOAT_TYPE.device(device));
++        in_edge_src = torch::empty({ecap}, i32.device(device));
++        in_edge_dst = torch::empty_like(in_edge_src);
++      }
++      in_type.copy_(host_type.slice(0, 0, nlocal), true);
++      in_edge_vec.copy_(host_edge_vec.slice(0, 0, ecap), true);
++      in_edge_src.copy_(host_edge_src.slice(0, 0, ecap), true);
++      in_edge_dst.copy_(host_edge_dst.slice(0, 0, ecap), true);
++      if (!graph) {
++        capture([&] { device_part(in_type, in_edge_vec, in_edge_src, in_edge_dst); });
++        if (graph) {
++          graph_nlocal = nlocal;
++          graph_npad = halo_pad;
++          graph_ecap = ecap;
++        }
++      }
++    }
++    if (graph) {
++      graph->replay();
++    } else {
++      // H2D: non-blocking copies out of the pinned buffers
++      device_part(host_type.slice(0, 0, nlocal).to(device, true),
++                  host_edge_vec.slice(0, 0, nedges).to(device, true),
++                  host_edge_src.slice(0, 0, nedges).to(device, true),
++                  host_edge_dst.slice(0, 0, nedges).to(device, true));
++    }
++    if (timing) cudaEventRecord(tev[1], c10::cuda::getCurrentCUDAStream());
++    lap(2);
++    d3_start();
++    d2h();
++    lap(3);
++  }
+   if (print_info) {
+     std::cout << " Nlocal: " << nlocal << std::endl;
+     std::cout << " Nedges: " << nedges << "\n" << std::endl;
+   }
+ 
+-  auto edge_vec_device = inp_edge_vec.to(device);
+-  edge_vec_device.set_requires_grad(true);
+-
+-  torch::Dict<std::string, torch::Tensor> input_dict;
+-  input_dict.insert("x", inp_node_type.to(device));
+-  input_dict.insert("edge_index", inp_edge_index.to(device));
+-  input_dict.insert("edge_vec", edge_vec_device);
+-  input_dict.insert("num_atoms", inp_num_atoms.to(device));
+-  input_dict.insert("nlocal", inp_num_atoms.to(torch::kCPU));
+-
+-  std::vector<torch::IValue> input(1, input_dict);
+-  auto output = model.forward(input).toGenericDict();
+-
+-  torch::Tensor energy_tensor =
+-      output.at("inferred_total_energy").toTensor().squeeze();
+-
+-  // dE_dr
+-  auto grads = torch::autograd::grad({energy_tensor}, {edge_vec_device});
+-  torch::Tensor dE_dr = grads[0].to(torch::kCPU);
+-
+-  eng_vdwl += energy_tensor.detach().to(torch::kCPU).item<float>();
+-  torch::Tensor force_tensor = torch::zeros({nlocal, 3});
+-
+-  auto _edge_idx_src_tensor =
+-      edge_idx_src_tensor.repeat_interleave(3).view({nedges, 3});
+-  auto _edge_idx_dst_tensor =
+-      edge_idx_dst_tensor.repeat_interleave(3).view({nedges, 3});
+-
+-  force_tensor.scatter_reduce_(0, _edge_idx_src_tensor, dE_dr, "sum");
+-  force_tensor.scatter_reduce_(0, _edge_idx_dst_tensor, torch::neg(dE_dr),
+-                               "sum");
+-
+-  auto forces = force_tensor.accessor<float, 2>();
+-
++  const double *out = host_out.data_ptr<double>();
++  eng_vdwl += out[3 * nlocal];
+   for (int graph_idx = 0; graph_idx < nlocal; graph_idx++) {
+-    int i = graph_index_to_i[graph_idx];
+-    f[i][0] += forces[graph_idx][0];
+-    f[i][1] += forces[graph_idx][1];
+-    f[i][2] += forces[graph_idx][2];
++    const int i = graph_index_to_i[graph_idx];
++    if (i < 0) continue; // halo padding row
++    f[i][0] += out[3 * graph_idx];
++    f[i][1] += out[3 * graph_idx + 1];
++    f[i][2] += out[3 * graph_idx + 2];
+   }
+ 
+-  // Virial stress from edge contributions
+   if (vflag) {
+-    auto diag = inp_edge_vec * dE_dr;
+-    auto s12 = inp_edge_vec.select(1, 0) * dE_dr.select(1, 1);
+-    auto s23 = inp_edge_vec.select(1, 1) * dE_dr.select(1, 2);
+-    auto s31 = inp_edge_vec.select(1, 2) * dE_dr.select(1, 0);
+-    std::vector<torch::Tensor> voigt_list = {
+-        diag, s12.unsqueeze(-1), s23.unsqueeze(-1), s31.unsqueeze(-1)};
+-    auto voigt = torch::cat(voigt_list, 1);
+-
+-    torch::Tensor per_atom_stress_tensor = torch::zeros({nlocal, 6});
+-    auto _edge_idx_dst6_tensor =
+-        edge_idx_dst_tensor.repeat_interleave(6).view({nedges, 6});
+-    per_atom_stress_tensor.scatter_reduce_(0, _edge_idx_dst6_tensor, voigt,
+-                                           "sum");
+-
+-    auto virial_stress_tensor =
+-        torch::neg(torch::sum(per_atom_stress_tensor, 0));
+-    auto virial_stress = virial_stress_tensor.accessor<float, 1>();
+-
++    torch::NoGradGuard no_grad;
++    const double *virial_stress = out + 3 * nlocal + 1;
+     virial[0] += virial_stress[0];
+     virial[1] += virial_stress[1];
+     virial[2] += virial_stress[2];
+@@ -255,9 +582,13 @@ void PairE3GNN::compute(int eflag, int vflag) {
+     virial[5] += virial_stress[4];
+ 
+     if (vflag_atom) {
+-      auto per_atom_stress = per_atom_stress_tensor.accessor<float, 2>();
++      torch::Tensor per_atom_stress_tensor =
++          torch::zeros({nlocal, 6}, dev_voigt.options());
++      per_atom_stress_tensor.index_add_(0, dev_edge_dst, dev_voigt);
++      auto per_atom_stress_cpu = per_atom_stress_tensor.to(torch::kCPU);
++      auto per_atom_stress = per_atom_stress_cpu.accessor<float, 2>();
+ 
+-      for (int gi = 0; gi < nlocal; gi++) {
++      for (int gi = 0; gi < (halo ? nloc : nlocal); gi++) { // local atoms only
+         const int i = graph_index_to_i[gi];
+         vatom[i][0] += -per_atom_stress[gi][0];
+         vatom[i][1] += -per_atom_stress[gi][1];
+@@ -271,21 +602,153 @@ void PairE3GNN::compute(int eflag, int vflag) {
+ 
+   if (eflag_atom) {
+     torch::Tensor atomic_energy_tensor =
+-        output.at("atomic_energy").toTensor().to(torch::kCPU).view({nlocal});
+-    auto atomic_energy = atomic_energy_tensor.accessor<float, 1>();
+-    for (int gi = 0; gi < nlocal; gi++) {
++        dev_atomic_energy.detach().to(torch::kCPU).to(torch::kDouble).view(-1); // halo pruning: n_L = nloc rows
++    auto atomic_energy = atomic_energy_tensor.accessor<double, 1>();
++    for (int gi = 0; gi < (halo ? nloc : nlocal); gi++) { // local atoms only
+       const int i = graph_index_to_i[gi];
+       eatom[i] += atomic_energy[gi];
+     }
+   }
++  if (timing) {
++    lap(4);
++    float gpu_ms = 0;
++    cudaEventElapsedTime(&gpu_ms, tev[0], tev[1]);
++    tstep[5] = gpu_ms;
++    if (captured) { // warm-up + capture: not a steady-state step
++      tcaptures++;
++    } else {
++      for (int k = 0; k < 6; k++) tsum[k] += tstep[k];
++      tsteps++;
++    }
++  }
++}
++
++// halo mode: freeze the graph rows for the coming neighbor-list interval (until the next
++// rebuild). Shells are the BFS hop count from the local atoms over the full neighbor list as
++// built (pairs within cutoff+skin): local atoms hop 0, then hop 1..num_conv. One node per tag,
++// taken at its min-hop image. Rows are grouped by hop and ordered by tag inside a group, with
++// padding rows between the groups, so that layer k (block k-1) fills rows [0, P_k), which hold
++// the hop <= L-k nodes (its real n_k rows) plus padding. P_k - P_{k+1} >= #(hop == L-k) keeps
++// every source of the rows visited by layer k+1 inside the previous layer's rows: a row of hop h
++// only has sources of hop <= h+1. Pads only change with the capture key (see compute()).
++// Exact for the whole interval: a pair within the cutoff at any step was within cutoff+skin
++// when the list was built.
++void PairE3GNN::build_halo_nodes() {
++  const int nloc = atom->nlocal;
++  const int nall = atom->nlocal + atom->nghost;
++  const int natoms = (int)atom->natoms;
++  tagint *tag = atom->tag;
++  int *numneigh = list->numneigh;
++  int **firstneigh = list->firstneigh;
++
++  std::vector<int> hop(nall, -1); // by atom index: ghost images have their own hop
++  std::vector<int> frontier(nloc), next;
++  for (int a = 0; a < nloc; a++) {
++    hop[a] = 0;
++    frontier[a] = a;
++  }
++  for (int h = 1; h <= num_conv && !frontier.empty(); h++) {
++    next.clear();
++    for (int a : frontier) {
++      const int *jlist = firstneigh[a];
++      const int jnum = numneigh[a];
++      for (int jj = 0; jj < jnum; jj++) {
++        const int j = jlist[jj] & NEIGHMASK;
++        if (j < nloc || hop[j] >= 0) continue; // local atoms are hop 0
++        hop[j] = h;
++        next.push_back(j);
++      }
++    }
++    frontier.swap(next);
++  }
++
++  // one node per tag at its min-hop image (an image of a local atom maps to that local atom)
++  std::vector<char> local_tag(natoms + 1, 0);
++  for (int a = 0; a < nloc; a++) local_tag[tag[a]] = 1;
++  std::vector<int> best(natoms + 1, -1);               // tag -> chosen atom image
++  std::vector<int> best_hop(natoms + 1, num_conv + 2); // tag -> its hop
++  for (int a = nloc; a < nall; a++) {
++    const int h = hop[a];
++    if (h < 0) continue; // beyond the L-halo
++    const tagint t = tag[a];
++    if (local_tag[t]) continue; // a ghost image of a local atom: that node is hop 0
++    if (h < best_hop[t]) {
++      best_hop[t] = h;
++      best[t] = a;
++    }
++  }
++
++  // hop groups, tag order inside a group: group[0] = local atoms
++  std::vector<std::vector<int>> group(num_conv + 1);
++  group[0].resize(nloc);
++  for (int a = 0; a < nloc; a++) group[0][a] = a;
++  for (int a = nloc; a < nall; a++) {
++    if (best[tag[a]] == a) group[best_hop[tag[a]]].push_back(a);
++  }
++  for (int h = 0; h <= num_conv; h++)
++    std::sort(group[h].begin(), group[h].end(), [&](int a, int b) { return tag[a] < tag[b]; });
++
++  // real counts n_k = #(hop <= L-k)
++  std::vector<long> nreal(num_conv + 2, 0);
++  nreal[num_conv] = nloc;
++  for (int h = 1; h <= num_conv; h++)
++    nreal[num_conv - h] = nreal[num_conv - h + 1] + (long)group[h].size();
++
++  // pads: keep the captured ones while every hop group still fits its slot and the padding is
++  // not wasteful (hysteresis: the row numbering must not change under a captured graph)
++  auto nb = [](long n) { return (n + n / 16 + 255) / 256 * 256; }; // ~6% + 256 headroom
++  bool keep = (int)graph_npad.size() == num_conv + 1;
++  for (int k = 0; k < num_conv && keep; k++) // slot [P_{k+1}, P_k) holds hop L-k
++    keep = (long)group[num_conv - k].size() <= graph_npad[k] - graph_npad[k + 1];
++  keep = keep && nloc <= graph_npad[num_conv];
++  for (int k = 0; k <= num_conv && keep; k++)
++    keep = graph_npad[k] - nreal[k] <= std::max(1024L, graph_npad[k] / 4);
++  if (keep) {
++    halo_pad = graph_npad;
++  } else {
++    halo_pad.assign(num_conv + 1, 0);
++    halo_pad[num_conv] = nb(nloc);
++    for (int k = num_conv - 1; k >= 1; k--)
++      halo_pad[k] = std::max(nb(nreal[k]), halo_pad[k + 1] + (long)group[num_conv - k].size());
++    halo_pad[0] = halo_pad[1] + nb((long)group[num_conv].size());
++  }
+ 
+-  // if it was the first MD step
+-  if (this->nedges_bound == -1) {
+-    this->nedges_bound = nedges * 1.2;
+-  } // else if the nedges is too small, increase the bound
+-  else if (nedges > this->nedges_bound / 1.2) {
+-    this->nedges_bound = nedges * 1.2;
++  // row assignment: hop 0 at [0, nloc), hop h at [P_{L-h+1}, ...); the gaps are padding rows
++  tag_to_graph.assign(natoms + 1, -1);
++  node_to_i.assign((size_t)halo_pad[0], -1);
++  int row = 0;
++  for (int a : group[0]) {
++    node_to_i[row] = a;
++    tag_to_graph[tag[a]] = row++;
+   }
++  for (int h = 1; h <= num_conv; h++) {
++    row = (int)halo_pad[num_conv - h + 1];
++    for (int a : group[h]) {
++      node_to_i[row] = a;
++      tag_to_graph[tag[a]] = row++;
++    }
++  }
++  layer_nout.assign(nreal.begin() + 1, nreal.begin() + num_conv + 1);
++  graph_index_to_i = node_to_i;
++  if (node_ncalls < 0) { // first rebuild of the run: the hop shells (n_0 .. n_L) of this rank
++    std::string ns;
++    for (int k = 0; k <= num_conv; k++) ns += " " + std::to_string(nreal[k]);
++    utils::logmesg(lmp, "PairE3GNN: rank {} hop shells n_0..n_{}:{}\n", comm->me, num_conv, ns);
++  }
++}
++
++void PairE3GNN::finish() {
++  if (!timing || tsteps == 0) return;
++  double m[6];
++  for (int k = 0; k < 6; k++) m[k] = tsum[k] / tsteps;
++  utils::logmesg(lmp,
++                 "PairE3GNN timing, ms/step over {} steps ({} capture steps left out): prep {:.3f} edges {:.3f} "
++                 "launch {:.3f} wait {:.3f} post {:.3f} | host total {:.3f} | gpu {:.3f}\n",
++                 tsteps, tcaptures, m[0], m[1], m[2], m[3], m[4], m[0] + m[1] + m[2] + m[3] + m[4], m[5]);
++  if (gpu_edges)
++    utils::logmesg(lmp, "PairE3GNN GPU edges: {} neighbor-list uploads, {} edge-capacity regrows\n", trebuilds, tregrows);
++  for (double &t : tsum) t = 0;
++  tsteps = tcaptures = trebuilds = tregrows = 0;
+ }
+ 
+ // allocate arrays (called from coeff)
+@@ -295,6 +758,7 @@ void PairE3GNN::allocate() {
+ 
+   memory->create(setflag, n + 1, n + 1, "pair:setflag");
+   memory->create(cutsq, n + 1, n + 1, "pair:cutsq");
++  memory->create(cutghost, n + 1, n + 1, "pair:cutghost"); // halo mode: ghost list cutoff
+   memory->create(map, n + 1, "pair:map");
+ }
+ 
+@@ -321,12 +785,14 @@ void PairE3GNN::coeff(int narg, char **arg) {
+   std::unordered_map<std::string, std::string> meta_dict = {
+       {"chemical_symbols_to_index", ""},
+       {"cutoff", ""},
++      {"num_conv", ""},
+       {"num_species", ""},
+       {"model_type", ""},
+       {"version", ""},
+       {"dtype", ""},
+       {"flashTP", "version mismatch"},
+       {"oeq", "version mismatch"},
++      {"jet_csr", "no"},
+       {"time", ""}};
+ 
+   // model loading from input
+@@ -346,11 +812,30 @@ void PairE3GNN::coeff(int narg, char **arg) {
+ 
+   cutoff = std::stod(meta_dict["cutoff"]);
+   cutoff_square = cutoff * cutoff;
++  // number of convolution layers (the halo depth on more than one rank); absent in
++  // models deployed before this key existed: init_style() errors only in halo mode
++  num_conv = meta_dict["num_conv"].empty() ? 0 : std::stoi(meta_dict["num_conv"]);
+ 
+   // to make torch::autograd::grad() works
+   if (meta_dict["oeq"] == "yes") {
+     pair_e3gnn_oeq_register_autograd();
+   }
++  // FlashTP launches on the legacy default stream (not capturable, and racy
++  // against torch's side stream): eager path only
++  if (use_graph && meta_dict["flashTP"] == "yes") {
++    use_graph = false;
++    utils::logmesg(lmp, "PairE3GNN: FlashTP model, CUDA graph disabled\n");
++  }
++
++  // GPU edge build: the model must reuse the pair's CSR (jet_csr, sevenn deploy) and
++  // libjet_mlip must provide the op (looked up, not linked: the pair builds without it)
++  const char *edges_flag = std::getenv("SEVENN_GPU_EDGES");
++  if (device.is_cuda() && meta_dict["jet_csr"] == "yes" && !(edges_flag && std::strcmp(edges_flag, "0") == 0)) {
++    edge_build_op = c10::Dispatcher::singleton().findOp({"jet_mlip::edge_build", ""});
++    gpu_edges = edge_build_op.has_value();
++    utils::logmesg(lmp, gpu_edges ? "PairE3GNN: edge list built on the GPU (jet_mlip::edge_build)\n"
++                                  : "PairE3GNN: jet_mlip::edge_build not registered, edge list built on the host\n");
++  }
+ 
+   if (meta_dict["model_type"].compare("E3_equivariant_model") != 0) {
+     error->all(FLERR, "given model type is not E3_equivariant_model");
+@@ -374,8 +859,9 @@ void PairE3GNN::coeff(int narg, char **arg) {
+       if (chem_vec[j].compare(arg[i]) == 0) {
+         map[i - 2] = j;
+         found_flag = true;
+-        fprintf(lmp->logfile, "Chemical specie '%s' is assigned to type %d\n",
+-                arg[i], i - 2);
++        if (lmp->logfile) // NULL on every rank but 0 (and with -log none)
++          fprintf(lmp->logfile, "Chemical specie '%s' is assigned to type %d\n",
++                  arg[i], i - 2);
+         break;
+       }
+     }
+@@ -412,15 +898,60 @@ void PairE3GNN::coeff(int narg, char **arg) {
+ 
+ // init specific to this pair
+ void PairE3GNN::init_style() {
+-  // Newton flag is irrelevant if use only one processor for simulation
+-  /*
+-  if (force->newton_pair == 0) {
+-    error->all(FLERR, "Pair style nn requires newton pair on");
++  halo = comm->nprocs > 1;
++  if (halo) {
++    // L-hop halo replication: every rank runs the single-GPU graph on its local atoms
++    // plus the ghosts within num_conv*cutoff, sums the local atoms' energy and leaves
++    // the ghost forces to LAMMPS' reverse comm
++    if (force->newton_pair == 0)
++      error->all(FLERR, "Pair style e3gnn on more than one MPI rank requires newton pair on");
++    if (domain->triclinic)
++      error->all(FLERR, "Pair style e3gnn on more than one MPI rank supports orthogonal boxes only");
++    if (!atom->tag_consecutive())
++      error->all(FLERR, "Pair style e3gnn on more than one MPI rank requires consecutive atom tags");
++    if (num_conv < 1)
++      error->all(FLERR, "Pair style e3gnn on more than one MPI rank needs the num_conv metadata: "
++                        "deploy the model with sevenn get_model");
++    // a ghost node at hop h is computed through layer num_conv-h+1, so it needs its own
++    // neighbors: communicate every atom within num_conv hops (each at most cutoff+skin)
++    comm->cutghostuser = MAX(comm->cutghostuser, num_conv * (cutoff + neighbor->skin));
++    ghostneigh = 1; // the neighbor list also gives the ghost atoms' neighbors
++    if (comm->me == 0)
++      utils::logmesg(lmp, "PairE3GNN: {} ranks, {}-hop halo ({} edges, CUDA graph {})\n", comm->nprocs,
++                     num_conv, gpu_edges ? "GPU" : "host", use_graph ? "on" : "off");
+   }
+-  */
+ 
+   // full neighbor list (this is many-body potential)
+-  neighbor->add_request(this, NeighConst::REQ_FULL);
++  neighbor->add_request(this, halo ? (NeighConst::REQ_FULL | NeighConst::REQ_GHOST) : NeighConst::REQ_FULL);
++
++  // Neighbor::init() zeroes neighbor->ncalls at every run / minimize, so a matching count cannot tell this run's
++  // list from the last one (stale candidates, centers and owners after setup's remap / sort): upload on the first
++  // compute of every run.
++  gpu_ncalls = -1;
++  node_ncalls = -1;
++
++  // pair_style hybrid/overlay e3gnn d3: compute() launches the D3 evaluation (see
++  // PairD3::launch / launch_multi_async) when d3 comes after e3gnn in the hybrid list, so its
++  // own compute() of the same force evaluation only collects the result. On more than one rank
++  // it runs after the e3gnn GPU work is launched, so the D3 host part overlaps it. Not under
++  // r-RESPA, where the sub-styles can run at different levels.
++  d3_prelaunch = nullptr;
++  if (force->pair != this && !utils::strmatch(update->integrate_style, "^respa")) {
++    int dim;
++    Pair *d3 = force->pair_match("d3", 1) ? force->pair_match("d3", 1) : force->pair_match("jet/d3", 1);   // d3 or jet/d3
++    if (d3 && force->pair->extract("sevenn_pair_first", dim) == this) {
++      d3_pair = d3;
++      d3_prelaunch = reinterpret_cast<void (*)(Pair *)>(d3->extract("d3_prelaunch", dim));
++    }
++  }
+ }
+ 
+-double PairE3GNN::init_one(int i, int j) { return cutoff; }
++void *PairE3GNN::extract(const char *str, int &dim) {
++  dim = 0;
++  return std::strcmp(str, "sevenn_pair_first") == 0 ? this : nullptr; // hybrid order probe (init_style)
++}
++
++double PairE3GNN::init_one(int i, int j) {
++  cutghost[i][j] = cutghost[j][i] = cutoff; // ghost list search range (halo mode)
++  return cutoff;
++}
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn.h b/sevenn/pair_e3gnn/pair_e3gnn.h
+index 038d5ca..55d7440 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn.h
++++ b/sevenn/pair_e3gnn/pair_e3gnn.h
+@@ -23,6 +23,16 @@ PairStyle(e3gnn, PairE3GNN)
+ 
+ #include <torch/torch.h>
+ 
++#include <ATen/core/dispatch/Dispatcher.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime_api.h>
++
++#include <memory>
++#include <optional>
++#include <vector>
++
++namespace at { namespace cuda { struct CUDAGraph; } }
++
+ namespace LAMMPS_NS {
+ class PairE3GNN : public Pair {
+ private:
+@@ -33,12 +43,61 @@ private:
+   int nelements;
+   bool print_info = false;
+ 
+-  int nedges_bound = -1;
++  // multi-rank halo mode (see init_style() and compute()): comm->nprocs > 1
++  bool halo = false;
++  int num_conv = 0;                  // model metadata: number of convolution layers L
++  std::vector<int> node_to_i;        // graph row -> LAMMPS atom index (-1: padding row)
++  std::vector<long> halo_pad;        // halo: padded row counts P_0 .. P_L (P_k = rows layer k fills)
++  std::vector<long> layer_nout;      // halo: real n_1 .. n_L of the current rebuild
++  bigint node_ncalls = -1;           // neighbor->ncalls the halo node set was built for
++  void build_halo_nodes();           // freeze the node set for the coming rebuild interval
++  std::vector<long> graph_npad;      // halo: padded counts of the captured graph
++  torch::Tensor in_emask;            // halo: 1 on the local atoms' atomic_energy rows, else 0
++
++  // grow-only scratch reused every step (see compute())
++  std::vector<int> tag_to_graph;     // LAMMPS tag -> graph node index
++  std::vector<int> graph_index_to_i; // graph node index -> LAMMPS local index
++  std::vector<int> edge_offset;      // per-i edge offsets (OpenMP build)
++  torch::Tensor host_type;           // pinned (N) int64
++  torch::Tensor host_edge_vec;       // pinned (E, 3) float
++  torch::Tensor host_edge_src;       // pinned (E) int32
++  torch::Tensor host_edge_dst;       // pinned (E) int32
++  torch::Tensor host_out;            // pinned (3N + 8) double: force, energy, virial, edge count
++
++  // CUDA graph replay of the model forward + dE/dr + force/virial reduction
++  // (see compute()); SEVENN_CUDA_GRAPH=0 forces the eager path
++  bool use_graph = false;
++  std::optional<c10::cuda::CUDAStream> stream;
++  std::unique_ptr<at::cuda::CUDAGraph> graph;
++  long graph_nlocal = -1, graph_ecap = -1;
++  torch::Tensor in_type, in_edge_vec, in_edge_src, in_edge_dst; // static graph inputs
++  torch::Tensor dev_energy, dev_atomic_energy, dev_dEdr, dev_edge_src, dev_edge_dst,
++      dev_force, dev_voigt, dev_virial, dev_out; // device results of the last step
++
++  // edge list built on the GPU by jet_mlip::edge_build inside the graph (see compute());
++  // models deployed with `jet_csr: yes` only, SEVENN_GPU_EDGES=0 disables
++  bool gpu_edges = false;
++  std::optional<c10::OperatorHandle> edge_build_op;
++  bigint gpu_ncalls = -1; // neighbor->ncalls of the uploaded candidate list
++  torch::Tensor host_x, host_cand_ptr, host_cand_j, host_center, host_owner; // pinned
++  torch::Tensor in_x, in_cand_ptr, in_cand_j, in_center, in_owner;           // uploaded per rebuild
++  torch::Tensor in_rowptr, in_nbr, in_ctr, in_perm, in_total;                // edge_build outputs (+ identity perm)
++
++  // pair_style hybrid/overlay e3gnn d3: D3 launch entry point (see init_style())
++  Pair *d3_pair = nullptr;
++  void (*d3_prelaunch)(Pair *) = nullptr;
++
++  // SEVENN_TIMING=1 (see compute() and finish())
++  bool timing = false;
++  cudaEvent_t tev[2];
++  double tsum[6] = {};
++  long tsteps = 0, tcaptures = 0, trebuilds = 0, tregrows = 0;
+ 
+ public:
+   PairE3GNN(class LAMMPS *);
+   ~PairE3GNN();
+   void compute(int, int);
++  void finish();
+ 
+   void settings(int, char **);
+   // read Atom type string from input script & related coeff
+@@ -47,6 +106,7 @@ public:
+ 
+   void init_style();
+   double init_one(int, int);
++  void *extract(const char *, int &) override;
+ };
+ } // namespace LAMMPS_NS
+ 
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp b/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
+index de8c6a1..cb8d293 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
++++ b/sevenn/pair_e3gnn/pair_e3gnn_parallel.cpp
+@@ -43,6 +43,7 @@
+ 
+ #include "pair_e3gnn_parallel.h"
+ #include <cassert>
++#include <typeinfo>
+ 
+ #ifdef OMPI_MPI_H
+ #include "mpi-ext.h" //This should be included after mpi.h which is included in pair.h
+@@ -56,6 +57,122 @@ extern void pair_e3gnn_oeq_register_autograd();
+ #define INTEGER_TYPE torch::TensorOptions().dtype(torch::kInt64)
+ #define FLOAT_TYPE torch::TensorOptions().dtype(torch::kFloat)
+ 
++// CommBrick keeps its swap tables protected. Deriving a class that is never
++// instantiated lets us form pointers to those members legally, so the two
++// comm loops below can read them from the stock comm_brick.h of any LAMMPS
++// version instead of shipping a patched copy of comm_brick.*.
++struct CommBrickAccess : CommBrick {
++  static int CommBrick::*nswap_() { return &CommBrickAccess::nswap; }
++  static int *CommBrick::*sendnum_() { return &CommBrickAccess::sendnum; }
++  static int *CommBrick::*recvnum_() { return &CommBrickAccess::recvnum; }
++  static int *CommBrick::*sendproc_() { return &CommBrickAccess::sendproc; }
++  static int *CommBrick::*recvproc_() { return &CommBrickAccess::recvproc; }
++  static int *CommBrick::*firstrecv_() { return &CommBrickAccess::firstrecv; }
++  static int **CommBrick::*sendlist_() { return &CommBrickAccess::sendlist; }
++  static int CommBrick::*maxsend_() { return &CommBrickAccess::maxsend; }
++  static int CommBrick::*maxrecv_() { return &CommBrickAccess::maxrecv; }
++  static int CommBrick::*bufextra_() { return &CommBrickAccess::bufextra; }
++  static double *CommBrick::*buf_send_() { return &CommBrickAccess::buf_send; }
++  static double *CommBrick::*buf_recv_() { return &CommBrickAccess::buf_recv; }
++};
++
++// The plain brick comm keeps its swap tables on the host. CommKokkos (used
++// with -k on) derives from CommBrick but may leave the host sendlist stale,
++// so only the exact CommBrick class is accepted.
++CommBrick *PairE3GNNParallel::get_comm_brick() {
++  if (typeid(*comm) != typeid(CommBrick)) {
++    error->all(FLERR, "e3gnn/parallel requires comm_style brick without the "
++                      "KOKKOS package enabled (-k on)");
++  }
++  return static_cast<CommBrick *>(comm);
++}
++
++void PairE3GNNParallel::forward_comm_gnn() {
++  CommBrick *cb = get_comm_brick();
++  const int nswap = cb->*CommBrickAccess::nswap_();
++  const int *sendnum = cb->*CommBrickAccess::sendnum_();
++  const int *recvnum = cb->*CommBrickAccess::recvnum_();
++  const int *sendproc = cb->*CommBrickAccess::sendproc_();
++  const int *recvproc = cb->*CommBrickAccess::recvproc_();
++  const int *firstrecv = cb->*CommBrickAccess::firstrecv_();
++  int **sendlist = cb->*CommBrickAccess::sendlist_();
++  int iswap, n;
++  MPI_Request request;
++
++  const int nsize = x_dim;
++  float *buf_send_, *buf_recv_;
++  if (use_cuda_mpi) {
++    DeviceBuffManager::getInstance().get_buffer(
++        cb->*CommBrickAccess::maxsend_() + cb->*CommBrickAccess::bufextra_(),
++        cb->*CommBrickAccess::maxrecv_(), buf_send_, buf_recv_);
++  } else {
++    buf_send_ = reinterpret_cast<float *>(cb->*CommBrickAccess::buf_send_());
++    buf_recv_ = reinterpret_cast<float *>(cb->*CommBrickAccess::buf_recv_());
++  }
++  if (!comm_preprocess_done) {
++    notify_proc_ids(sendproc, recvproc);
++  }
++  if (nswap > 6)
++    error->all(FLERR, "PairE3GNNParallel: Cell size is too small. Please use a "
++                      "single GPU or make a supercell");
++
++  for (iswap = 0; iswap < nswap; iswap++) {
++    if (sendproc[iswap] == comm->me) continue;
++
++    if (!comm_preprocess_done) {
++      pack_forward_init(sendnum[iswap], sendlist[iswap], iswap);
++      unpack_forward_init(recvnum[iswap], firstrecv[iswap], iswap);
++    } else {
++      n = pack_forward_comm_gnn(buf_send_, iswap);
++
++      if (recvnum[iswap])
++        MPI_Irecv(buf_recv_, nsize * recvnum[iswap], MPI_FLOAT, recvproc[iswap],
++                  0, world, &request);
++      if (sendnum[iswap])
++        MPI_Send(buf_send_, n, MPI_FLOAT, sendproc[iswap], 0, world);
++      if (recvnum[iswap]) MPI_Wait(&request, MPI_STATUS_IGNORE);
++
++      unpack_forward_comm_gnn(buf_recv_, iswap);
++    }
++  }
++}
++
++void PairE3GNNParallel::reverse_comm_gnn() {
++  CommBrick *cb = get_comm_brick();
++  const int nswap = cb->*CommBrickAccess::nswap_();
++  const int *sendnum = cb->*CommBrickAccess::sendnum_();
++  const int *recvnum = cb->*CommBrickAccess::recvnum_();
++  const int *sendproc = cb->*CommBrickAccess::sendproc_();
++  const int *recvproc = cb->*CommBrickAccess::recvproc_();
++  int iswap, n;
++  MPI_Request request;
++
++  const int nsize = x_dim;
++  float *buf_send_, *buf_recv_;
++  if (use_cuda_mpi) {
++    DeviceBuffManager::getInstance().get_buffer(
++        cb->*CommBrickAccess::maxsend_() + cb->*CommBrickAccess::bufextra_(),
++        cb->*CommBrickAccess::maxrecv_(), buf_send_, buf_recv_);
++  } else {
++    buf_send_ = reinterpret_cast<float *>(cb->*CommBrickAccess::buf_send_());
++    buf_recv_ = reinterpret_cast<float *>(cb->*CommBrickAccess::buf_recv_());
++  }
++
++  for (iswap = nswap - 1; iswap >= 0; iswap--) {
++    if (sendproc[iswap] == comm->me) continue;
++    n = pack_reverse_comm_gnn(buf_send_, iswap);
++
++    if (sendnum[iswap])
++      MPI_Irecv(buf_recv_, nsize * sendnum[iswap], MPI_FLOAT, sendproc[iswap],
++                0, world, &request);
++    if (recvnum[iswap])
++      MPI_Send(buf_send_, n, MPI_FLOAT, recvproc[iswap], 0, world);
++    if (sendnum[iswap]) MPI_Wait(&request, MPI_STATUS_IGNORE);
++
++    unpack_reverse_comm_gnn(buf_recv_, iswap);
++  }
++}
++
+ DeviceBuffManager &DeviceBuffManager::getInstance() {
+   static DeviceBuffManager instance;
+   return instance;
+@@ -216,11 +333,7 @@ void PairE3GNNParallel::compute(int eflag, int vflag) {
+   int *ilist = list->ilist;
+   int inum = list->inum;
+ 
+-  CommBrick *comm_brick = dynamic_cast<CommBrick *>(comm);
+-  if (comm_brick == nullptr) {
+-    error->all(FLERR, "e3gnn/parallel: comm style should be brick & from "
+-                      "modified code of comm_brick");
+-  }
++  get_comm_brick(); // fail early on an unsupported comm style
+ 
+   bigint natoms = atom->natoms;
+ 
+@@ -366,7 +479,7 @@ void PairE3GNNParallel::compute(int eflag, int vflag) {
+     auto ghost_and_extra_x = torch::zeros({ghost_node_num + extra_size, x_dim},
+                                           FLOAT_TYPE.device(device));
+     x_comm = torch::cat({x_local, ghost_and_extra_x}, 0).to(device_comm);
+-    comm_brick->forward_comm(this); // populate x_ghost by communication
++    forward_comm_gnn(); // populate x_ghost by communication
+ 
+     // What we got from forward_comm (node feature of ghosts)
+     x_ghost = torch::split_with_sizes(
+@@ -432,7 +545,7 @@ void PairE3GNNParallel::compute(int eflag, int vflag) {
+     auto extra_x = torch::zeros({extra_size, x_dim}, FLOAT_TYPE.device(device));
+     x_comm = torch::cat({x_local, x_ghost, extra_x}, 0).to(device_comm);
+ 
+-    comm_brick->reverse_comm(this); // completes x_local
++    reverse_comm_gnn(); // completes x_local
+ 
+     // now x_local is complete (dE_dx), become next grads_output(with
+     // self_conn_grads)
+@@ -697,11 +810,9 @@ void PairE3GNNParallel::notify_proc_ids(const int *sendproc, const int *recvproc
+ 
+ void PairE3GNNParallel::comm_preprocess() {
+   assert(!comm_preprocess_done);
+-  CommBrick *comm_brick = dynamic_cast<CommBrick *>(comm);
+-
+   // fake lammps communication call to preprocess index
+   // gives complete comm_index_pack, unpack_forward, and extra_graph_idx_map
+-  comm_brick->forward_comm(this);
++  forward_comm_gnn();
+ 
+   std::map<int, std::set<int>> already_met_map;
+   for (int comm_phase = 0; comm_phase < 6; comm_phase++) {
+@@ -743,7 +854,7 @@ void PairE3GNNParallel::comm_preprocess() {
+   comm_preprocess_done = true;
+ }
+ 
+-// called from comm_brick if comm_preprocess_done is false
++// called from forward_comm_gnn if comm_preprocess_done is false
+ void PairE3GNNParallel::pack_forward_init(int n, int *list_send,
+                                           int comm_phase) {
+   std::vector<long> &idx_map = comm_index_pack_forward[comm_phase];
+@@ -776,7 +887,7 @@ void PairE3GNNParallel::pack_forward_init(int n, int *list_send,
+   }
+ }
+ 
+-// called from comm_brick if comm_preprocess_done is false
++// called from forward_comm_gnn if comm_preprocess_done is false
+ void PairE3GNNParallel::unpack_forward_init(int n, int first, int comm_phase) {
+   std::vector<long> &idx_map = comm_index_unpack_forward[comm_phase];
+ 
+diff --git a/sevenn/pair_e3gnn/pair_e3gnn_parallel.h b/sevenn/pair_e3gnn/pair_e3gnn_parallel.h
+index 2ddf783..6531348 100644
+--- a/sevenn/pair_e3gnn/pair_e3gnn_parallel.h
++++ b/sevenn/pair_e3gnn/pair_e3gnn_parallel.h
+@@ -45,6 +45,11 @@ private:
+   void comm_preprocess();
+   bool comm_preprocess_done = false;
+ 
++  // per-layer node feature exchange over CommBrick's swap tables
++  class CommBrick *get_comm_brick();
++  void forward_comm_gnn();
++  void reverse_comm_gnn();
++
+   // temporary variables holds for each compute step
+   std::unordered_map<int, long> extra_graph_idx_map;
+   // To use scatter, store long instead of int
+diff --git a/sevenn/pair_e3gnn/patch_lammps.sh b/sevenn/pair_e3gnn/patch_lammps.sh
+index ec46c1b..54b3145 100755
+--- a/sevenn/pair_e3gnn/patch_lammps.sh
++++ b/sevenn/pair_e3gnn/patch_lammps.sh
+@@ -1,5 +1,16 @@
+ #!/bin/bash
+ 
++# optional: --jet {jet_so} (anywhere in the argument list)
++jet_so="NONE"
++_args=()
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        --jet) jet_so="$2"; shift 2 ;;
++        *) _args+=("$1"); shift ;;
++    esac
++done
++set -- "${_args[@]}"
++
+ lammps_root=$1
+ cxx_standard=$2 # 14, 17
+ d3_support=$3 # 1, 0
+@@ -8,6 +19,7 @@ oeq_so="${5:-NONE}"
+ SCRIPT_DIR=$(dirname "${BASH_SOURCE[0]}")
+ enable_flashTP=0
+ enable_oeq=0
++enable_jet=0
+ 
+ ###########################################
+ # Check if the given arguments are valid  #
+@@ -15,7 +27,7 @@ enable_oeq=0
+ 
+ # Check the number of arguments
+ if [ "$#" -lt 3 ] || [ "$#" -gt 5 ]; then
+-    echo "Usage: sh patch_lammps.sh {lammps_root} {cxx_standard} {d3_support} {flashTP_so} {oeq_so}"
++    echo "Usage: sh patch_lammps.sh {lammps_root} {cxx_standard} {d3_support} {flashTP_so} {oeq_so} [--jet {jet_so}]"
+     echo "  {lammps_root}: Root directory of LAMMPS source"
+     echo "  {cxx_standard}: C++ standard (14, 17)"
+     echo "  {d3_support}: Support for pair_d3 (1, 0)"
+@@ -60,6 +72,16 @@ else
+     oeq_so="NONE"
+ fi
+ 
++if [ -f "$jet_so" ]; then
++    echo "Using jet_so: $jet_so"
++    enable_jet=1
++elif [ "$jet_so" = "NONE" ]; then
++    echo "[Jet] Skipped: not provided"
++else
++    echo "[Jet] Skipped: invalid or missing jet_so given"
++    jet_so="NONE"
++fi
++
+ # Check if the patch is already applied
+ if [ -f "$lammps_root/src/pair_e3gnn.cpp" ]; then
+     echo "----------------------------------------------------------"
+@@ -87,16 +109,25 @@ else
+     echo "OpenMPI not found, parallel performance is not optimal"
+ fi
+ 
+-# Extract LAMMPS version and update
++# The pair styles build against the stock LAMMPS API from stable_2Aug2023 on.
++# The comm API gained a size argument in 22 Jul 2025; the ML-IAP path
++# (sevenn --use_mliap, pair_style mliap/kk) needs that release or newer with
++# the KOKKOS package. Probe the header instead of comparing version strings.
+ lammps_version=$(grep "#define LAMMPS_VERSION" $lammps_root/src/version.h | awk '{print $3, $4, $5}' | tr -d '"')
+-
+-# Combine version and update
+-detected_version="$lammps_version"
+-required_version="2 Aug 2023"  # Example required version
+-
+-# Check if the detected version is compatible
+-if [[ "$detected_version" != "$required_version" ]]; then
+-    echo "Warning: Detected LAMMPS version ($detected_version) may not be compatible. Required version: $required_version"
++lammps_update=$(grep "#define LAMMPS_UPDATE" $lammps_root/src/version.h | cut -d'"' -f2)
++# Stable lines this patch was built and checked on (run 0 + MD vs a reference, e3gnn/parallel vs serial):
++# 2Aug2023 update3/update4, 29Aug2024 update4, 22Jul2025 update6, feature release patch_2Sep2026. Updates within a
++# stable line are bug-fix only, so every update of these lines is treated as verified. Keep in sync with the test matrix.
++verified_versions=("2 Aug 2023" "29 Aug 2024" "22 Jul 2025" "2 Sep 2026")
++echo "Verified LAMMPS releases: stable_2Aug2023, stable_29Aug2024, stable_22Jul2025 (all updates), patch_2Sep2026"
++if [[ ! " ${verified_versions[*]/%/;} " == *" $lammps_version;"* ]]; then
++    echo "WARNING: LAMMPS $lammps_version${lammps_update:+ $lammps_update} is not a verified release." >&2
++    echo "WARNING: The patch should still apply (no core file is overwritten), but check the build and a run 0 against a verified build." >&2
++fi
++if grep -q 'forward_comm(class Pair \*, int size' $lammps_root/src/comm.h; then
++    echo "Detected LAMMPS $lammps_version: e3gnn, e3gnn/parallel, d3; ML-IAP (mliap/kk) available with PKG_KOKKOS"
++else
++    echo "Detected LAMMPS $lammps_version: e3gnn, e3gnn/parallel, d3; ML-IAP needs LAMMPS >= 22 Jul 2025 with PKG_KOKKOS"
+ fi
+ 
+ ###########################################
+@@ -107,10 +138,6 @@ fi
+ backup_dir="$lammps_root/_backups"
+ mkdir -p $backup_dir
+ 
+-# Copy comm_* from original LAMMPS source as backup
+-cp $lammps_root/src/comm_brick.cpp $backup_dir/
+-cp $lammps_root/src/comm_brick.h $backup_dir/
+-
+ # Copy cmake/CMakeLists.txt from original source as backup
+ cp $lammps_root/cmake/CMakeLists.txt $backup_dir/CMakeLists.txt
+ 
+@@ -119,41 +146,72 @@ cp $lammps_root/cmake/CMakeLists.txt $backup_dir/CMakeLists.txt
+ ###########################################
+ 
+ # 1. Copy pair_e3gnn files to LAMMPS source
+-cp $SCRIPT_DIR/{pair_e3gnn,pair_e3gnn_parallel,comm_brick}.cpp $lammps_root/src/
+-cp $SCRIPT_DIR/{pair_e3gnn,pair_e3gnn_parallel,comm_brick}.h $lammps_root/src/
++cp $SCRIPT_DIR/{pair_e3gnn,pair_e3gnn_parallel}.cpp $lammps_root/src/
++cp $SCRIPT_DIR/{pair_e3gnn,pair_e3gnn_parallel}.h $lammps_root/src/
+ # Always copy the oEq autograd bridge (pair_e3gnn.cpp has an extern reference to it)
+ cp $SCRIPT_DIR/pair_e3gnn_oeq_autograd.cpp $lammps_root/src/  # TODO: set this as oeq-specific
+ 
+-# 2. Patch cmake/CMakeLists.txt
+-sed -i "s/set(CMAKE_CXX_STANDARD 11)/set(CMAKE_CXX_STANDARD $cxx_standard)/" $lammps_root/cmake/CMakeLists.txt
++# 2. Patch cmake/CMakeLists.txt. Everything is appended, so one block serves
++# every LAMMPS release (the CMakeLists.txt layout changed in 22 Jul 2025).
++if [ "$d3_support" -ne 0 ]; then
+ cat >> $lammps_root/cmake/CMakeLists.txt << "EOF"
+ 
++# --- SevenNet: pair_d3 (CUDA) ---
++# Real SASS for Ada (89) and Hopper (90) unless the caller passes -DCMAKE_CUDA_ARCHITECTURES.
++# Keep this before find_package(Torch): torch's cuda.cmake sets CMAKE_CUDA_ARCHITECTURES to OFF.
++if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
++  set(CMAKE_CUDA_ARCHITECTURES 89 90)
++endif()
++enable_language(CUDA)
++find_package(CUDAToolkit REQUIRED)
++target_sources(lammps PRIVATE ${LAMMPS_SOURCE_DIR}/pair_d3.cu)
++set_target_properties(lammps PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
++set_source_files_properties(${LAMMPS_SOURCE_DIR}/pair_d3.cu PROPERTIES COMPILE_OPTIONS "-O3;--use_fast_math")
++target_link_libraries(lammps PUBLIC CUDA::cudart CUDA::cuda_driver)
++EOF
++fi
++# LAMMPS before 22 Jul 2025 defaults to C++11; libtorch needs 17.
++echo "" >> $lammps_root/cmake/CMakeLists.txt
++echo "# --- SevenNet: libtorch ---" >> $lammps_root/cmake/CMakeLists.txt
++echo "target_compile_features(lammps PUBLIC cxx_std_$cxx_standard)" >> $lammps_root/cmake/CMakeLists.txt
++cat >> $lammps_root/cmake/CMakeLists.txt << "EOF"
+ find_package(Torch REQUIRED)
+ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+ target_link_libraries(lammps PUBLIC "${TORCH_LIBRARIES}")
+ EOF
+ 
++# Extension libraries are linked as one "-Wl,--no-as-needed,<path>" token each
++# (libtorch's own pattern): a Kokkos nvcc_wrapper link line reorders arguments
++# and would otherwise put the .so behind LAMMPS's global -Wl,--as-needed.
+ optional_libs=()
+ optional_rpaths=()
+ 
+ if [ "$enable_flashTP" -eq 1 ]; then
+-    optional_libs+=("    \${CMAKE_CURRENT_LIST_DIR}/flashTP/libflashtp_large_kernel_lammps.so")
++    optional_libs+=("    \"-Wl,--no-as-needed,\${CMAKE_CURRENT_LIST_DIR}/flashTP/libflashtp_large_kernel_lammps.so\"")
+     optional_rpaths+=("\${CMAKE_CURRENT_LIST_DIR}/flashTP")
+     mkdir -p $lammps_root/cmake/flashTP && cp $flashTP_so $lammps_root/cmake/flashTP/libflashtp_large_kernel_lammps.so && echo "[FlashTP] flashTP so file copied"
+ fi
+ 
+ if [ "$enable_oeq" -eq 1 ]; then
+-    optional_libs+=("    \${CMAKE_CURRENT_LIST_DIR}/oeq/liboeq_stable_cuda_aoti.so")
++    optional_libs+=("    \"-Wl,--no-as-needed,\${CMAKE_CURRENT_LIST_DIR}/oeq/liboeq_stable_cuda_aoti.so\"")
+     optional_rpaths+=("\${CMAKE_CURRENT_LIST_DIR}/oeq")
+     mkdir -p $lammps_root/cmake/oeq && cp $oeq_so $lammps_root/cmake/oeq/liboeq_stable_cuda_aoti.so && echo "[OEQ] oeq so file copied"
+ fi
+ 
++if [ "$enable_jet" -eq 1 ]; then
++    optional_libs+=("    \"-Wl,--no-as-needed,\${CMAKE_CURRENT_LIST_DIR}/jet_mlip/libjet_mlip.so\"")
++    optional_rpaths+=("\${CMAKE_CURRENT_LIST_DIR}/jet_mlip")
++    # symlink, not a copy: rebuilding or upgrading jet_mlip reaches this LAMMPS without re-patching (deploy options live in the .pt)
++    mkdir -p $lammps_root/cmake/jet_mlip && ln -sf "$(realpath "$jet_so")" $lammps_root/cmake/jet_mlip/libjet_mlip.so && echo "[Jet] jet so file linked"
++fi
++
+ if [ ${#optional_libs[@]} -gt 0 ]; then
+     rpath_joined=$(IFS=';'; echo "${optional_rpaths[*]}")
+     {
+         echo ""
++        echo "# --- SevenNet: extension libraries ---"
+         echo "find_package(Python3 REQUIRED COMPONENTS Development)"
+-        echo "target_link_libraries(lammps PUBLIC -Wl,--no-as-needed"
++        echo "target_link_libraries(lammps PUBLIC"
+         for lib in "${optional_libs[@]}"; do
+             echo "$lib"
+         done
+@@ -173,22 +231,11 @@ fi
+ 
+ if [ "$d3_support" -ne 0 ]; then
+ 
+-# 1. Copy pair_d3 files to LAMMPS source
++# Copy pair_d3 files to LAMMPS source (the CMake part was appended above)
+ cp $SCRIPT_DIR/pair_d3.cu $lammps_root/src/
+ cp $SCRIPT_DIR/pair_d3.h $lammps_root/src/
+ cp $SCRIPT_DIR/pair_d3_pars.h $lammps_root/src/
+ 
+-# 2. Patch cmake/CMakeLists.txt
+-sed -i "s/project(lammps CXX)/project(lammps CXX CUDA)/" $lammps_root/cmake/CMakeLists.txt
+-sed -i "s/\${LAMMPS_SOURCE_DIR}\/\[\^.\]\*\.cpp/\${LAMMPS_SOURCE_DIR}\/\[\^.\]\*\.cpp  \${LAMMPS_SOURCE_DIR}\/\[\^.\]\*\.cu/" $lammps_root/cmake/CMakeLists.txt
+-cat >> $lammps_root/cmake/CMakeLists.txt << "EOF"
+-
+-find_package(CUDA)
+-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -fmad=false -O3")
+-string(REPLACE "-gencode arch=compute_50,code=sm_50" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+-target_link_libraries(lammps PUBLIC ${CUDA_LIBRARIES} cuda)
+-EOF
+-
+ fi
+ 
+ ###########################################
+@@ -197,7 +244,7 @@ fi
+ 
+ # Print changes and backup file locations
+ echo "Changes made:"
+-echo "  - Original LAMMPS files (src/comm_brick.*, cmake/CMakeList.txt) are in {lammps_root}/_backups"
++echo "  - Original cmake/CMakeLists.txt is in {lammps_root}/_backups"
+ echo "  - Copied contents of pair_e3gnn to $lammps_root/src/"
+ echo "  - Patched CMakeLists.txt: include LibTorch, CXX_STANDARD $cxx_standard"
+ echo
+@@ -212,6 +259,11 @@ if [ "$enable_oeq" -eq 1 ]; then
+     echo "  - Patched CMakeLists.txt: link liboeq_stable_cuda_aoti.so"
+     echo
+ fi
++if [ "$enable_jet" -eq 1 ]; then
++    echo "  - Copied jet .so to $lammps_root/cmake/jet_mlip/"
++    echo "  - Patched CMakeLists.txt: link libjet_mlip.so"
++    echo
++fi
+ if [ "$d3_support" -ne 0 ]; then
+     echo "  - Copied contents of pair_d3 to $lammps_root/src/"
+     echo "  - Patched CMakeLists.txt: include CUDA"
+diff --git a/sevenn/parse_input.py b/sevenn/parse_input.py
+index 099e4c0..cb0d446 100644
+--- a/sevenn/parse_input.py
++++ b/sevenn/parse_input.py
+@@ -102,6 +102,16 @@ def init_model_config(config: Dict[str, Any]) -> Dict[str, Any]:
+         model_meta[key] = config_initialize(
+             key, config, default, _const.MODEL_CONFIG_CONDITION
+         )
++    if model_meta[KEY.JET_RADIAL_TABLE] > 0:
++        raise ValueError(
++            'jet_radial_table is an inference-only option (sevenn get_model '
++            '--radial_table, SevenNetCalculator(radial_table=...)); remove it from '
++            'the training yaml'
++        )
++    if model_meta[KEY.JET_EXACT_BACKWARD] not in ('split', 'recompute'):
++        raise ValueError(
++            f"jet_exact_backward must be 'split' or 'recompute', got {model_meta[KEY.JET_EXACT_BACKWARD]!r}"
++        )
+ 
+     unknown_keys = [key for key in config.keys() if key not in model_meta.keys()]
+     if len(unknown_keys) != 0:
+diff --git a/sevenn/scripts/deploy.py b/sevenn/scripts/deploy.py
+index ca718c3..f70d581 100644
+--- a/sevenn/scripts/deploy.py
++++ b/sevenn/scripts/deploy.py
+@@ -10,17 +10,32 @@ from ase.data import chemical_symbols
+ import sevenn._keys as KEY
+ from sevenn import __version__
+ from sevenn.model_build import build_E3_equivariant_model
++from sevenn.nn.jet_helper import optimize_for_inference
+ from sevenn.util import load_checkpoint, warn_no_tp_accelerator
+ 
+ 
++def _build_radial_tables(model) -> None:
++    """jet radial tables are built from the trained weights, so they can only be
++    filled after the state dict is loaded and before the model is scripted / frozen."""
++    coeffs = [m.basis_function.coeffs for m in model.modules() if hasattr(m, 'basis_function')]
++    if not coeffs:   # a parallel segment without its own edge embedding: keep the exact path
++        return
++    for mod in model.modules():
++        if hasattr(mod, 'build_radial_table'):
++            mod.build_radial_table(coeffs[0])
++
++
+ def deploy(
+     checkpoint: Union[pathlib.Path, str],
+     fname='deployed_serial.pt',
+     modal: Optional[str] = None,
+     use_flash: bool = False,
+     use_oeq: bool = False,
++    use_jet: bool = False,
++    radial_table: bool = True,
++    exact_backward: str = 'split',
+ ) -> None:
+-    if not (use_flash or use_oeq):
++    if not (use_flash or use_oeq or use_jet):
+         warn_no_tp_accelerator('LAMMPS TorchScript deployment')
+ 
+     cp = load_checkpoint(checkpoint)
+@@ -29,6 +44,9 @@ def deploy(
+             enable_cueq=False,
+             enable_flash=use_flash,
+             enable_oeq=use_oeq,
++            enable_jet=use_jet,
++            radial_table=radial_table,
++            exact_backward=exact_backward,
+             _flash_lammps=use_flash,
+         ),
+         cp.config,
+@@ -48,6 +66,9 @@ def deploy(
+ 
+     model.set_is_batch_data(False)
+     model.eval()
++    _build_radial_tables(model)
++    if use_jet:
++        optimize_for_inference(model)
+ 
+     model = e3nn.util.jit.script(model)
+     model = torch.jit.freeze(model)
+@@ -62,8 +83,14 @@ def deploy(
+     md_configs.update({'chemical_symbols_to_index': chem_list})
+     md_configs.update({'cutoff': str(config[KEY.CUTOFF])})
+     md_configs.update({'num_species': str(config[KEY.NUM_SPECIES])})
++    # convolution layers L: pair_e3gnn's multi-rank halo (L*cutoff ghost depth)
++    md_configs.update({'num_conv': str(config[KEY.NUM_CONVOLUTION])})
+     md_configs.update({'flashTP': 'yes' if use_flash else 'no'})
+     md_configs.update({'oeq': 'yes' if use_oeq else 'no'})
++    md_configs.update({'jet': 'yes' if use_jet else 'no'})
++    # the convolutions reuse a CSR given in the input dict: pair_e3gnn may build the
++    # edge list on the GPU (jet_mlip::edge_build) instead of on the host
++    md_configs.update({'jet_csr': 'yes' if use_jet else 'no'})
+     md_configs.update(
+         {'model_type': config.pop(KEY.MODEL_TYPE, 'E3_equivariant_model')}
+     )
+@@ -83,8 +110,11 @@ def deploy_parallel(
+     modal: Optional[str] = None,
+     use_flash: bool = False,
+     use_oeq: bool = False,
++    use_jet: bool = False,
++    radial_table: bool = True,
++    exact_backward: str = 'split',
+ ) -> None:
+-    if not (use_flash or use_oeq):
++    if not (use_flash or use_oeq or use_jet):
+         warn_no_tp_accelerator(
+             'LAMMPS parallel TorchScript deployment',
+         )
+@@ -99,6 +129,9 @@ def deploy_parallel(
+             enable_cueq=False,
+             enable_flash=use_flash,
+             enable_oeq=use_oeq,
++            enable_jet=use_jet,
++            radial_table=radial_table,
++            exact_backward=exact_backward,
+             _flash_lammps=use_flash,
+         ),
+         cp.config,
+@@ -106,6 +139,13 @@ def deploy_parallel(
+     config[KEY.CUEQUIVARIANCE_CONFIG] = {'use': False}
+     config[KEY.USE_FLASH_TP] = use_flash
+     config[KEY.USE_OEQ] = use_oeq
++    config[KEY.USE_JET] = use_jet
++    if use_jet:
++        from sevenn.nn.jet_helper import table_size
++        config[KEY.JET_RADIAL_TABLE] = table_size(radial_table)
++    else:
++        config[KEY.JET_RADIAL_TABLE] = 0
++    config[KEY.JET_EXACT_BACKWARD] = exact_backward
+     config['_flash_lammps'] = use_flash
+     model_state_dct = model.state_dict()
+ 
+@@ -159,6 +199,7 @@ def deploy_parallel(
+     md_configs.update({'comm_size': str(comm_size)})
+     md_configs.update({'flashTP': 'yes' if use_flash else 'no'})
+     md_configs.update({'oeq': 'yes' if use_oeq else 'no'})
++    md_configs.update({'jet': 'yes' if use_jet else 'no'})
+     md_configs.update(
+         {'model_type': config.pop(KEY.MODEL_TYPE, 'E3_equivariant_model')}
+     )
+@@ -171,6 +212,9 @@ def deploy_parallel(
+         fname_full = f'{fname}/deployed_parallel_{idx}.pt'
+         model.set_is_batch_data(False)
+         model.eval()
++        _build_radial_tables(model)
++        if use_jet:
++            optimize_for_inference(model)
+ 
+         model = e3nn.util.jit.script(model)
+         model = torch.jit.freeze(model)
+diff --git a/sevenn/scripts/inference.py b/sevenn/scripts/inference.py
+index cb7c275..b7f58da 100644
+--- a/sevenn/scripts/inference.py
++++ b/sevenn/scripts/inference.py
+@@ -151,6 +151,7 @@ def inference(
+     enable_cueq: bool = False,
+     enable_flash: bool = False,
+     enable_oeq: bool = False,
++    enable_jet: bool = False,
+     **data_kwargs,
+ ) -> None:
+     """
+@@ -183,6 +184,7 @@ def inference(
+         enable_cueq=enable_cueq,
+         enable_flash=enable_flash,
+         enable_oeq=enable_oeq,
++        enable_jet=enable_jet,
+     )
+     cutoff = model.cutoff
+ 
+@@ -234,6 +236,7 @@ def inference(
+     model.to(device)
+     model.set_is_batch_data(True)
+     model.eval()
++    model.requires_grad_(False)
+ 
+     rec = util.get_error_recorder()
+     output_list = []
+diff --git a/sevenn/torchsim.py b/sevenn/torchsim.py
+index 2f37554..12c4577 100644
+--- a/sevenn/torchsim.py
++++ b/sevenn/torchsim.py
+@@ -78,6 +78,7 @@ class SevenNetModel(ModelInterface):  # type: ignore[misc,valid-type]
+         enable_cueq: bool = False,
+         enable_flash: bool = False,
+         enable_oeq: bool = False,
++        enable_jet: bool = False,
+         compute_atomic_virial: bool = False,
+         device: torch.device | str = 'auto',
+         dtype: torch.dtype = torch.float32,
+@@ -98,6 +99,7 @@ class SevenNetModel(ModelInterface):  # type: ignore[misc,valid-type]
+             enable_cueq (bool): Enable cuEquivariance backend.
+             enable_flash (bool): Enable flashTP backend.
+             enable_oeq (bool): Enable OpenEquivariance backend.
++            enable_jet (bool): Enable jet backend.
+             neighbor_list_fn (Callable): Neighbor list function to use.
+                 Default is torch_nl_linked_cell.
+             device (torch.device | str): Device to run the model on
+@@ -144,7 +146,9 @@ class SevenNetModel(ModelInterface):  # type: ignore[misc,valid-type]
+                 enable_flash=enable_flash,
+                 enable_cueq=enable_cueq,
+                 enable_oeq=enable_oeq,
++                enable_jet=enable_jet,
+             )
++            model.requires_grad_(False)
+ 
+         _validate(model, modal)
+ 
+@@ -320,6 +324,7 @@ class SevenNetD3Model(ModelInterface):
+         enable_cueq: bool = False,
+         enable_flash: bool = False,
+         enable_oeq: bool = False,
++        enable_jet: bool = False,
+         neighbor_list_fn: Callable | None = None,
+         device: torch.device | str = 'auto',
+         dtype: torch.dtype = torch.float32,
+@@ -343,6 +348,7 @@ class SevenNetD3Model(ModelInterface):
+             enable_cueq=enable_cueq,
+             enable_flash=enable_flash,
+             enable_oeq=enable_oeq,
++            enable_jet=enable_jet,
+             neighbor_list_fn=neighbor_list_fn,
+             device=device,
+             dtype=dtype,
+diff --git a/sevenn/util.py b/sevenn/util.py
+index 55d7b24..b323760 100644
+--- a/sevenn/util.py
++++ b/sevenn/util.py
+@@ -122,10 +122,18 @@ def model_from_checkpoint(
+     enable_cueq: bool = False,
+     enable_flash: bool = False,
+     enable_oeq: bool = False,
++    enable_jet: bool = False,
++    radial_table: bool = True,
++    exact_backward: str = 'split',
+ ) -> Tuple[torch.nn.Module, Dict[str, Any]]:
+     cp = load_checkpoint(checkpoint)
+     model = cp.build_model(
+-        enable_cueq=enable_cueq, enable_flash=enable_flash, enable_oeq=enable_oeq
++        enable_cueq=enable_cueq,
++        enable_flash=enable_flash,
++        enable_oeq=enable_oeq,
++        enable_jet=enable_jet,
++        radial_table=radial_table,
++        exact_backward=exact_backward,
+     )
+ 
+     return model, cp.config

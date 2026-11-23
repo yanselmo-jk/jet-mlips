@@ -1,0 +1,24 @@
+upstream/
+work/
+.superpowers/
+__pycache__/
+*.so
+build/
+*.egg-info/
+*.pt
+*.pt2
+*.model
+*.pth
+*.safetensors
+*.log
+*.tgz
+*.tar.gz
+.pytest_cache/
+# internal (setup of our machines, offline kit, handover notes): kept locally, not distributed
+env/
+kit/
+HANDOVER.md
+bench/profile_mace.py
+bench/bench_train_mace.py
+patches/make_patch.sh
+jet_mlip/csrc/configs_gen.h

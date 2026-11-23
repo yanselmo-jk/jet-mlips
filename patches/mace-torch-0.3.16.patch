@@ -1,0 +1,221 @@
+diff --git a/mace/modules/blocks.py b/mace/modules/blocks.py
+index af60244..534e619 100644
+--- a/mace/modules/blocks.py
++++ b/mace/modules/blocks.py
+@@ -13,6 +13,7 @@ from e3nn import nn, o3
+ from e3nn.util.jit import compile_mode
+ 
+ from mace.modules.gate import GatedEquivariantBlock
++from mace.modules.macetp_hook import macetp_fused, macetp_tp3
+ from mace.modules.wrapper_ops import (
+     CuEquivarianceConfig,
+     FullyConnectedTensorProduct,
+@@ -668,6 +669,7 @@ class RealAgnosticInteractionBlock(InteractionBlock):
+         lammps_natoms: Tuple[int, int] = (0, 0),
+         lammps_class: Optional[Any] = None,
+         first_layer: bool = False,
++        edge_vectors: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, None]:
+         n_real = lammps_natoms[0] if lammps_class is not None else None
+         node_feats = self.linear_up(node_feats)
+@@ -677,12 +679,19 @@ class RealAgnosticInteractionBlock(InteractionBlock):
+             lammps_natoms=lammps_natoms,
+             first_layer=first_layer,
+         )
+-        tp_weights = self.conv_tp_weights(edge_feats)
+-        if cutoff is not None:
+-            tp_weights = tp_weights * cutoff
+-
+-        message = None
+-        if hasattr(self, "conv_fusion"):
++        message: Optional[torch.Tensor] = None
++        if not torch.jit.is_scripting():   # macetp eval path: fused table convolution, no radial MLP
++            message = macetp_fused(self, node_feats, edge_vectors, edge_index, node_attrs)
++        tp_weights = torch.zeros(0)
++        if message is None:
++            tp_weights = self.conv_tp_weights(edge_feats)
++            if cutoff is not None:
++                tp_weights = tp_weights * cutoff
++            if not torch.jit.is_scripting():   # macetp train path: fused tensor product + scatter
++                message = macetp_tp3(self, node_feats, edge_attrs, tp_weights, edge_index)
++        if message is not None:
++            pass
++        elif hasattr(self, "conv_fusion"):
+             message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
+         else:
+             mji = self.conv_tp(
+@@ -771,6 +780,7 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
+         lammps_class: Optional[Any] = None,
+         lammps_natoms: Tuple[int, int] = (0, 0),
+         first_layer: bool = False,
++        edge_vectors: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         n_real = lammps_natoms[0] if lammps_class is not None else None
+         sc = self.skip_tp(node_feats, node_attrs)
+@@ -781,11 +791,19 @@ class RealAgnosticResidualInteractionBlock(InteractionBlock):
+             lammps_natoms=lammps_natoms,
+             first_layer=first_layer,
+         )
+-        tp_weights = self.conv_tp_weights(edge_feats)
+-        if cutoff is not None:
+-            tp_weights = tp_weights * cutoff
+-        message = None
+-        if hasattr(self, "conv_fusion"):
++        message: Optional[torch.Tensor] = None
++        if not torch.jit.is_scripting():   # macetp eval path: fused table convolution, no radial MLP
++            message = macetp_fused(self, node_feats, edge_vectors, edge_index, node_attrs)
++        tp_weights = torch.zeros(0)
++        if message is None:
++            tp_weights = self.conv_tp_weights(edge_feats)
++            if cutoff is not None:
++                tp_weights = tp_weights * cutoff
++            if not torch.jit.is_scripting():   # macetp train path: fused tensor product + scatter
++                message = macetp_tp3(self, node_feats, edge_attrs, tp_weights, edge_index)
++        if message is not None:
++            pass
++        elif hasattr(self, "conv_fusion"):
+             message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
+         else:
+             mji = self.conv_tp(
+@@ -884,6 +902,7 @@ class RealAgnosticDensityInteractionBlock(InteractionBlock):
+         lammps_class: Optional[Any] = None,
+         lammps_natoms: Tuple[int, int] = (0, 0),
+         first_layer: bool = False,
++        edge_vectors: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, None]:
+         receiver = edge_index[1]
+         num_nodes = node_feats.shape[0]
+@@ -895,16 +914,25 @@ class RealAgnosticDensityInteractionBlock(InteractionBlock):
+             lammps_natoms=lammps_natoms,
+             first_layer=first_layer,
+         )
+-        tp_weights = self.conv_tp_weights(edge_feats)
+         edge_density = torch.tanh(self.density_fn(edge_feats) ** 2)
+         if cutoff is not None:
+-            tp_weights = tp_weights * cutoff
+             edge_density = edge_density * cutoff
+         density = scatter_sum(
+             src=edge_density, index=receiver, dim=0, dim_size=num_nodes
+         )  # [n_nodes, 1]
+-        message = None
+-        if hasattr(self, "conv_fusion"):
++        message: Optional[torch.Tensor] = None
++        if not torch.jit.is_scripting():   # macetp eval path: fused table convolution, no radial MLP
++            message = macetp_fused(self, node_feats, edge_vectors, edge_index, node_attrs)
++        tp_weights = torch.zeros(0)
++        if message is None:
++            tp_weights = self.conv_tp_weights(edge_feats)
++            if cutoff is not None:
++                tp_weights = tp_weights * cutoff
++            if not torch.jit.is_scripting():   # macetp train path: fused tensor product
++                message = macetp_tp3(self, node_feats, edge_attrs, tp_weights, edge_index)
++        if message is not None:
++            pass
++        elif hasattr(self, "conv_fusion"):
+             message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
+         else:
+             mji = self.conv_tp(
+@@ -1006,6 +1034,7 @@ class RealAgnosticDensityResidualInteractionBlock(InteractionBlock):
+         lammps_class: Optional[Any] = None,
+         lammps_natoms: Tuple[int, int] = (0, 0),
+         first_layer: bool = False,
++        edge_vectors: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         receiver = edge_index[1]
+         num_nodes = node_feats.shape[0]
+@@ -1018,17 +1047,25 @@ class RealAgnosticDensityResidualInteractionBlock(InteractionBlock):
+             lammps_natoms=lammps_natoms,
+             first_layer=first_layer,
+         )
+-        tp_weights = self.conv_tp_weights(edge_feats)
+         edge_density = torch.tanh(self.density_fn(edge_feats) ** 2)
+         if cutoff is not None:
+-            tp_weights = tp_weights * cutoff
+             edge_density = edge_density * cutoff
+         density = scatter_sum(
+             src=edge_density, index=receiver, dim=0, dim_size=num_nodes
+         )  # [n_nodes, 1]
+-
+-        message = None
+-        if hasattr(self, "conv_fusion"):
++        message: Optional[torch.Tensor] = None
++        if not torch.jit.is_scripting():   # macetp eval path: fused table convolution, no radial MLP
++            message = macetp_fused(self, node_feats, edge_vectors, edge_index, node_attrs)
++        tp_weights = torch.zeros(0)
++        if message is None:
++            tp_weights = self.conv_tp_weights(edge_feats)
++            if cutoff is not None:
++                tp_weights = tp_weights * cutoff
++            if not torch.jit.is_scripting():   # macetp train path: fused tensor product
++                message = macetp_tp3(self, node_feats, edge_attrs, tp_weights, edge_index)
++        if message is not None:
++            pass
++        elif hasattr(self, "conv_fusion"):
+             message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
+         else:
+             mji = self.conv_tp(
+@@ -1129,6 +1166,7 @@ class RealAgnosticAttResidualInteractionBlock(InteractionBlock):
+         lammps_class: Optional[Any] = None,
+         lammps_natoms: Tuple[int, int] = (0, 0),
+         first_layer: bool = False,
++        edge_vectors: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, None]:
+         sender = edge_index[0]
+         receiver = edge_index[1]
+@@ -1303,6 +1341,7 @@ class RealAgnosticResidualNonLinearInteractionBlock(InteractionBlock):
+         lammps_class: Optional[Any] = None,
+         lammps_natoms: Tuple[int, int] = (0, 0),
+         first_layer: bool = False,
++        edge_vectors: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         num_nodes = node_feats.shape[0]
+         n_real = lammps_natoms[0] if lammps_class is not None else None
+diff --git a/mace/modules/macetp_hook.py b/mace/modules/macetp_hook.py
+new file mode 100644
+index 0000000..6301761
+--- /dev/null
++++ b/mace/modules/macetp_hook.py
+@@ -0,0 +1,23 @@
++"""mlip-accel hook: jet_mlip fused convolution (macetp) for InteractionBlocks.
++`macetp.convert.patch_model` attaches a `macetp` module to each block. Eval: the whole radial MLP + tensor
++product + scatter is one fused kernel (radial table). Train: the radial MLP stays in torch, the tensor product +
++scatter run in jet_mlip's tp3 (any-order autograd). Eager only (TorchScript keeps the upstream path)."""
++from typing import Optional
++
++import torch
++
++
++def macetp_fused(block, node_feats: torch.Tensor, edge_vectors: Optional[torch.Tensor],
++                 edge_index: torch.Tensor, node_attrs: torch.Tensor) -> Optional[torch.Tensor]:
++    conv = getattr(block, "macetp", None)
++    if conv is None or block.training or edge_vectors is None:
++        return None
++    return conv(node_feats, edge_vectors, edge_index, node_attrs)
++
++
++def macetp_tp3(block, node_feats: torch.Tensor, edge_attrs: torch.Tensor, tp_weights: torch.Tensor,
++               edge_index: torch.Tensor) -> Optional[torch.Tensor]:
++    conv = getattr(block, "macetp", None)
++    if conv is None or not block.training:
++        return None
++    return conv.tp3(node_feats, edge_attrs, tp_weights, edge_index)
+diff --git a/mace/modules/models.py b/mace/modules/models.py
+index 5e2d604..d7cbbf0 100644
+--- a/mace/modules/models.py
++++ b/mace/modules/models.py
+@@ -376,6 +376,7 @@ class MACE(torch.nn.Module):
+                 first_layer=(i == 0),
+                 lammps_class=lammps_class,
+                 lammps_natoms=lammps_natoms,
++                edge_vectors=vectors,
+             )
+             if is_lammps and i == 0:
+                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+@@ -556,6 +557,7 @@ class ScaleShiftMACE(MACE):
+                 first_layer=(i == 0),
+                 lammps_class=lammps_class,
+                 lammps_natoms=lammps_natoms,
++                edge_vectors=vectors,
+             )
+             if is_lammps and i == 0:
+                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]

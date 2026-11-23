@@ -1,0 +1,105 @@
+--- a/src/KOKKOS/mliap_data_kokkos.cpp	2026-10-11 00:32:36.001122924 +0900
++++ b/src/KOKKOS/mliap_data_kokkos.cpp	2026-10-11 00:32:36.014273633 +0900
+@@ -151,8 +151,12 @@
+     update += d_numneighs(ii);
+   });
+ 
+-  Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType>(0,natomneigh), KOKKOS_LAMBDA (int ii)  {
+-    int ij = d_ij(ii);
++  // mliap-accel: neighdata fill — one team per atom, team scan over its neighbours keeps the per-atom pair order
++  typedef Kokkos::TeamPolicy<DeviceType> NDTeamPolicy;
++  typedef typename NDTeamPolicy::member_type NDTeam;
++  Kokkos::parallel_for(NDTeamPolicy(natomneigh, Kokkos::AUTO), KOKKOS_LAMBDA (const NDTeam &team) {
++    const int ii = team.league_rank();
++    const int ij0 = d_ij(ii);
+     const int i = d_ilist[ii];
+     const double xtmp = x(i, 0);
+     const double ytmp = x(i, 1);
+@@ -160,27 +164,31 @@
+     const int itype = type(i);
+     const int ielem = map(itype);
+     const int jnum = d_numneigh(i);
+-    for (int jj = 0; jj < jnum; jj++) {
++    Kokkos::parallel_scan(Kokkos::TeamThreadRange(team, jnum), [&] (const int jj, int &upd, const bool final) {
+       int j = d_neighbors(i,jj);
+       j &= NEIGHMASK;
+       const double delx = x(j,0) - xtmp;
+       const double dely = x(j,1) - ytmp;
+       const double delz = x(j,2) - ztmp;
+       const double rsq = delx*delx + dely*dely + delz*delz;
+-      int jtype = type(j);
+-      const int jelem = map(jtype);
++      const int jtype = type(j);
+       if (rsq < d_cutsq(itype,jtype)) {
+-        d_jatoms(ij) = j;
+-        d_pair_i(ij) = i;
+-        d_jelems(ij) = jelem;
+-        d_rij(ij, 0) = delx;
+-        d_rij(ij, 1) = dely;
+-        d_rij(ij, 2) = delz;
+-        ij++;
++        if (final) {
++          const int ij = ij0 + upd;
++          d_jatoms(ij) = j;
++          d_pair_i(ij) = i;
++          d_jelems(ij) = map(jtype);
++          d_rij(ij, 0) = delx;
++          d_rij(ij, 1) = dely;
++          d_rij(ij, 2) = delz;
++        }
++        upd++;
+       }
+-    }
+-    d_iatoms[ii] = i;
+-    d_ielems[ii] = ielem;
++    });
++    Kokkos::single(Kokkos::PerTeam(team), [&] () {
++      d_iatoms[ii] = i;
++      d_ielems[ii] = ielem;
++    });
+   });
+ 
+   Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType>(0,nmax), KOKKOS_LAMBDA (int i)  {
+@@ -225,27 +233,33 @@
+   auto d_cutsq=k_pairmliap->k_cutsq.template view<DeviceType>();
+   auto h_cutsq=k_pairmliap->k_cutsq.template view<LMPHostType>();
+   auto d_numneighs = k_numneighs.template view<DeviceType>();
+-  Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType>(0,natomneigh), KOKKOS_LAMBDA (int ii, int &contrib) {
++  // mliap-accel: neighdata count — one team per atom, threads over its neighbours (the one-thread-per-atom loop over
++  // ~1000 neighbours of a long-cutoff list took ~10 ms/step on 5568 atoms)
++  typedef Kokkos::TeamPolicy<DeviceType> NDTeamPolicy;
++  typedef typename NDTeamPolicy::member_type NDTeam;
++  Kokkos::parallel_reduce(NDTeamPolicy(natomneigh, Kokkos::AUTO), KOKKOS_LAMBDA (const NDTeam &team, int &contrib) {
++    const int ii = team.league_rank();
+     const int i = d_ilist[ii];
+-    int count=0;
+     const double xtmp = x(i, 0);
+     const double ytmp = x(i, 1);
+     const double ztmp = x(i, 2);
+     const int itype = type(i);
+     const int jnum = d_numneigh(i);
+-    for (int jj = 0; jj < jnum; jj++) {
++    int count = 0;
++    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(team, jnum), [&] (const int jj, int &c) {
+       int j = d_neighbors(i,jj);
+       j &= NEIGHMASK;
+       const double delx = x(j,0) - xtmp;
+       const double dely = x(j,1) - ytmp;
+       const double delz = x(j,2) - ztmp;
+       const double rsq = delx*delx + dely*dely + delz*delz;
+-      int jtype = type(j);
+-      if (rsq < d_cutsq(itype,jtype))
+-        count++;
+-    }
+-    d_numneighs(ii) = count;
+-    contrib += count;
++      const int jtype = type(j);
++      if (rsq < d_cutsq(itype,jtype)) c++;
++    }, count);
++    Kokkos::single(Kokkos::PerTeam(team), [&] () {
++      d_numneighs(ii) = count;
++      contrib += count;
++    });
+   }, npairs);
+   modified(execution_space, NUMNEIGHS_MASK);
+ 

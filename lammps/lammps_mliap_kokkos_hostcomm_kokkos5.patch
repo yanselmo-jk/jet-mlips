@@ -1,0 +1,137 @@
+diff --git a/src/KOKKOS/comm_kokkos.cpp b/src/KOKKOS/comm_kokkos.cpp
+index d78f47a..8d17b2c 100644
+--- a/src/KOKKOS/comm_kokkos.cpp
++++ b/src/KOKKOS/comm_kokkos.cpp
+@@ -742,6 +742,14 @@ void CommKokkos::forward_comm(Pair *pair, int size)
+   if (pair->execution_space == Host || pair->execution_space == HostKK ||
+       forward_pair_comm_legacy || !pairKKBase) {
+     k_sendlist.sync_host();
++    // pair may set comm_forward/comm_reverse after Comm::init() (e.g. ML-IAP per-layer feature vectors):
++    // grow the host buffers to nsize doubles per atom before the classic CommBrick path uses them.
++    int nsize = size ? size : pair->comm_forward;
++    int nmax = 0;
++    for (int iswap = 0; iswap < nswap; iswap++)
++      nmax = MAX(nmax, nsize*MAX(sendnum[iswap], recvnum[iswap]));
++    if (nmax > maxsend) grow_send(nmax, 0);
++    if (nmax > maxrecv) grow_recv(nmax);
+     CommBrick::forward_comm(pair, size);
+   } else {
+     k_sendlist.sync_device();
+@@ -883,6 +891,14 @@ void CommKokkos::reverse_comm(Pair *pair, int size)
+ {
+   if (pair->execution_space == Host || pair->execution_space == HostKK || !pair->reverse_comm_device || reverse_pair_comm_legacy) {
+     k_sendlist.sync_host();
++    // pair may set comm_forward/comm_reverse after Comm::init() (e.g. ML-IAP per-layer feature vectors):
++    // grow the host buffers to nsize doubles per atom before the classic CommBrick path uses them.
++    int nsize = size ? size : MAX(pair->comm_reverse, pair->comm_reverse_off);
++    int nmax = 0;
++    for (int iswap = 0; iswap < nswap; iswap++)
++      nmax = MAX(nmax, nsize*MAX(sendnum[iswap], recvnum[iswap]));
++    if (nmax > maxsend) grow_send(nmax, 0);
++    if (nmax > maxrecv) grow_recv(nmax);
+     CommBrick::reverse_comm(pair, size);
+   } else {
+     k_sendlist.sync_device();
+diff --git a/src/KOKKOS/pair_mliap_kokkos.cpp b/src/KOKKOS/pair_mliap_kokkos.cpp
+index cf8dc7d..05f6c5a 100644
+--- a/src/KOKKOS/pair_mliap_kokkos.cpp
++++ b/src/KOKKOS/pair_mliap_kokkos.cpp
+@@ -443,7 +443,7 @@ int PairMLIAPKokkos<DeviceType>::pack_forward_comm(int nv, int* idx_v, double *f
+ {
+   static bool first=true;
+   if (first) {
+-    error->warning(FLERR,"PackForwardComm has only been tested on Kokkos devices");
++    error->warning(FLERR,"PackForwardComm host path: staging through device (non-GPU-aware MPI)");
+     first=false;
+   }
+   switch( comm_type ) {
+@@ -461,15 +461,18 @@ int PairMLIAPKokkos<DeviceType>::pack_forward_comm(int nv, int* idx_v, double *f
+ template<class DeviceType>
+ template <typename CommType>
+ int PairMLIAPKokkos<DeviceType>::pack_forward_comm(int nv, int* idx_v, double *fill,
+-                                                   int /*int2*/, int */*intp*/, CommType *copy_to)
++                                                   int int2, int *intp, CommType *copy_to)
+ {
+-  for (int i=0;i<nv;++i) {
+-    int gstart=idx_v[i]*vec_len;
+-    int start=i*vec_len;
+-    for (int j=0;j<vec_len;++j)
+-      fill[start++] = static_cast<double>(copy_to[gstart++]);
+-  }
+-  return nv*vec_len;
++  // host (non-GPU-aware MPI) fallback: copy_to lives on the device, so stage
++  // idx/fill through DualViews and run the Kokkos pack, then bring fill back.
++  DAT::tdual_int_1d k_idx("mliap:idx", nv);
++  DAT::tdual_double_1d k_fill("mliap:fill", nv*vec_len);
++  for (int i=0;i<nv;++i) k_idx.view_host()(i)=idx_v[i];
++  k_idx.modify_host(); k_idx.sync_device();
++  int n = pack_forward_comm_kokkos(nv,k_idx,k_fill,int2,intp,copy_to);
++  k_fill.modify_device(); k_fill.sync_host();
++  for (int i=0;i<n;++i) fill[i]=k_fill.view_host()(i);
++  return n;
+ }
+ /* ---------------------------------------------------------------------- */
+ 
+@@ -525,13 +528,12 @@ template <class DeviceType>
+ template <typename CommType>
+ void PairMLIAPKokkos<DeviceType>::unpack_forward_comm(
+     int nv, int first_up, double *fill, CommType *copy_to) {
+-  for (int i=0; i<nv; ++i) {
+-    int gstart=(first_up+i)*vec_len;
+-    int start=i*vec_len;
+-    for (int j=0;j<vec_len;++j) {
+-      copy_to[gstart+j] = static_cast<CommType>(fill[start+j]);
+-    }
+-  }
++  // host fallback: stage fill to the device and run the Kokkos unpack
++  DAT::tdual_double_1d k_fill("mliap:fill", nv*vec_len);
++  for (int i=0;i<nv*vec_len;++i) k_fill.view_host()(i)=fill[i];
++  k_fill.modify_host(); k_fill.sync_device();
++  unpack_forward_comm_kokkos(nv,first_up,k_fill,copy_to);
++  Kokkos::fence();
+ }
+ /* ---------------------------------------------------------------------- */
+ 
+@@ -590,14 +592,12 @@ template<class DeviceType>
+ template<typename CommType>
+ int PairMLIAPKokkos<DeviceType>::pack_reverse_comm(int nv, int first_up, double *fill, CommType *copy_to)
+ {
+-  for (int i=0;i<nv;++i) {
+-    int gstart=(first_up+i)*vec_len;
+-    int start=i*vec_len;
+-    for (int j=0;j<vec_len;++j) {
+-      fill[start++] = static_cast<double>(copy_to[gstart++]);
+-    }
+-  }
+-  return nv*vec_len;
++  // host fallback: run the Kokkos pack into a DualView, then bring fill back
++  DAT::tdual_double_1d k_fill("mliap:fill", nv*vec_len);
++  int n = pack_reverse_comm_kokkos(nv,first_up,k_fill,copy_to);
++  k_fill.modify_device(); k_fill.sync_host();
++  for (int i=0;i<n;++i) fill[i]=k_fill.view_host()(i);
++  return n;
+ }
+ 
+ /* ---------------------------------------------------------------------- */
+@@ -659,12 +659,15 @@ template<class DeviceType>
+ template<typename CommType>
+ void PairMLIAPKokkos<DeviceType>::unpack_reverse_comm(int nv, int *idx, double *fill, CommType *copy_to)
+ {
+-  for (int i=0;i<nv;++i) {
+-    int gstart=idx[i]*vec_len;
+-    int start=i*vec_len;
+-    for (int j=0;j<vec_len;++j)
+-      copy_to[gstart++] += static_cast<CommType>(fill[start++]);
+-  }
++  // host fallback: stage idx/fill to the device and run the Kokkos unpack
++  DAT::tdual_int_1d k_idx("mliap:idx", nv);
++  DAT::tdual_double_1d k_fill("mliap:fill", nv*vec_len);
++  for (int i=0;i<nv;++i) k_idx.view_host()(i)=idx[i];
++  for (int i=0;i<nv*vec_len;++i) k_fill.view_host()(i)=fill[i];
++  k_idx.modify_host(); k_idx.sync_device();
++  k_fill.modify_host(); k_fill.sync_device();
++  unpack_reverse_comm_kokkos(nv,k_idx,k_fill,copy_to);
++  Kokkos::fence();
+ }
+ namespace LAMMPS_NS {
+ template class PairMLIAPKokkos<LMPDeviceType>;

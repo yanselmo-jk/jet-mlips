@@ -1,0 +1,2 @@
+mace-torch 0.3.16 (upstream tag v0.3.16) -> mace-torch-0.3.16.patch
+sevenn 0.13.0: sevenn-jet*.patch (bases 8d9905c / 3a7552c), applied by python -m jet_mlip.patch_sevenn
