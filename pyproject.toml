@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jet-mlips"
-version = "0.4.3"
+version = "0.4.4"
 description = "JET fused convolution kernels (jet_mlip) and LAMMPS integration for SevenNet, MACE, NequIP, Nequix and EquFlash"
 requires-python = ">=3.11"
 license = {text = "CC-BY-NC-SA-4.0 (LAMMPS-derived files: GPL-2.0)"}

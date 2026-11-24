@@ -114,6 +114,36 @@ calc = UCalculator(checkpoint_path='equflash_oam_30M.pt', cpu=False)
 convert.patch_model(getattr(calc.trainer.model, 'module', calc.trainer.model))
 ```
 
+**D3 dispersion** (any family): `jet/d3`, the same GPU kernel as the LAMMPS pair style, added on top of any of the
+calculators above. Build once per env:
+
+```bash
+JET_CUDA_ARCH=90 pip install -e jet_d3/ase --no-build-isolation
+```
+
+Example, MACE + D3(BJ, PBE):
+
+```python
+from ase.build import bulk
+from ase.calculators.mixing import SumCalculator
+from mace.calculators import mace_mp
+from jet_mace import convert
+from jet_d3_ase import JetD3Calculator
+
+mace = mace_mp(model='medium', device='cuda', default_dtype='float32')
+mace.models[0] = convert.patch_model(mace.models[0], cueq=True)
+calc = SumCalculator([mace, JetD3Calculator(xc='pbe')])   # model + D3; damping='bj' (default) or 'zero'
+
+atoms = bulk('Si', 'diamond', a=5.43, cubic=True).repeat((2, 2, 2))
+atoms.calc = calc
+print(atoms.get_potential_energy(), atoms.get_forces().shape, atoms.get_stress())
+```
+
+The same `SumCalculator([calc, JetD3Calculator(...)])` works with the SevenNet, NequIP, Nequix and EquFlash
+calculators. `xc` is the functional of the model's training data (e.g. `'pbe'`, `'r2scan'`).
+`params={'s6': ..., 's8': ..., 'a1': ..., 'a2': ...}` sets custom BJ parameters instead of `xc`; `cutoff` / `cn_cutoff`
+in Å (defaults: those of `jet/d3 9000 1600`). Energy, forces and stress (stress for fully periodic cells); one GPU.
+
 ### LAMMPS
 
 **1. Build LAMMPS** in the env of sections 1-2 (it adds the ML-IAP patches that every family runs on):
@@ -260,5 +290,5 @@ If you use JET-MLIPs, please cite: [arXiv:XXXX.XXXXX](https://arxiv.org/abs/XXXX
 
 ## License
 
-CC BY-NC-SA 4.0 (`LICENSE`): non-commercial use; commercial use needs written permission. Files derived from LAMMPS (`lammps/*.patch`, `jet_d3/`, the SevenNet pair styles) are GPL-2.0.
+CC BY-NC-SA 4.0 (`LICENSE`): non-commercial use; commercial use needs written permission. Files derived from LAMMPS (`lammps/*.patch`, `jet_d3/` with `jet_d3/ase/`, the SevenNet pair styles) are GPL-2.0.
 GGNN (EquFlash) is CC BY-NC-SA 4.0: it is loaded, not copied. Model weights are not redistributed.

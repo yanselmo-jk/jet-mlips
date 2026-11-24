@@ -21,7 +21,7 @@ Third-party code (its own terms apply to these parts)
 - Files derived from LAMMPS (https://www.lammps.org) remain under the GNU General
   Public License version 2, including the changes made here, and the
   CC BY-NC-SA 4.0 terms do not apply to them: lammps/*.patch (ML-IAP Kokkos),
-  jet_d3/ (pair_jet_d3.{h,cu}, pair_jet_d3_pars.h), and the LAMMPS pair styles
+  jet_d3/ (pair_jet_d3.{h,cu}, pair_jet_d3_pars.h, and the ASE module jet_d3/ase/), and the LAMMPS pair styles
   that patches/sevenn-jet*.patch changes (pair_e3gnn*.{h,cpp}).
 - Used but not included: NequIP (MIT), Nequix (MIT), cuEquivariance (Apache-2.0),
   OpenEquivariance (BSD-3-Clause), EquFlash / GGNN (CC BY-NC-SA 4.0). Model
