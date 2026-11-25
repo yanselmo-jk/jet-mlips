@@ -20,7 +20,7 @@ d3 = os.path.dirname(here)   # jet_d3/: pair_jet_d3.{h,cu}, pair_jet_d3_pars.h
 
 setup(
     name='jet_d3_ase',
-    version='0.4.4',
+    version='0.4.5',
     description='JET-MLIPs GPU D3 (jet/d3) for ASE',
     license='GPL-2.0',
     packages=['jet_d3_ase'],

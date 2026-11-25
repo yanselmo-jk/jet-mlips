@@ -64,6 +64,14 @@ def edge_build(x, cand_ptr, cand_j, center, owner, cutoff_sq: float, rowptr, nbr
     torch.ops.jet_mlip.edge_build(x, cand_ptr, cand_j, center, owner, cutoff_sq, rowptr, nbr, ctr, vec, total)
 
 
+def cand_build(x, ncenters: int, cut_sq: float):
+    """pair_e3gnn's neighbor (candidate) list on the GPU (one rank; replaces LAMMPS' CPU full list).
+    x (nall, 3) f64, rows [0, ncenters) the centers (LAMMPS local atoms), the rest ghosts. Returns cand_ptr
+    (ncenters+1) int32 and cand_j int32: per center ii the rows j != ii with |x[j]-x[ii]|^2 < cut_sq (cell
+    list, deterministic order), edge_build's candidate input. Allocates and syncs: call per rebuild only."""
+    return torch.ops.jet_mlip.cand_build(x, ncenters, cut_sq)
+
+
 DEFAULT_RADIAL_TABLE = 2048   # requested grid points (rounded down by table_points); at the fp32 floor for 7net-nano / 0 / omni
 
 

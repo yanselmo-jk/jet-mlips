@@ -3029,8 +3029,10 @@ index 7fd1010..0000000
 -} // namespace LAMMPS_NS
 -
 -#endif
+sec_new.patch
+sevenn
 diff --git a/sevenn/pair_e3gnn/pair_e3gnn.cpp b/sevenn/pair_e3gnn/pair_e3gnn.cpp
-index 587f427..cfed125 100644
+index 587f427..06c5635 100644
 --- a/sevenn/pair_e3gnn/pair_e3gnn.cpp
 +++ b/sevenn/pair_e3gnn/pair_e3gnn.cpp
 @@ -16,14 +16,27 @@
@@ -3126,7 +3128,7 @@ index 587f427..cfed125 100644
    // compute
    /*
       This compute function is ispired/modified from stress branch of pair-nequip
-@@ -81,172 +133,447 @@ void PairE3GNN::compute(int eflag, int vflag) {
+@@ -81,172 +133,469 @@ void PairE3GNN::compute(int eflag, int vflag) {
      ev_setup(eflag, vflag);
    else
      evflag = vflag_fdotr = 0;
@@ -3146,9 +3148,16 @@ index 587f427..cfed125 100644
    double **f = atom->f;
    int *type = atom->type;
 -  int nlocal = list->inum; // same as nlocal, Why? is it different from atom->nlocal?
-   int *ilist = list->ilist;
+-  int *ilist = list->ilist;
 -  int inum = list->inum;
-+  const int nloc = list->inum; // local atoms = rows [0, nloc); same as atom->nlocal
++  // gpu_nlist: no LAMMPS list; graph row ii = local atom ii
++  if (gpu_nlist && (int)ident.size() < atom->nlocal) {
++    const int n0 = ident.size();
++    ident.resize(atom->nlocal);
++    for (int k = n0; k < atom->nlocal; k++) ident[k] = k;
++  }
++  int *ilist = gpu_nlist ? ident.data() : list->ilist;
++  const int nloc = gpu_nlist ? atom->nlocal : list->inum; // local atoms = rows [0, nloc)
 +  const int nall = atom->nlocal + atom->nghost;
 +  // graph rows: one per tag (halo: hop-ordered groups with padding rows between them, see
 +  // build_halo_nodes()), [0, ncenters) carry the edges (n_1); on one rank both are the local atoms
@@ -3161,12 +3170,14 @@ index 587f427..cfed125 100644
  
 -  std::unordered_map<tagint, int> tag_map;
 -  std::vector<int> graph_index_to_i(nlocal);
--
++  int *numneigh = gpu_nlist ? nullptr : list->numneigh;      // j loop cond
++  int **firstneigh = gpu_nlist ? nullptr : list->firstneigh; // j list
+ 
 -  long num_atoms[1] = {nlocal};
 -
-   int *numneigh = list->numneigh;      // j loop cond
-   int **firstneigh = list->firstneigh; // j list
- 
+-  int *numneigh = list->numneigh;      // j loop cond
+-  int **firstneigh = list->firstneigh; // j list
+-
 -  int bound;
 -  if (this->nedges_bound == -1) {
 -    bound = std::accumulate(numneigh, numneigh + nlocal, 0);
@@ -3196,9 +3207,9 @@ index 587f427..cfed125 100644
 +    tag_to_graph.assign(atom->natoms + 1, -1);
    }
 -  const int nedges_upper_bound = bound;
--
--  std::vector<long> node_type;
  
+-  std::vector<long> node_type;
+-
 -  float edge_vec[nedges_upper_bound][3];
 -  long edge_idx_src[nedges_upper_bound];
 -  long edge_idx_dst[nedges_upper_bound];
@@ -3330,8 +3341,9 @@ index 587f427..cfed125 100644
 +      // candidates = the full list masked with NEIGHMASK, in center order; center = node_to_i;
 +      // owner[j] = graph row of the node with tag[j] (-1: not a node)
 +      long ncand = 0;
-+      for (int ii = 0; ii < ncenters; ii++)
-+        if (node_i[ii] >= 0) ncand += numneigh[node_i[ii]];
++      if (!gpu_nlist)
++        for (int ii = 0; ii < ncenters; ii++)
++          if (node_i[ii] >= 0) ncand += numneigh[node_i[ii]];
 +      grow(host_x, nall, 3, torch::TensorOptions().dtype(torch::kDouble).merge_in(pin));
 +      grow(host_owner, nall, 0, i32.merge_in(pin));
 +      grow(host_center, ncenters, 0, i32.merge_in(pin));
@@ -3341,7 +3353,7 @@ index 587f427..cfed125 100644
 +      realloc |= grow(in_owner, nall, 0, i32.device(device));
 +      realloc |= grow(in_center, ncenters, 0, i32.device(device));
 +      realloc |= grow(in_cand_ptr, ncenters + 1, 0, i32.device(device));
-+      realloc |= grow(in_cand_j, ncand, 0, i32.device(device));
++      if (!gpu_nlist) realloc |= grow(in_cand_j, ncand, 0, i32.device(device));
 +      int *owner = host_owner.data_ptr<int>();
 +      for (int j = 0; j < nall; j++) owner[j] = tag_lookup(tag[j]);
 +      int *center = host_center.data_ptr<int>();
@@ -3351,7 +3363,7 @@ index 587f427..cfed125 100644
 +      cptr[0] = 0;
 +      for (int ii = 0; ii < ncenters; ii++) {
 +        const int i = node_i[ii];
-+        if (i >= 0) {
++        if (i >= 0 && !gpu_nlist) {
 +          const int *jlist = firstneigh[i];
 +          for (int jj = 0; jj < numneigh[i]; jj++) cj[k++] = jlist[jj] & NEIGHMASK;
          }
@@ -3379,13 +3391,28 @@ index 587f427..cfed125 100644
 -      torch::stack({edge_idx_src_tensor, edge_idx_dst_tensor});
 +      in_owner.narrow(0, 0, nall).copy_(host_owner.narrow(0, 0, nall), true);
 +      in_center.narrow(0, 0, ncenters).copy_(host_center.narrow(0, 0, ncenters), true);
-+      in_cand_ptr.narrow(0, 0, ncenters + 1).copy_(host_cand_ptr.narrow(0, 0, ncenters + 1), true);
-+      in_cand_j.narrow(0, 0, ncand).copy_(host_cand_j.narrow(0, 0, ncand), true);
-+      gpu_ncalls = neighbor->ncalls;
-+      trebuilds++;
++      if (!gpu_nlist) {
++        in_cand_ptr.narrow(0, 0, ncenters + 1).copy_(host_cand_ptr.narrow(0, 0, ncenters + 1), true);
++        in_cand_j.narrow(0, 0, ncand).copy_(host_cand_j.narrow(0, 0, ncand), true);
++      }
 +    }
 +    std::memcpy(host_x.data_ptr<double>(), &x[0][0], sizeof(double) * 3 * nall);
 +    in_x.narrow(0, 0, nall).copy_(host_x.narrow(0, 0, nall), true);
++    if (neighbor->ncalls != gpu_ncalls) {
++      if (gpu_nlist) {
++        // candidates within cutoff + skin (LAMMPS' list range) from the x just uploaded; same stream, so
++        // they are in place before the graph's edge_build reads them
++        const double rc = cutoff + neighbor->skin;
++        torch::jit::Stack args{in_x.narrow(0, 0, nall), (int64_t)ncenters, rc * rc};
++        cand_build_op->callBoxed(args);
++        const torch::Tensor cptr_d = args[0].toTensor(), cj_d = args[1].toTensor();
++        realloc |= grow(in_cand_j, cj_d.numel(), 0, i32.device(device));
++        in_cand_ptr.narrow(0, 0, ncenters + 1).copy_(cptr_d);
++        in_cand_j.narrow(0, 0, cj_d.numel()).copy_(cj_d);
++      }
++      gpu_ncalls = neighbor->ncalls;
++      trebuilds++;
++    }
 +  } else if (comm->nthreads > 1) {
 +    // OpenMP graph build: count edges per i, prefix sum, fill in parallel
 +    const int nthreads = comm->nthreads;
@@ -3702,7 +3729,7 @@ index 587f427..cfed125 100644
      virial[0] += virial_stress[0];
      virial[1] += virial_stress[1];
      virial[2] += virial_stress[2];
-@@ -255,9 +582,13 @@ void PairE3GNN::compute(int eflag, int vflag) {
+@@ -255,9 +604,13 @@ void PairE3GNN::compute(int eflag, int vflag) {
      virial[5] += virial_stress[4];
  
      if (vflag_atom) {
@@ -3718,7 +3745,7 @@ index 587f427..cfed125 100644
          const int i = graph_index_to_i[gi];
          vatom[i][0] += -per_atom_stress[gi][0];
          vatom[i][1] += -per_atom_stress[gi][1];
-@@ -271,21 +602,153 @@ void PairE3GNN::compute(int eflag, int vflag) {
+@@ -271,23 +624,155 @@ void PairE3GNN::compute(int eflag, int vflag) {
  
    if (eflag_atom) {
      torch::Tensor atomic_energy_tensor =
@@ -3745,7 +3772,13 @@ index 587f427..cfed125 100644
 +    }
 +  }
 +}
-+
+ 
+-  // if it was the first MD step
+-  if (this->nedges_bound == -1) {
+-    this->nedges_bound = nedges * 1.2;
+-  } // else if the nedges is too small, increase the bound
+-  else if (nedges > this->nedges_bound / 1.2) {
+-    this->nedges_bound = nedges * 1.2;
 +// halo mode: freeze the graph rows for the coming neighbor-list interval (until the next
 +// rebuild). Shells are the BFS hop count from the local atoms over the full neighbor list as
 +// built (pairs within cutoff+skin): local atoms hop 0, then hop 1..num_conv. One node per tag,
@@ -3835,13 +3868,7 @@ index 587f427..cfed125 100644
 +      halo_pad[k] = std::max(nb(nreal[k]), halo_pad[k + 1] + (long)group[num_conv - k].size());
 +    halo_pad[0] = halo_pad[1] + nb((long)group[num_conv].size());
 +  }
- 
--  // if it was the first MD step
--  if (this->nedges_bound == -1) {
--    this->nedges_bound = nedges * 1.2;
--  } // else if the nedges is too small, increase the bound
--  else if (nedges > this->nedges_bound / 1.2) {
--    this->nedges_bound = nedges * 1.2;
++
 +  // row assignment: hop 0 at [0, nloc), hop h at [P_{L-h+1}, ...); the gaps are padding rows
 +  tag_to_graph.assign(natoms + 1, -1);
 +  node_to_i.assign((size_t)halo_pad[0], -1);
@@ -3849,7 +3876,7 @@ index 587f427..cfed125 100644
 +  for (int a : group[0]) {
 +    node_to_i[row] = a;
 +    tag_to_graph[tag[a]] = row++;
-   }
++  }
 +  for (int h = 1; h <= num_conv; h++) {
 +    row = (int)halo_pad[num_conv - h + 1];
 +    for (int a : group[h]) {
@@ -3863,9 +3890,9 @@ index 587f427..cfed125 100644
 +    std::string ns;
 +    for (int k = 0; k <= num_conv; k++) ns += " " + std::to_string(nreal[k]);
 +    utils::logmesg(lmp, "PairE3GNN: rank {} hop shells n_0..n_{}:{}\n", comm->me, num_conv, ns);
-+  }
-+}
-+
+   }
+ }
+ 
 +void PairE3GNN::finish() {
 +  if (!timing || tsteps == 0) return;
 +  double m[6];
@@ -3878,10 +3905,12 @@ index 587f427..cfed125 100644
 +    utils::logmesg(lmp, "PairE3GNN GPU edges: {} neighbor-list uploads, {} edge-capacity regrows\n", trebuilds, tregrows);
 +  for (double &t : tsum) t = 0;
 +  tsteps = tcaptures = trebuilds = tregrows = 0;
- }
- 
++}
++
  // allocate arrays (called from coeff)
-@@ -295,6 +758,7 @@ void PairE3GNN::allocate() {
+ void PairE3GNN::allocate() {
+   allocated = 1;
+@@ -295,6 +780,7 @@ void PairE3GNN::allocate() {
  
    memory->create(setflag, n + 1, n + 1, "pair:setflag");
    memory->create(cutsq, n + 1, n + 1, "pair:cutsq");
@@ -3889,7 +3918,7 @@ index 587f427..cfed125 100644
    memory->create(map, n + 1, "pair:map");
  }
  
-@@ -321,12 +785,14 @@ void PairE3GNN::coeff(int narg, char **arg) {
+@@ -321,12 +807,14 @@ void PairE3GNN::coeff(int narg, char **arg) {
    std::unordered_map<std::string, std::string> meta_dict = {
        {"chemical_symbols_to_index", ""},
        {"cutoff", ""},
@@ -3904,7 +3933,7 @@ index 587f427..cfed125 100644
        {"time", ""}};
  
    // model loading from input
-@@ -346,11 +812,30 @@ void PairE3GNN::coeff(int narg, char **arg) {
+@@ -346,11 +834,31 @@ void PairE3GNN::coeff(int narg, char **arg) {
  
    cutoff = std::stod(meta_dict["cutoff"]);
    cutoff_square = cutoff * cutoff;
@@ -3929,13 +3958,14 @@ index 587f427..cfed125 100644
 +  if (device.is_cuda() && meta_dict["jet_csr"] == "yes" && !(edges_flag && std::strcmp(edges_flag, "0") == 0)) {
 +    edge_build_op = c10::Dispatcher::singleton().findOp({"jet_mlip::edge_build", ""});
 +    gpu_edges = edge_build_op.has_value();
++    cand_build_op = c10::Dispatcher::singleton().findOp({"jet_mlip::cand_build", ""});
 +    utils::logmesg(lmp, gpu_edges ? "PairE3GNN: edge list built on the GPU (jet_mlip::edge_build)\n"
 +                                  : "PairE3GNN: jet_mlip::edge_build not registered, edge list built on the host\n");
 +  }
  
    if (meta_dict["model_type"].compare("E3_equivariant_model") != 0) {
      error->all(FLERR, "given model type is not E3_equivariant_model");
-@@ -374,8 +859,9 @@ void PairE3GNN::coeff(int narg, char **arg) {
+@@ -374,8 +882,9 @@ void PairE3GNN::coeff(int narg, char **arg) {
        if (chem_vec[j].compare(arg[i]) == 0) {
          map[i - 2] = j;
          found_flag = true;
@@ -3947,7 +3977,7 @@ index 587f427..cfed125 100644
          break;
        }
      }
-@@ -412,15 +898,60 @@ void PairE3GNN::coeff(int narg, char **arg) {
+@@ -412,15 +921,66 @@ void PairE3GNN::coeff(int narg, char **arg) {
  
  // init specific to this pair
  void PairE3GNN::init_style() {
@@ -3979,9 +4009,16 @@ index 587f427..cfed125 100644
    }
 -  */
  
-   // full neighbor list (this is many-body potential)
+-  // full neighbor list (this is many-body potential)
 -  neighbor->add_request(this, NeighConst::REQ_FULL);
-+  neighbor->add_request(this, halo ? (NeighConst::REQ_FULL | NeighConst::REQ_GHOST) : NeighConst::REQ_FULL);
++  // full neighbor list (this is many-body potential); one rank with GPU edges builds its own candidate
++  // list on the GPU (jet_mlip::cand_build) and requests none, so LAMMPS only reneighbors (ghosts, sort)
++  const char *nlist_flag = std::getenv("SEVENN_GPU_NLIST");
++  gpu_nlist = gpu_edges && !halo && cand_build_op.has_value() && !(nlist_flag && std::strcmp(nlist_flag, "0") == 0);
++  if (gpu_nlist)
++    utils::logmesg(lmp, "PairE3GNN: neighbor list built on the GPU (jet_mlip::cand_build)\n");
++  else
++    neighbor->add_request(this, halo ? (NeighConst::REQ_FULL | NeighConst::REQ_GHOST) : NeighConst::REQ_FULL);
 +
 +  // Neighbor::init() zeroes neighbor->ncalls at every run / minimize, so a matching count cannot tell this run's
 +  // list from the last one (stale candidates, centers and owners after setup's remap / sort): upload on the first
@@ -4003,20 +4040,20 @@ index 587f427..cfed125 100644
 +      d3_prelaunch = reinterpret_cast<void (*)(Pair *)>(d3->extract("d3_prelaunch", dim));
 +    }
 +  }
- }
- 
--double PairE3GNN::init_one(int i, int j) { return cutoff; }
++}
++
 +void *PairE3GNN::extract(const char *str, int &dim) {
 +  dim = 0;
 +  return std::strcmp(str, "sevenn_pair_first") == 0 ? this : nullptr; // hybrid order probe (init_style)
-+}
-+
+ }
+ 
+-double PairE3GNN::init_one(int i, int j) { return cutoff; }
 +double PairE3GNN::init_one(int i, int j) {
 +  cutghost[i][j] = cutghost[j][i] = cutoff; // ghost list search range (halo mode)
 +  return cutoff;
 +}
 diff --git a/sevenn/pair_e3gnn/pair_e3gnn.h b/sevenn/pair_e3gnn/pair_e3gnn.h
-index 038d5ca..55d7440 100644
+index 038d5ca..6883a9c 100644
 --- a/sevenn/pair_e3gnn/pair_e3gnn.h
 +++ b/sevenn/pair_e3gnn/pair_e3gnn.h
 @@ -23,6 +23,16 @@ PairStyle(e3gnn, PairE3GNN)
@@ -4036,7 +4073,7 @@ index 038d5ca..55d7440 100644
  namespace LAMMPS_NS {
  class PairE3GNN : public Pair {
  private:
-@@ -33,12 +43,61 @@ private:
+@@ -33,12 +43,66 @@ private:
    int nelements;
    bool print_info = false;
  
@@ -4080,6 +4117,11 @@ index 038d5ca..55d7440 100644
 +  torch::Tensor host_x, host_cand_ptr, host_cand_j, host_center, host_owner; // pinned
 +  torch::Tensor in_x, in_cand_ptr, in_cand_j, in_center, in_owner;           // uploaded per rebuild
 +  torch::Tensor in_rowptr, in_nbr, in_ctr, in_perm, in_total;                // edge_build outputs (+ identity perm)
++  // one rank: the candidate list itself built on the GPU by jet_mlip::cand_build at every neighbor rebuild,
++  // so no LAMMPS neighbor list is requested (its CPU build was ~1/4 of the step); SEVENN_GPU_NLIST=0 disables
++  bool gpu_nlist = false;
++  std::optional<c10::OperatorHandle> cand_build_op;
++  std::vector<int> ident; // graph row ii -> local atom ii (gpu_nlist: no list->ilist)
 +
 +  // pair_style hybrid/overlay e3gnn d3: D3 launch entry point (see init_style())
 +  Pair *d3_pair = nullptr;
@@ -4099,7 +4141,7 @@ index 038d5ca..55d7440 100644
  
    void settings(int, char **);
    // read Atom type string from input script & related coeff
-@@ -47,6 +106,7 @@ public:
+@@ -47,6 +111,7 @@ public:
  
    void init_style();
    double init_one(int, int);
