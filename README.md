@@ -286,7 +286,7 @@ Then repeat sections 1-2 and deploy the models again.
 
 ## Citation
 
-If you use JET-MLIPs, please cite: [arXiv:XXXX.XXXXX](https://arxiv.org/abs/XXXX.XXXXX)
+If you use JET-MLIPs, please cite: [arXiv:2611.31865](https://arxiv.org/abs/2611.31865)
 
 ## License
 
