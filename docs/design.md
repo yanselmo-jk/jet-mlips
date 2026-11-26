@@ -79,3 +79,19 @@ family's test folder (graph vs eager, vs upstream, files deployed with v0.2.1).
 | v0.2.1 | SevenNet deploy options on one axis: `--radial_table N` (0 or `--no-radial_table` = exact MLP), `--exact_backward split` or `recompute` (exact only; replaces `--jet_memory`, `fastest` removed); pair_e3gnn frees the warm-up cache before the CUDA-graph capture (startup peak 7net-omni 6.1 -> 4.3 GB). Kernels as v0.2.0 |
 | v0.2.0 | own kernel library `jet_mlip` (fiber fold, register-model path groups for the radial-table kernels, lmax 4); SevenNet patch; Nequix and EquFlash v1/V2 (ASE + LAMMPS ML-IAP, multi-GPU); GPU D3 `jet/d3`; MIT license |
 | v0.1.0 | MACE and NequIP on the first JET kernel |
+
+## Debugging and A/B (moved from the README, 2026-11-27)
+
+Deploy options (add them to the `python -m jet_mlip.deploy` line):
+
+- `--no-graph`: the official ML-IAP wrapper instead of the CUDA-graph one (slower; for comparison or debugging).
+- `--no-jet`: deploy the official model unchanged, for A/B comparison. MACE: `--no-jet` is not supported; use the
+official `mace_create_lammps_model <model> --format mliap` instead.
+
+Environment variables, set in front of `lmp` (e.g. `JET_MACE_CUDA_GRAPH=0 lmp ...`):
+
+- `JET_<FAMILY>_CUDA_GRAPH=0`: run without the CUDA graph (`<FAMILY>` = `SEVENN`, `MACE`, `NEQUIP`, `NEQUIX`, `EQUFLASH`).
+- `JET_MACE_COMPILE=0`, `JET_NEQUIP_COMPILE=0`, `JET_NEQUIX_COMPILE=0`: no torch.compile (read when LAMMPS runs).
+- `JET_MLIAP_CHECK=N` (debug): every N-th step and after atoms migrate, compare the step with an eager rerun and check
+LAMMPS' element types; stops the run on a mismatch.
+- `JET_ASE_GPU_NL=0`: the ASE calculators use their package's CPU neighbour list instead of `jet_mlip.neighbors`.

@@ -184,9 +184,6 @@ Deploy options (add them to the `python -m jet_mlip.deploy` line):
 
 - `--radial_table N`: grid points of the tabulated radial weights (default: MACE 4096, others 2048). The defaults keep
 the table's force error well below the official fp32 error (`docs/design.md`). SevenNet: `0` = exact, no table.
-- `--no-graph`: the official ML-IAP wrapper instead of the CUDA-graph one (slower; for comparison or debugging).
-- `--no-jet`: deploy the official model unchanged, for A/B comparison. MACE: `--no-jet` is not supported; use the
-official `mace_create_lammps_model <model> --format mliap` instead.
 - SevenNet: `--modal NAME`, the modal of a multi-fidelity model (e.g. `7net-omni`).
 - MACE: `--head NAME`, which output head of a multi-head model to run (default: the last head. the official models have one).
 
@@ -207,13 +204,6 @@ lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in in.lammps
 
 Example inputs: `lammps/examples/` (`in.mliap_d3`: any deployed file + D3; `in.sevenn_d3`: SevenNet `jet/e3gnn` + D3;
 348-atom LiPF6 EC/EMC box).
-
-Environment variables, set in front of `lmp` (e.g. `JET_MACE_CUDA_GRAPH=0 lmp ...`):
-
-- `JET_<FAMILY>_CUDA_GRAPH=0`: run without the CUDA graph (`<FAMILY>` = `SEVENN`, `MACE`, `NEQUIP`, `NEQUIX`, `EQUFLASH`).
-- `JET_MACE_COMPILE=0`, `JET_NEQUIP_COMPILE=0`, `JET_NEQUIX_COMPILE=0`: no torch.compile (read when LAMMPS runs).
-- `JET_MLIAP_CHECK=N` (debug): every N-th step and after atoms migrate, compare the step with an eager rerun and check
-LAMMPS' element types; stops the run on a mismatch.
 
 **Several GPUs** (one node, one GPU per rank, the same deployed file):
 
