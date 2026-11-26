@@ -1,0 +1,78 @@
+diff --git a/src/KOKKOS/mliap_data_kokkos.cpp b/src/KOKKOS/mliap_data_kokkos.cpp
+index 1307d1a..453d706 100644
+--- a/src/KOKKOS/mliap_data_kokkos.cpp
++++ b/src/KOKKOS/mliap_data_kokkos.cpp
+@@ -23,6 +23,10 @@
+ #include "pair_mliap_kokkos.h"
+ #include "atom_masks.h"
+ #include "kokkos.h"
++#include "neighbor.h"
++
++// jet-mlips: one count for the whole process, so a build count never repeats (not after `clear`, not between pairs)
++static int jet_nbuilds = 0;
+ 
+ /* ---------------------------------------------------------------------- */
+ 
+@@ -88,7 +92,8 @@ void MLIAPDataKokkos<DeviceType>::generate_neighdata(class NeighList *list_in, i
+     Kokkos::deep_copy(d_gradforce, 0.);
+   }
+   auto d_elems = k_elems.template view<DeviceType>();
+-  Kokkos::deep_copy(d_elems, 0.);
++  // jet-mlips: no deep_copy(d_elems, 0) (two fences per step): the loop over nmax below writes every entry
++  if (neighbor->ago == 0) nbuild = ++jet_nbuilds;
+ 
+   // grow arrays if necessary
+ 
+diff --git a/src/KOKKOS/mliap_data_kokkos.h b/src/KOKKOS/mliap_data_kokkos.h
+index 189d5df..67df7a8 100644
+--- a/src/KOKKOS/mliap_data_kokkos.h
++++ b/src/KOKKOS/mliap_data_kokkos.h
+@@ -85,6 +85,8 @@ template <class DeviceType> class MLIAPDataKokkos : public MLIAPData {
+   // Just cached for python interface
+   double *f_device;
+ 
++  int nbuild = 0;    // jet-mlips: neighbour-list builds so far
++
+  protected:
+   class LAMMPS *lmp;
+ };
+@@ -139,7 +141,7 @@ public:
+ #else
+     dev(0)
+ #endif
+-    {  }
++    { nbuild = base.nbuild; }
+   int size_array_rows;
+   int size_array_cols;
+   int natoms;
+@@ -191,6 +193,7 @@ public:
+   class PairMLIAPKokkos<LMPDeviceType> *pairmliap;    // access to pair tally functions
+ 
+   int dev;
++  int nbuild = 0;    // jet-mlips: neighbour-list builds so far (a model keeps what only a build changes)
+ 
+   //forward_exchange writes into ghosts
+   template <typename CommType>
+diff --git a/src/KOKKOS/mliap_unified_couple_kokkos.pyx b/src/KOKKOS/mliap_unified_couple_kokkos.pyx
+index 91dce64..9f9a4b0 100644
+--- a/src/KOKKOS/mliap_unified_couple_kokkos.pyx
++++ b/src/KOKKOS/mliap_unified_couple_kokkos.pyx
+@@ -83,6 +83,7 @@ cdef extern from "mliap_data_kokkos.h" namespace "LAMMPS_NS":
+         int vflag               # indicates if virial is needed
+         void * pairmliap        # pointer to base class
+         int dev
++        int nbuild
+ 
+         void forward_exchange[CommType]  (CommType * copy_from, CommType * copy_to, int vec_len) except +
+         void reverse_exchange[CommType] (CommType * copy_from, CommType * copy_to, int vec_len) except +
+@@ -448,6 +449,10 @@ cdef class MLIAPDataPy:
+     def vflag(self):
+         return self.data.vflag
+ 
++    @property
++    def nbuild(self):
++        return self.data.nbuild
++
+ 
+ # Interface between C and Python compute functions
+ cdef class MLIAPUnifiedInterfaceKokkos:

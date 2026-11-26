@@ -69,3 +69,23 @@ def test_graph_wrapper_matches_eager(name):
         assert torch.allclose(d1.pair_forces, d0.pair_forces, atol=2e-3)
         assert graph.key[:2] == (n, n)   # one rank: no ghost and no padding row
     assert graph.n_captures >= 2 and graph.n_replays >= 1
+    assert hasattr(graph.model.model, '_orig_mod')   # compiled when LAMMPS runs (JET_MACE_COMPILE unset), not at deploy
+
+
+def test_compile_switch_is_read_at_run_time(monkeypatch):
+    """JET_MACE_COMPILE=0 in the LAMMPS run gives the uncompiled model, also from a pickle that holds a model compiled
+    at deploy (up to v0.5.0)."""
+    from mace.calculators.lammps_mliap_mace import LAMMPS_MLIAP_MACE
+    calc, structs = structures('medium')
+    model = convert.patch_model(calc.models[0], radial_table=1024, cueq=True)
+    model.lammps_mliap = True
+    eager, graph = LAMMPS_MLIAP_MACE(model), mliap.LAMMPS_MLIAP_MACE_Graph(model)
+    assert not hasattr(graph.model.model, '_orig_mod')   # deploy does not compile
+    graph.model.model = torch.compile(graph.model.model, dynamic=False)   # as a v0.5.0 pickle
+    monkeypatch.setenv('JET_MACE_COMPILE', '0')
+    n, batch = structs[0]
+    d0, d1 = FakeData(batch, n), FakeData(batch, n)
+    eager.compute_forces(d0)
+    graph.compute_forces(d1)
+    assert not hasattr(graph.model.model, '_orig_mod') and graph.n_captures == 1
+    assert torch.allclose(d1.pair_forces, d0.pair_forces, atol=2e-3)

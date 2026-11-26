@@ -151,7 +151,7 @@ in Å (defaults: those of `jet/d3 9000 1600`). Energy, forces and stress (stress
 ```bash
 conda activate <env>
 bash lammps/build_lammps.sh              # installs `lmp` into this env: pair_style jet/mliap (ML-IAP), jet/d3
-SEVENN=1 bash lammps/build_lammps.sh     # instead: the same plus SevenNet's pair_style e3gnn
+SEVENN=1 bash lammps/build_lammps.sh     # instead: the same plus SevenNet's pair_style jet/e3gnn (= e3gnn)
 ```
 
 `lmp` runs inside this env (activate it first). Build it once in every env you run.
@@ -205,13 +205,13 @@ the style does not exist.
 lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in in.lammps
 ```
 
-Example inputs: `lammps/examples/` (`in.mliap_d3`: any deployed file + D3; `in.sevenn_d3`: SevenNet `e3gnn` + D3;
+Example inputs: `lammps/examples/` (`in.mliap_d3`: any deployed file + D3; `in.sevenn_d3`: SevenNet `jet/e3gnn` + D3;
 348-atom LiPF6 EC/EMC box).
 
 Environment variables, set in front of `lmp` (e.g. `JET_MACE_CUDA_GRAPH=0 lmp ...`):
 
 - `JET_<FAMILY>_CUDA_GRAPH=0`: run without the CUDA graph (`<FAMILY>` = `SEVENN`, `MACE`, `NEQUIP`, `NEQUIX`, `EQUFLASH`).
-- `JET_MACE_COMPILE=0`, `JET_NEQUIP_COMPILE=0`: no torch.compile (also read by deploy).
+- `JET_MACE_COMPILE=0`, `JET_NEQUIP_COMPILE=0`, `JET_NEQUIX_COMPILE=0`: no torch.compile (read when LAMMPS runs).
 - `JET_MLIAP_CHECK=N` (debug): every N-th step and after atoms migrate, compare the step with an eager rerun and check
 LAMMPS' element types; stops the run on a mismatch.
 
@@ -237,14 +237,15 @@ pair_coeff * * jet/d3 Li C H O N F S P B
 
 &lt;functional&gt;: functional name such as `pbe`, or `custom s6 s8 a1 a2` with `damp_bj`.
 
-**SevenNet's own pair style** `e3gnn` (faster than ML-IAP for small cells; needs the `SEVENN=1` LAMMPS build):
+**SevenNet's own pair style** `jet/e3gnn` (= SevenNet's `e3gnn`, which still works; faster than ML-IAP for SevenNet
+models at every size measured; needs the `SEVENN=1` LAMMPS build):
 
 ```bash
 sevenn get_model 7net-0 --enable_jet -o model.pt
 ```
 
 ```
-pair_style e3gnn
+pair_style jet/e3gnn
 pair_coeff * * model.pt Li C H O N F S P B
 ```
 
@@ -290,6 +291,14 @@ Then repeat sections 1-2 and deploy the models again.
 ## Citation
 
 If you use JET-MLIPs, please cite: [arXiv:2611.31865](https://arxiv.org/abs/2611.31865)
+
+## Changes
+
+v0.5.0
+- Skip connections (self-connection, per-element linears) as single CUDA ops.
+- The layers around the convolution optimized.
+- LAMMPS: `pair_style jet/mliap` (= `mliap unified <file> 0`) and `jet/e3gnn` (= SevenNet's `e3gnn`).
+- ASE: the neighbour list is built on the GPU (SevenNet, MACE, NequIP, Nequix).
 
 ## License
 

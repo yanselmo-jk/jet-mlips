@@ -8,6 +8,8 @@
 //   (inference).
 //   species None: one shared (1, P) weight, an e3nn o3.Linear (sevenn IrrepsLinear); bias (dim_out) is added to
 //   the columns the paths write (sevenn's modal one-hot input of a linear folded into a bias).
+//   out_ir_mul: the output in cuEq's ir_mul layout (out[n, oo + m*V + w]; grad out is read in it), for a consumer that takes
+//   ir_mul (MACE symmetric contraction): no layout copy of the output and of its gradient. LAY = 1 / 2 below.
 // CUDA-graph capturable: no sync, allocations depend on N and S only. species must lie in [0, S).
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -94,7 +96,9 @@ __device__ __forceinline__ int divf(int e, float inv) { return (int)(((float)e +
 // (storing the register tile directly hit 32 sectors per warp instruction: 2.9x the time of the transposed GEMMs).
 // Two (A, B) buffers: the next k-step is loaded while this one is multiplied, one __syncthreads per step.
 // PIPE = the kernel of small problems (gemm_kernel<true>), where a block's latency is what counts.
-template <int TR, bool PIPE>
+// LAY: 0 = both sides mul_ir (the code of the other two is compiled out), 1 = output ir_mul, 2 = input ir_mul (grad x);
+// paths with d = 1 are the same in both layouts and take the mul_ir code.
+template <int TR, bool PIPE, int LAY>
 __device__ __forceinline__ void tile(const Args& a, const Path& p, int r0, int x, float* sm, int* seg_s) {
   constexpr int TC = 32 / TR, BM = 16 * TR, BN = 16 * TC, BK = 4 * TR, SA = BM + 4, SB = BN + 4, SC = BM + 4;   // +4: bank spread
   constexpr int NBUF = BK * (SA + SB), EPA = BM * BK / kThreads, EPT = BN * BK / kThreads, TAB = 2 * NBUF, CEND = BN * SC;
@@ -130,8 +134,15 @@ __device__ __forceinline__ void tile(const Args& a, const Path& p, int r0, int x
   // Kept in a shared-memory table, read as float so that the compiler cannot hoist the 8 entries of a thread into
   // registers (the kernel has to fit 64, 4 blocks per SM); PIPE has the registers and no table to wait for.
   const float inv_d = 1.f / d, inv_kd = 1.f / (BK * d);
+  const bool in_irm = LAY == 2 && d > 1, out_irm = LAY == 1 && d > 1;
   auto entry = [&](int i) {
     const int e = tid + kThreads * i, q = divf(e, inv_kd), w = e - q * (BK * d), kk = divf(w, inv_d);
+    if constexpr (LAY == 2) {
+      // ir_mul input: k fastest (its own order: runs of BK floats), offset field = k << 5 | m
+      if (in_irm)
+        return e < nqv * BK * d ? ((w % BK) * SB + q * d + w / BK) << 18 | q << 10 | (w % BK) << 5 | w / BK
+                                : (BK * SB - 1) << 18 | 1023;
+    }
     return e < nqv * BK * d ? (kk * (SB - d) + q * d + w) << 18 | q << 10 | w : (BK * SB - 1) << 18 | 1023;
   };
   if constexpr (!PIPE) {
@@ -155,6 +166,16 @@ __device__ __forceinline__ void tile(const Args& a, const Path& p, int r0, int x
     for (int i = 0; i < EPA; i++)
       va[i] = (ak + i * dk < kmax && r0 + ar + i * dr < p.R) ? Ws[i * (dr * p.rs + dk * p.ks) + k0 * p.ks] : 0.f;
     const float* src = a.in + p.io + k0 * d;
+    if constexpr (LAY == 2) {
+      if (in_irm) {   // in[n, io + m*K + k]
+#pragma unroll
+        for (int i = 0; i < EPT; i++) {
+          const int e = elem(i), w = e & 1023;
+          v[i] = (w >> 5) < min(kmax, BK) ? a.in[(int64_t)node_of((e >> 10) & 255) * a.ldi + p.io + (w & 31) * p.K + k0 + (w >> 5)] : 0.f;
+        }
+        return;
+      }
+    }
 #pragma unroll
     for (int i = 0; i < EPT; i++) {
       const int e = elem(i), w = e & 1023;
@@ -232,6 +253,21 @@ __device__ __forceinline__ void tile(const Args& a, const Path& p, int r0, int x
     else *reinterpret_cast<float2*>(c) = make_float2(acc[0][j], acc[1][j]);
   }
   __syncthreads();
+  if constexpr (LAY == 1) {
+    if (out_irm) {   // out[n, oo + m*R + r]: the node's d runs of `rows` floats, in that order
+      const float inv_rows = 1.f / rows;
+      for (int q = wp; q < nqv; q += 8) {
+        float* dst = a.out + (int64_t)node_of(q) * a.ldo + p.oo + r0;
+        const float* csq = Cs + q * d * SC;
+        for (int w = lane; w < rows * d; w += 32) {
+          const int m = divf(w, inv_rows), r = w - m * rows;
+          const float f = csq[m * SC + r];
+          dst[m * p.R + r] = a.bias ? f + a.bias[p.oo + r0 + m * p.R + r] : f;
+        }
+      }
+      return;
+    }
+  }
   for (int q = wp; q < nqv; q += 8) {   // warp = one node, its rows * d floats (r, m) 32 at a time
     float* dst = a.out + (int64_t)node_of(q) * a.ldo + col;
     const float* csq = Cs + q * d * SC;
@@ -244,7 +280,7 @@ __device__ __forceinline__ void tile(const Args& a, const Path& p, int r0, int x
 }
 
 // SMALL: 64-row tiles only, PIPE (few blocks: the kernel takes as long as one block). Else 4 blocks per SM.
-template <bool SMALL>
+template <bool SMALL, int LAY>
 __global__ void __launch_bounds__(kThreads, SMALL ? 2 : 4) gemm_kernel(Args a, Paths ps) {
   __shared__ __align__(16) float sm[kSmem];
   __shared__ int seg_s[2];
@@ -253,16 +289,17 @@ __global__ void __launch_bounds__(kThreads, SMALL ? 2 : 4) gemm_kernel(Args a, P
   const Path p = ps.p[pi];
   const int l = blockIdx.x - p.b0;
   if constexpr (SMALL) {
-    tile<4, true>(a, p, (l / p.nx4) * 64, l % p.nx4, sm, seg_s);
+    tile<4, true, LAY>(a, p, (l / p.nx4) * 64, l % p.nx4, sm, seg_s);
   } else {
-    if (l < p.n4) tile<4, false>(a, p, (l / p.nx4) * 64, l % p.nx4, sm, seg_s);
-    else tile<2, false>(a, p, (p.n4 / p.nx4) * 64, l - p.n4, sm, seg_s);
+    if (l < p.n4) tile<4, false, LAY>(a, p, (l / p.nx4) * 64, l % p.nx4, sm, seg_s);
+    else tile<2, false, LAY>(a, p, (p.n4 / p.nx4) * 64, l - p.n4, sm, seg_s);
   }
 }
 
 // paths flat [io, oo, U, V, d]*; transpose = grad x (in = grad out, out = grad x)
 at::Tensor run(const at::Tensor& in, const at::Tensor& perm, const at::Tensor& start, const at::Tensor& W,
-               const std::vector<int64_t>& paths, int64_t dim_out, bool transpose, const at::Tensor& bias = {}) {
+               const std::vector<int64_t>& paths, int64_t dim_out, bool transpose, const at::Tensor& bias = {},
+               bool ir_mul = false) {   // ir_mul: the op's output side (out, or in = grad out when transpose)
   const int np = (int)paths.size() / 5, S = (int)W.size(0);
   const int64_t n = in.size(0);
   Paths ps{};
@@ -308,8 +345,17 @@ at::Tensor run(const at::Tensor& in, const at::Tensor& perm, const at::Tensor& s
                perm.defined() ? perm.data_ptr<int>() : nullptr, bias.defined() ? bias.data_ptr<float>() : nullptr,
                out.data_ptr<float>(), (int)in.size(1), (int)dim_out, (int)W.size(1), S, (int)n};
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (small) gemm_kernel<true><<<(unsigned)nblk, kThreads, 0, stream>>>(a, ps);
-  else gemm_kernel<false><<<(unsigned)nblk, kThreads, 0, stream>>>(a, ps);
+  const unsigned nb = (unsigned)nblk;
+  if (!ir_mul) {   // LAY 0: the kernels every mul_ir caller had before the layout option
+    if (small) gemm_kernel<true, 0><<<nb, kThreads, 0, stream>>>(a, ps);
+    else gemm_kernel<false, 0><<<nb, kThreads, 0, stream>>>(a, ps);
+  } else if (transpose) {
+    if (small) gemm_kernel<true, 2><<<nb, kThreads, 0, stream>>>(a, ps);
+    else gemm_kernel<false, 2><<<nb, kThreads, 0, stream>>>(a, ps);
+  } else {
+    if (small) gemm_kernel<true, 1><<<nb, kThreads, 0, stream>>>(a, ps);
+    else gemm_kernel<false, 1><<<nb, kThreads, 0, stream>>>(a, ps);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -355,24 +401,26 @@ at::Tensor checked_bias(const at::Tensor& x, const std::optional<at::Tensor>& sp
 }
 
 at::Tensor species_linear_cuda(const at::Tensor& x, const std::optional<at::Tensor>& species, const at::Tensor& W,
-                               std::vector<int64_t> paths, int64_t dim_out, const std::optional<at::Tensor>& bias) {
+                               std::vector<int64_t> paths, int64_t dim_out, const std::optional<at::Tensor>& bias,
+                               bool out_ir_mul) {
   const auto b = checked_bias(x, species, W, paths, dim_out, bias);
   auto [perm, start] = bucket(species, W.size(0), x.size(0));
-  return run(x.contiguous(), perm, start, W, paths, dim_out, false, b);
+  return run(x.contiguous(), perm, start, W, paths, dim_out, false, b, out_ir_mul);
 }
 
 struct SpeciesLinearFn : public torch::autograd::Function<SpeciesLinearFn> {
   static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& x,
                             const std::optional<at::Tensor>& species, const at::Tensor& W, std::vector<int64_t> paths,
-                            int64_t dim_out, const std::optional<at::Tensor>& bias) {
+                            int64_t dim_out, const std::optional<at::Tensor>& bias, bool out_ir_mul) {
     const auto b = checked_bias(x, species, W, paths, dim_out, bias);
     at::AutoDispatchBelowADInplaceOrView guard;
     auto [perm, start] = bucket(species, W.size(0), x.size(0));
     ctx->save_for_backward({perm, start, W});
     ctx->saved_data["paths"] = paths;
     ctx->saved_data["din"] = x.size(1);
+    ctx->saved_data["ir_mul"] = out_ir_mul;
     ctx->saved_data["wgrad"] = W.requires_grad() || (b.defined() && b.requires_grad());
-    return run(x.contiguous(), perm, start, W, paths, dim_out, false, b);
+    return run(x.contiguous(), perm, start, W, paths, dim_out, false, b, out_ir_mul);
   }
   static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
                                                  torch::autograd::variable_list gouts) {
@@ -383,22 +431,23 @@ struct SpeciesLinearFn : public torch::autograd::Function<SpeciesLinearFn> {
     if (gouts[0].defined() && ctx->needs_input_grad(0)) {
       at::NoGradGuard no_grad;   // no double backward
       gx = run(gouts[0].contiguous(), s[0], s[1], s[2], ctx->saved_data["paths"].toIntVector(),
-               ctx->saved_data["din"].toInt(), true);
+               ctx->saved_data["din"].toInt(), true, {}, ctx->saved_data["ir_mul"].toBool());
     }
-    return {gx, at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor()};
+    return {gx, at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor()};
   }
 };
 
 at::Tensor species_linear_autograd(const at::Tensor& x, const std::optional<at::Tensor>& species, const at::Tensor& W,
-                                   std::vector<int64_t> paths, int64_t dim_out, const std::optional<at::Tensor>& bias) {
-  return SpeciesLinearFn::apply(x, species, W, paths, dim_out, bias);
+                                   std::vector<int64_t> paths, int64_t dim_out, const std::optional<at::Tensor>& bias,
+                               bool out_ir_mul) {
+  return SpeciesLinearFn::apply(x, species, W, paths, dim_out, bias, out_ir_mul);
 }
 
 }  // namespace
 }  // namespace jet_mlip
 
 TORCH_LIBRARY_FRAGMENT(jet_mlip, m) {
-  m.def("species_linear(Tensor x, Tensor? species, Tensor weight, int[] paths, int dim_out, Tensor? bias=None) -> Tensor");
+  m.def("species_linear(Tensor x, Tensor? species, Tensor weight, int[] paths, int dim_out, Tensor? bias=None, bool out_ir_mul=False) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(jet_mlip, CUDA, m) {
   m.impl("species_linear", &jet_mlip::species_linear_cuda);

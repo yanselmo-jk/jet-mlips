@@ -24,6 +24,8 @@ if [ "${SEVENN:-0}" = 1 ]; then LAMMPS_DIR=${LAMMPS_DIR:-lammps-accel-sevenn}; e
 HERE=$(cd "$(dirname "$0")" && pwd)
 # sevenn's pair_e3gnn needs both packages in the activated env (sevenn-jet is the packed one)
 [ "${SEVENN:-0}" = 1 ] && { python -c 'import sevenn, jet_mlip' || { echo "$ENV_NAME lacks sevenn / jet_mlip (needed for SEVENN=1)"; exit 1; }; }
+# an env with sevenn built without SEVENN=1 gets ML-IAP only: e3gnn is the faster LAMMPS path for SevenNet models
+[ "${SEVENN:-0}" != 1 ] && python -c 'import sevenn' 2> /dev/null && echo "WARNING: sevenn is installed but SEVENN=1 is not set: for SevenNet models pair_style jet/e3gnn (SEVENN=1 build) is faster than ML-IAP at every size measured. Rebuild with SEVENN=1 bash lammps/build_lammps.sh unless you only need ML-IAP."
 export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-$(python -c 'import torch;print("%d.%d" % torch.cuda.get_device_capability() if torch.cuda.is_available() else "8.9")')}
 CUDA_ARCHS=$(echo "$TORCH_CUDA_ARCH_LIST" | tr ' ,' ';;' | tr -d '.')
 ARCH1=${CUDA_ARCHS%%;*}
@@ -62,6 +64,9 @@ grep -q "mliap:fill" src/KOKKOS/pair_mliap_kokkos.cpp || git apply -C1 "$HERE/$H
 grep -q "mliap-accel: neighdata" src/KOKKOS/mliap_data_kokkos.cpp || git apply -C1 "$HERE/lammps_mliap_kokkos_neighdata.patch"
 # ML-IAP global virial by reduction instead of 6 atomics contended by every pair (3.07M pairs, H200: 27 -> 0.32 ms per call)
 grep -q "mliap-accel: virial reduce" src/KOKKOS/mliap_unified_kokkos.cpp || git apply -C1 "$HERE/lammps_mliap_kokkos_virial.patch"
+# ML-IAP data: `nbuild` (neighbour-list builds so far) for the model, which then probes the ghost owners once per build
+# instead of once per pair list, and no zero fill of elems before the loop that writes it (Si 512 atoms, H200: -0.1 ms/step)
+grep -q "jet-mlips: neighbour-list builds" src/KOKKOS/mliap_data_kokkos.h || git apply -C1 "$HERE/lammps_mliap_kokkos_nbuild.patch"
 # `pair_style jet/mliap <model.pt>` (= `mliap unified <model.pt> 0`), KOKKOS only: the JET ML-IAP models need Kokkos device data
 grep -q "PairJetMLIAPKokkos" src/KOKKOS/pair_mliap_kokkos.h || git apply -C1 "$HERE/lammps_mliap_kokkos_jet_style.patch"
 

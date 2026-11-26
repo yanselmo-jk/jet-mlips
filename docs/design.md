@@ -32,7 +32,7 @@ swapped (fused JET convolution with a radial table). Static buckets + CUDA graph
 |---|---|---|
 | (always) | ML-IAP Kokkos: host comm fix, neighbour data, virial reduction (`lammps/*.patch`) | `jet/mliap` (= `mliap unified <file> 0`, KOKKOS only; MACE, NequIP, Nequix, EquFlash, SevenNet ML-IAP) |
 | `D3=1` (default) | `jet_d3/` (GPU D3, also `custom s6 s8 a1 a2` BJ parameters) | `jet/d3` |
-| `SEVENN=1` | `sevenn patch_lammps --jet` (needs sevenn + jet_mlip in the env; own source tree) | `e3gnn`, `e3gnn/parallel` |
+| `SEVENN=1` | `sevenn patch_lammps --jet` (needs sevenn + jet_mlip in the env; own source tree) | `jet/e3gnn`, `jet/e3gnn/parallel` (= `e3gnn`, `e3gnn/parallel`) |
 
 A binary runs the models of its own env: MACE (e3nn 0.4.4) needs its own env and build; SevenNet and NequIP share one
 (`SEVENN=1` build in a NequIP env with sevenn installed). An env with its own CUDA toolkit builds with it (e.g. EquFlash's

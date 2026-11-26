@@ -51,6 +51,18 @@ def model_wide():
     )
 
 
+@pytest.fixture(scope='module')
+def model_wide_parity():
+    """Sliced, with parity: the last block has x irreps no tensor-product path reads (their gradient is zero)."""
+    set_global_state()
+    return NequIPGNNModel(
+        num_layers=3, l_max=2, parity=True, num_features=[160, 64, 32], r_max=4.0,
+        type_names=TYPE_NAMES, avg_num_neighbors=10.0,
+        per_type_energy_shifts={'H': 0.0, 'C': 0.0, 'O': 0.0}, seed=123, model_dtype='float32',
+        type_embed_num_features=32,
+    )
+
+
 PEC = {'H': 2.5, 'C': {'H': 3.0, 'C': 3.5, 'O': 3.2}, 'O': 3.8}   # per_edge_type_cutoff, all < r_max 4.0
 
 
@@ -139,7 +151,7 @@ def test_per_edge_type_needs_no_pruning(model_pec, data, device):
     assert (f1 - f0).abs().max() < 1e-4 * f0.abs().max() + 1e-6
 
 
-@pytest.mark.parametrize('model_name', ['model', 'model_wide', 'model_pec', 'model_wide_pec'])
+@pytest.mark.parametrize('model_name', ['model', 'model_wide', 'model_wide_parity', 'model_pec', 'model_wide_pec'])
 def test_patched_model_matches_upstream(request, data, model_name):
     model = request.getfixturevalue(model_name)
 
@@ -152,7 +164,13 @@ def test_patched_model_matches_upstream(request, data, model_name):
     ref = run(model)
     patched = convert.patch_model(copy.deepcopy(model), radial_table=2048)
     assert all(type(b.tp_scatter).__name__ == 'JetTPScatter' for b in blocks(patched))
+    last = blocks(patched)[-1].tp_scatter
+    assert model_name != 'model_wide_parity' or last.n_x == len(last.cfgs) + 1   # the unread x columns
+    # no block reads the Bessel edge embedding any more: the encoding computes the cutoff only
+    assert type(patched.model.func.bessel_encode).__name__ == '_CutoffOnly'
     out = run(patched)
+    assert out[AtomicDataDict.EDGE_EMBEDDING_KEY].shape[1] == 0 and torch.equal(
+        out[AtomicDataDict.EDGE_CUTOFF_KEY], ref[AtomicDataDict.EDGE_CUTOFF_KEY])
     assert abs(out[AtomicDataDict.TOTAL_ENERGY_KEY].item() - ref[AtomicDataDict.TOTAL_ENERGY_KEY].item()) \
         < 1e-5 * abs(ref[AtomicDataDict.TOTAL_ENERGY_KEY].item())
     f0, f1 = ref[AtomicDataDict.FORCE_KEY], out[AtomicDataDict.FORCE_KEY]
@@ -198,3 +216,37 @@ def test_glue_matches_e3nn(request, model_name):
         assert (out - ref).abs().max() <= 1e-5 * ref.abs().max(), type(m).__name__
         assert (gx - gref).abs().max() <= 1e-5 * gref.abs().max(), type(m).__name__
     assert seen == {'JetLinear', 'JetSelfConnection', 'JetGate'}
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and ops.has_op('species_linear') and ops.has_op('gate')),
+                    reason='no CUDA jet_mlip glue ops')
+def test_local_block_forward(model_pec, data, monkeypatch):
+    """The one-rank graph path's block forward (four jet ops, the atom types handed over) against the block's own
+    forward with the jet glue (model_pec: its conv shapes are compiled into jet_mlip); a block whose own forward the
+    probe does not reproduce keeps it."""
+    model = convert.patch_model(copy.deepcopy(model_pec).cuda(), radial_table=2048)
+    d = AtomicDataDict.to_(dict(data), 'cuda')
+    ref = _run(model, d)
+    assert convert.patch_block_forward(model) == 3
+    calls = []   # the glue modules' own forwards: the local forward calls the ops itself
+    for b in blocks(model):
+        b.linear_1.register_forward_hook(lambda *a: calls.append(1))
+    for types in (d[AtomicDataDict.ATOM_TYPE_KEY].view(-1), None):   # None: no caller vouches for local rows -> upstream forward
+        monkeypatch.setattr(convert, 'TYPES', types)
+        del calls[:]
+        out = _run(model, d)
+        assert bool(calls) == (types is None)
+        e0, e1 = ref[AtomicDataDict.TOTAL_ENERGY_KEY].item(), out[AtomicDataDict.TOTAL_ENERGY_KEY].item()
+        f0, f1 = ref[AtomicDataDict.FORCE_KEY], out[AtomicDataDict.FORCE_KEY]
+        assert abs(e1 - e0) < 1e-5 * abs(e0) and (f1 - f0).abs().max() < 1e-4 * f0.abs().max() + 1e-6
+    monkeypatch.setattr(convert, 'TYPES', None)
+    other = convert.patch_model(copy.deepcopy(model_pec).cuda(), radial_table=2048)
+    cls = type(blocks(other)[0])
+    upstream = cls.forward
+
+    def doubled(self, data):   # a forward contract the local forward does not know
+        data = upstream(self, data)
+        data[AtomicDataDict.NODE_FEATURES_KEY] = 2 * data[AtomicDataDict.NODE_FEATURES_KEY]
+        return data
+    monkeypatch.setattr(cls, 'forward', doubled)
+    assert convert.patch_block_forward(other) == 0 and all(type(b) is cls for b in blocks(other))

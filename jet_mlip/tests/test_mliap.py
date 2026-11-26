@@ -75,7 +75,7 @@ def check(wrapper, d, energy=True):
     e, F = float(d.energy), d.atom_forces()
     if energy:
         assert abs(e - e_ref) <= 1e-10 * abs(e_ref), f'dE {e - e_ref:.3e} eV'
-    torch.testing.assert_close(d.eatoms, e_ref_atoms, rtol=1e-10, atol=1e-12)
+        torch.testing.assert_close(d.eatoms, e_ref_atoms, rtol=1e-10, atol=1e-12)   # LAMMPS reads eatoms with eflag only
     torch.testing.assert_close(F, f_ref, rtol=1e-10, atol=1e-12)
     return e_ref
 
@@ -101,6 +101,32 @@ def test_padding_layout(monkeypatch):
     assert rowptr[-1].item() == npairs
     assert torch.equal(torch.sort(perm[:npairs].long()).values, torch.arange(npairs, device=perm.device))
     assert torch.equal(perm[npairs:].long(), torch.arange(npairs, ecap, device=perm.device))   # padding last
+
+
+@pytest.mark.parametrize('grouped', [True, False])
+def test_masked_csr(monkeypatch, grouped):
+    """build_csr with EDGE_MASK: rows hold exactly their real edges; a list grouped by dst with the padding last (a
+    LAMMPS pair list) keeps its order (perm = arange), any other order is still a valid CSR."""
+    g = torch.Generator().manual_seed(0)
+    n, E, real = 37, 5000, 4321
+    dst = torch.randint(0, n + 3, (E,), generator=g)   # some dst past n_nodes: counted as padding
+    mask = (torch.arange(E) < real).int()
+    if grouped:
+        dst = torch.cat([dst[:real].sort().values, dst[real:]])
+    else:
+        mask = mask[torch.randperm(E, generator=g)]
+    dst, mask = dst.cuda(), mask.cuda()
+    monkeypatch.setattr(ops, 'EDGE_MASK', mask)
+    rowptr, perm = ops.build_csr(dst.int(), n)
+    live = mask.bool() & (dst < n)
+    counts = torch.bincount(dst[live], minlength=n)
+    assert rowptr.dtype == perm.dtype == torch.int32 and rowptr[0] == 0
+    assert torch.equal(rowptr[1:].long(), counts.cumsum(0))
+    assert torch.equal(perm.long().sort().values, torch.arange(E, device='cuda'))
+    k = perm[:rowptr[-1]].long()
+    assert live[k].all() and torch.equal(dst[k], torch.repeat_interleave(torch.arange(n, device='cuda'), counts))
+    if grouped:
+        assert torch.equal(perm.long(), torch.arange(E, device='cuda'))
 
 
 def test_ghost_fold():
@@ -161,8 +187,27 @@ def test_eflag(eflag):
     sentinel = 12345.0
     d.eflag = eflag
     d.energy = sentinel
-    e_ref = check(w, d, energy=bool(eflag))   # check() also verifies eatoms / pair forces
+    e_ref = check(w, d, energy=bool(eflag))   # check() also verifies the pair forces
     if eflag:
         assert abs(float(d.energy) - e_ref) <= 1e-10 * abs(e_ref)
     else:
         assert d.energy == sentinel
+
+
+def test_same_build_skips_probe(monkeypatch):
+    """nbuild (our LAMMPS patch) unchanged: another pair list of the same build goes in without the exchange probe."""
+    w = Toy()
+    d = stub(structures()['LiF rocksalt'])
+    d.nbuild = 7
+    check(w, d)
+    probes = []
+    monkeypatch.setattr(type(d), 'forward_exchange', lambda self, *a: probes.append(1))   # must not be called
+    keep = d.npairs - 5   # pairs left r_cut: a shorter list, same atoms and ghosts
+    d.npairs, d.pair_i, d.pair_j, d.rij = keep, d.pair_i[:keep], d.pair_j[:keep], d.rij[:keep]
+    check(w, d)
+    assert not probes and (w.n_lists, w.n_captures) == (2, 1)
+    monkeypatch.undo()
+    d.nbuild = 8   # rebuilt: probed again
+    d.pair_i, d.pair_j, d.rij = d.pair_i.flip(0), d.pair_j.flip(0), d.rij.flip(0)
+    check(w, d)
+    assert w.n_lists == 3

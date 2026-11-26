@@ -1,16 +1,107 @@
+diff --git a/mace/calculators/mace.py b/mace/calculators/mace.py
+index 8887aa4..24947a0 100644
+--- a/mace/calculators/mace.py
++++ b/mace/calculators/mace.py
+@@ -21,6 +21,7 @@
+ from e3nn import o3
+ 
+ from mace import data as mace_data
++from mace.modules.macetp_hook import macetp_nl_device
+ from mace.modules.utils import extract_invariant
+ from mace.tools import torch_geometric, torch_tools, utils
+ from mace.tools.compile import (
+@@ -538,6 +539,7 @@
+                 z_table=self.z_table,
+                 cutoff=self.r_max,
+                 heads=self.available_heads,
++                device=macetp_nl_device(self),
+             )
+ 
+         real_num_atoms = int(real_graph["node_attrs"].shape[0])
+diff --git a/mace/data/atomic_data.py b/mace/data/atomic_data.py
+index 8d8623d..38d4026 100644
+--- a/mace/data/atomic_data.py
++++ b/mace/data/atomic_data.py
+@@ -171,6 +171,7 @@
+         z_table: AtomicNumberTable,
+         cutoff: float,
+         heads: Optional[list] = None,
++        device=None,  # jet: neighbour list on this CUDA device (get_neighborhood)
+         **kwargs,  # pylint: disable=unused-argument
+     ) -> "AtomicData":
+         if heads is None:
+@@ -180,6 +181,7 @@
+             cutoff=cutoff,
+             pbc=deepcopy(config.pbc),
+             cell=deepcopy(config.cell),
++            device=device,
+         )
+         indices = atomic_numbers_to_indices(config.atomic_numbers, z_table=z_table)
+         one_hot = to_one_hot(
+@@ -397,10 +399,12 @@
+         )
+ 
+         cls_kwargs = dict(
+-            edge_index=torch.tensor(edge_index, dtype=torch.long),
++            edge_index=torch.as_tensor(edge_index, dtype=torch.long),
+             positions=positions,
+-            shifts=torch.tensor(shifts, dtype=torch.get_default_dtype()),
+-            unit_shifts=torch.tensor(unit_shifts, dtype=torch.get_default_dtype()),
++            shifts=torch.as_tensor(shifts, dtype=torch.get_default_dtype()),
++            unit_shifts=torch.as_tensor(
++                unit_shifts, dtype=torch.get_default_dtype()
++            ),
+             cell=cell,
+             node_attrs=one_hot,
+             weight=weight,
+diff --git a/mace/data/neighborhood.py b/mace/data/neighborhood.py
+index 0372896..389d3ae 100644
+--- a/mace/data/neighborhood.py
++++ b/mace/data/neighborhood.py
+@@ -10,6 +10,7 @@
+     pbc: Optional[Tuple[bool, bool, bool]] = None,
+     cell: Optional[np.ndarray] = None,  # [3, 3]
+     true_self_interaction=False,
++    device=None,  # jet: build the list on this CUDA device, tensors out (ASE calculator)
+ ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+     if pbc is None:
+         pbc = (False, False, False)
+@@ -35,6 +36,17 @@
+     if not pbc_z:
+         cell[2, :] = max_positions * 5 * cutoff * identity[2, :]
+ 
++    if device is not None:  # jet_mlip.neighbors: the same pairs (none is a true self-edge)
++        import torch
++        from jet_mlip.neighbors import neighbor_list
++
++        sender, receiver, unit_shifts = neighbor_list(
++            torch.as_tensor(positions, device=device), cell, pbc, cutoff
++        )
++        unit_shifts = unit_shifts.double()
++        shifts = unit_shifts @ torch.as_tensor(cell, device=device)
++        return torch.stack((sender, receiver)), shifts, unit_shifts, cell
++
+     sender, receiver, unit_shifts = neighbour_list(
+         quantities="ijS",
+         pbc=pbc,
 diff --git a/mace/modules/blocks.py b/mace/modules/blocks.py
-index af60244..19c78c7 100644
+index af60244..b5c2437 100644
 --- a/mace/modules/blocks.py
 +++ b/mace/modules/blocks.py
-@@ -13,6 +13,7 @@
+@@ -13,6 +13,12 @@
  from e3nn.util.jit import compile_mode
  
  from mace.modules.gate import GatedEquivariantBlock
-+from mace.modules.macetp_hook import macetp_fused, macetp_lin_done, macetp_tp3
++from mace.modules.macetp_hook import (
++    macetp_fused,
++    macetp_lin_done,
++    macetp_skip_done,
++    macetp_tp3,
++)
  from mace.modules.wrapper_ops import (
      CuEquivarianceConfig,
      FullyConnectedTensorProduct,
-@@ -668,6 +669,7 @@
+@@ -668,6 +674,7 @@
          lammps_natoms: Tuple[int, int] = (0, 0),
          lammps_class: Optional[Any] = None,
          first_layer: bool = False,
@@ -18,7 +109,7 @@ index af60244..19c78c7 100644
      ) -> Tuple[torch.Tensor, None]:
          n_real = lammps_natoms[0] if lammps_class is not None else None
          node_feats = self.linear_up(node_feats)
-@@ -677,12 +679,21 @@
+@@ -677,12 +684,23 @@
              lammps_natoms=lammps_natoms,
              first_layer=first_layer,
          )
@@ -30,9 +121,11 @@ index af60244..19c78c7 100644
 -        if hasattr(self, "conv_fusion"):
 +        message: Optional[torch.Tensor] = None
 +        lin_done = False   # macetp: the fused convolution may apply self.linear too
++        skip_done = False   # ... and, in a first block, 1/avg_num_neighbors and self.skip_tp
 +        if not torch.jit.is_scripting():   # macetp eval path: fused table convolution, no radial MLP
 +            message = macetp_fused(self, node_feats, edge_vectors, edge_index, node_attrs)
 +            lin_done = macetp_lin_done(self, message)
++            skip_done = macetp_skip_done(self, message)
 +        tp_weights = torch.zeros(0)
 +        if message is None:
 +            tp_weights = self.conv_tp_weights(edge_feats)
@@ -46,18 +139,21 @@ index af60244..19c78c7 100644
              message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
          else:
              mji = self.conv_tp(
-@@ -693,7 +704,9 @@
+@@ -693,8 +711,11 @@
              )
          message = self.truncate_ghosts(message, n_real)
          node_attrs = self.truncate_ghosts(node_attrs, n_real)
 -        message = self.linear(message) / self.avg_num_neighbors
+-        message = self.skip_tp(message, node_attrs)
 +        if not lin_done:
 +            message = self.linear(message)
-+        message = message / self.avg_num_neighbors
-         message = self.skip_tp(message, node_attrs)
++        if not skip_done:   # macetp: else the convolution applied 1/avg_num_neighbors and skip_tp with self.linear
++            message = message / self.avg_num_neighbors
++            message = self.skip_tp(message, node_attrs)
          return (
              self.reshape(message),
-@@ -771,6 +784,7 @@
+             None,
+@@ -771,6 +792,7 @@
          lammps_class: Optional[Any] = None,
          lammps_natoms: Tuple[int, int] = (0, 0),
          first_layer: bool = False,
@@ -65,7 +161,7 @@ index af60244..19c78c7 100644
      ) -> Tuple[torch.Tensor, torch.Tensor]:
          n_real = lammps_natoms[0] if lammps_class is not None else None
          sc = self.skip_tp(node_feats, node_attrs)
-@@ -781,11 +795,21 @@
+@@ -781,11 +803,21 @@
              lammps_natoms=lammps_natoms,
              first_layer=first_layer,
          )
@@ -92,7 +188,7 @@ index af60244..19c78c7 100644
              message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
          else:
              mji = self.conv_tp(
-@@ -797,7 +821,9 @@
+@@ -797,7 +829,9 @@
          message = self.truncate_ghosts(message, n_real)
          node_attrs = self.truncate_ghosts(node_attrs, n_real)
          sc = self.truncate_ghosts(sc, n_real)
@@ -103,7 +199,7 @@ index af60244..19c78c7 100644
          return (
              self.reshape(message),
              sc,
-@@ -884,6 +910,7 @@
+@@ -884,6 +918,7 @@
          lammps_class: Optional[Any] = None,
          lammps_natoms: Tuple[int, int] = (0, 0),
          first_layer: bool = False,
@@ -111,7 +207,7 @@ index af60244..19c78c7 100644
      ) -> Tuple[torch.Tensor, None]:
          receiver = edge_index[1]
          num_nodes = node_feats.shape[0]
-@@ -895,16 +922,27 @@
+@@ -895,16 +930,29 @@
              lammps_natoms=lammps_natoms,
              first_layer=first_layer,
          )
@@ -127,9 +223,11 @@ index af60244..19c78c7 100644
 -        if hasattr(self, "conv_fusion"):
 +        message: Optional[torch.Tensor] = None
 +        lin_done = False   # macetp: the fused convolution may apply self.linear too
++        skip_done = False   # ... and, in a first block, 1/avg_num_neighbors and self.skip_tp
 +        if not torch.jit.is_scripting():   # macetp eval path: fused table convolution, no radial MLP
 +            message = macetp_fused(self, node_feats, edge_vectors, edge_index, node_attrs)
 +            lin_done = macetp_lin_done(self, message)
++            skip_done = macetp_skip_done(self, message)
 +        tp_weights = torch.zeros(0)
 +        if message is None:
 +            tp_weights = self.conv_tp_weights(edge_feats)
@@ -143,18 +241,21 @@ index af60244..19c78c7 100644
              message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
          else:
              mji = self.conv_tp(
-@@ -917,7 +955,9 @@
+@@ -917,8 +965,11 @@
          message = self.truncate_ghosts(message, n_real)
          node_attrs = self.truncate_ghosts(node_attrs, n_real)
          density = self.truncate_ghosts(density, n_real)
 -        message = self.linear(message) / (density + 1)
+-        message = self.skip_tp(message, node_attrs)
 +        if not lin_done:
 +            message = self.linear(message)
 +        message = message / (density + 1)
-         message = self.skip_tp(message, node_attrs)
++        if not skip_done:   # macetp: else the convolution applied skip_tp with self.linear (the division commutes)
++            message = self.skip_tp(message, node_attrs)
          return (
              self.reshape(message),
-@@ -1006,6 +1046,7 @@
+             None,
+@@ -1006,6 +1057,7 @@
          lammps_class: Optional[Any] = None,
          lammps_natoms: Tuple[int, int] = (0, 0),
          first_layer: bool = False,
@@ -162,7 +263,7 @@ index af60244..19c78c7 100644
      ) -> Tuple[torch.Tensor, torch.Tensor]:
          receiver = edge_index[1]
          num_nodes = node_feats.shape[0]
-@@ -1018,17 +1059,27 @@
+@@ -1018,17 +1070,27 @@
              lammps_natoms=lammps_natoms,
              first_layer=first_layer,
          )
@@ -195,7 +296,7 @@ index af60244..19c78c7 100644
              message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
          else:
              mji = self.conv_tp(
-@@ -1042,7 +1093,9 @@
+@@ -1042,7 +1104,9 @@
          node_attrs = self.truncate_ghosts(node_attrs, n_real)
          density = self.truncate_ghosts(density, n_real)
          sc = self.truncate_ghosts(sc, n_real)
@@ -206,7 +307,7 @@ index af60244..19c78c7 100644
          return (
              self.reshape(message),
              sc,
-@@ -1129,6 +1182,7 @@
+@@ -1129,6 +1193,7 @@
          lammps_class: Optional[Any] = None,
          lammps_natoms: Tuple[int, int] = (0, 0),
          first_layer: bool = False,
@@ -214,18 +315,7 @@ index af60244..19c78c7 100644
      ) -> Tuple[torch.Tensor, None]:
          sender = edge_index[0]
          receiver = edge_index[1]
-@@ -1168,7 +1222,9 @@
-             )
-         message = self.truncate_ghosts(message, n_real)
-         sc = self.truncate_ghosts(sc, n_real)
--        message = self.linear(message) / self.avg_num_neighbors
-+        if not lin_done:
-+            message = self.linear(message)
-+        message = message / self.avg_num_neighbors
-         return (
-             self.reshape(message),
-             sc,
-@@ -1303,6 +1359,7 @@
+@@ -1303,6 +1368,7 @@
          lammps_class: Optional[Any] = None,
          lammps_natoms: Tuple[int, int] = (0, 0),
          first_layer: bool = False,
@@ -233,12 +323,29 @@ index af60244..19c78c7 100644
      ) -> Tuple[torch.Tensor, torch.Tensor]:
          num_nodes = node_feats.shape[0]
          n_real = lammps_natoms[0] if lammps_class is not None else None
+diff --git a/mace/modules/irreps_tools.py b/mace/modules/irreps_tools.py
+index 6677b1b..0aab70c 100644
+--- a/mace/modules/irreps_tools.py
++++ b/mace/modules/irreps_tools.py
+@@ -83,6 +83,12 @@
+         ix = 0
+         out = []
+         batch, _ = tensor.shape
++        if not torch.jit.is_scripting():
++            # macetp: cuEq ir_mul with one mul is already the memory layout of the (batch, sum d, mul) result: a view
++            # instead of a slice and reshape per irrep and a cat (and their backward)
++            cfg = getattr(self, "cueq_config", None)
++            if cfg is not None and cfg.layout_str != "mul_ir" and len(set(self.muls)) == 1:
++                return tensor.reshape(batch, -1, self.muls[0])
+         for mul, d in zip(self.muls, self.dims):
+             field = tensor[:, ix : ix + mul * d]  # [batch, sample, mul * repr]
+             ix += mul * d
 diff --git a/mace/modules/macetp_hook.py b/mace/modules/macetp_hook.py
 new file mode 100644
-index 0000000..a0cdf09
+index 0000000..e1ca2d9
 --- /dev/null
 +++ b/mace/modules/macetp_hook.py
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,59 @@
 +"""mlip-accel hook: jet_mlip fused convolution (macetp) for InteractionBlocks.
 +`macetp.convert.patch_model` attaches a `macetp` module to each block. Eval: the whole radial MLP + tensor
 +product + scatter is one fused kernel (radial table). Train: the radial MLP stays in torch, the tensor product +
@@ -269,23 +376,48 @@ index 0000000..a0cdf09
 +    return message is not None and getattr(block.macetp, "lin", None) is not None
 +
 +
++def macetp_skip_done(block, message: Optional[torch.Tensor]) -> bool:
++    """True if `message` is the fused convolution's of a first block and has the block's 1/avg_num_neighbors and
++    `skip_tp` applied with its `linear`, as one map per element (MaceTPConv.skip)."""
++    return message is not None and getattr(block.macetp, "skip", False)
++
++
 +def macetp_all_fused(model) -> bool:
 +    """Eval with every interaction on the fused table convolution (flag set by `jet_mace.convert.patch_model`): the
 +    model skips the spherical harmonics and the radial embedding, which only the upstream convolution reads."""
 +    return getattr(model, "macetp_all_fused", False) and not model.training
++
++
++def macetp_no_sh(model) -> bool:
++    """Eval with every interaction on a fused table convolution, density blocks included (they read the radial
++    embedding, so `macetp_all_fused` is False for them): no block reads the spherical harmonics."""
++    return getattr(model, "macetp_no_sh", getattr(model, "macetp_all_fused", False)) and not model.training
++
++
++def macetp_nl_device(calc):
++    """Device on which the ASE calculator builds its neighbour list: its own when every model is jet-patched and
++    jet_mlip's GPU list runs there (CUDA, JET_ASE_GPU_NL != 0), else None = matscipy on the CPU (also under
++    use_compile, whose padding graph is built on the CPU)."""
++    if calc.use_compile or not all(hasattr(m, "macetp_no_sh") for m in calc.models):
++        return None
++    try:
++        from jet_mlip import neighbors
++    except ImportError:
++        return None
++    return calc.device if neighbors.available(calc.device) else None
 diff --git a/mace/modules/models.py b/mace/modules/models.py
-index 5e2d604..5d9e544 100644
+index 5e2d604..b9427cc 100644
 --- a/mace/modules/models.py
 +++ b/mace/modules/models.py
 @@ -12,6 +12,7 @@
  from e3nn.util.jit import compile_mode
  
  from mace.modules.embeddings import GenericJointEmbedding
-+from mace.modules.macetp_hook import macetp_all_fused
++from mace.modules.macetp_hook import macetp_all_fused, macetp_no_sh
  from mace.modules.radial import ZBLBasis
  from mace.tools.scatter import scatter_mean, scatter_sum
  from mace.tools.torch_tools import get_change_of_basis, spherical_to_cartesian
-@@ -318,10 +319,16 @@
+@@ -318,10 +319,19 @@
          )  # [n_graphs, n_heads]
          # Embeddings
          node_feats = self.node_embedding(data["node_attrs"])
@@ -296,17 +428,20 @@ index 5e2d604..5d9e544 100644
 +        edge_attrs, edge_feats = vectors, lengths
 +        cutoff: Optional[torch.Tensor] = None
 +        fused = False   # macetp eval path: every block is a fused table convolution, none reads the two embeddings
++        no_sh = False   # ... or only the radial one (the density blocks)
 +        if not torch.jit.is_scripting():
 +            fused = macetp_all_fused(self)
-+        if not fused:
++            no_sh = macetp_no_sh(self)
++        if not no_sh:
 +            edge_attrs = self.spherical_harmonics(vectors)
++        if not fused:
 +            edge_feats, cutoff = self.radial_embedding(
 +                lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
 +            )
          if hasattr(self, "pair_repulsion"):
              pair_node_energy = self.pair_repulsion_fn(
                  lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
-@@ -376,6 +383,7 @@
+@@ -376,6 +386,7 @@
                  first_layer=(i == 0),
                  lammps_class=lammps_class,
                  lammps_natoms=lammps_natoms,
@@ -314,7 +449,7 @@ index 5e2d604..5d9e544 100644
              )
              if is_lammps and i == 0:
                  node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
-@@ -386,9 +394,10 @@
+@@ -386,9 +397,10 @@
  
          for i, readout in enumerate(self.readouts):
              feat_idx = -1 if len(self.readouts) == 1 else i
@@ -328,7 +463,7 @@ index 5e2d604..5d9e544 100644
              energy = scatter_sum(node_es, data["batch"], dim=0, dim_size=num_graphs)
              energies.append(energy)
              node_energies_list.append(node_es)
-@@ -499,10 +508,16 @@
+@@ -499,10 +511,19 @@
  
          # Embeddings
          node_feats = self.node_embedding(data["node_attrs"])
@@ -339,17 +474,20 @@ index 5e2d604..5d9e544 100644
 +        edge_attrs, edge_feats = vectors, lengths
 +        cutoff: Optional[torch.Tensor] = None
 +        fused = False   # macetp eval path: every block is a fused table convolution, none reads the two embeddings
++        no_sh = False   # ... or only the radial one (the density blocks)
 +        if not torch.jit.is_scripting():
 +            fused = macetp_all_fused(self)
-+        if not fused:
++            no_sh = macetp_no_sh(self)
++        if not no_sh:
 +            edge_attrs = self.spherical_harmonics(vectors)
++        if not fused:
 +            edge_feats, cutoff = self.radial_embedding(
 +                lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
 +            )
  
          if hasattr(self, "pair_repulsion"):
              pair_node_energy = self.pair_repulsion_fn(
-@@ -556,6 +571,7 @@
+@@ -556,6 +577,7 @@
                  first_layer=(i == 0),
                  lammps_class=lammps_class,
                  lammps_natoms=lammps_natoms,
@@ -357,7 +495,7 @@ index 5e2d604..5d9e544 100644
              )
              if is_lammps and i == 0:
                  node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
-@@ -567,9 +583,10 @@
+@@ -567,9 +589,10 @@
          for i, readout in enumerate(self.readouts):
              feat_idx = -1 if len(self.readouts) == 1 else i
              node_es_list.append(
@@ -371,3 +509,37 @@ index 5e2d604..5d9e544 100644
              )
  
          node_feats_out = torch.cat(node_feats_list, dim=-1)
+diff --git a/mace/modules/utils.py b/mace/modules/utils.py
+index fa7f44e..a29b0f4 100644
+--- a/mace/modules/utils.py
++++ b/mace/modules/utils.py
+@@ -96,15 +96,16 @@
+     symmetric_displacement = 0.5 * (
+         displacement + displacement.transpose(-1, -2)
+     )  # From https://github.com/mir-group/nequip
++    # index_select, not [...]: the backward of advanced indexing is a sort-based index_put
+     positions = positions + torch.einsum(
+-        "be,bec->bc", positions, symmetric_displacement[batch]
++        "be,bec->bc", positions, symmetric_displacement.index_select(0, batch)
+     )
+     cell = cell.view(-1, 3, 3)
+     cell = cell + torch.matmul(cell, symmetric_displacement)
+     shifts = torch.einsum(
+         "be,bec->bc",
+         unit_shifts,
+-        cell[batch[sender]],
++        cell.index_select(0, batch.index_select(0, sender)),
+     )
+     return positions, shifts, displacement
+ 
+@@ -267,7 +268,9 @@
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     sender = edge_index[0]
+     receiver = edge_index[1]
+-    vectors = positions[receiver] - positions[sender] + shifts  # [n_edges, 3]
++    vectors = (
++        positions.index_select(0, receiver) - positions.index_select(0, sender) + shifts
++    )  # [n_edges, 3]; index_select: see get_symmetric_displacement
+     lengths = torch.linalg.norm(vectors, dim=-1, keepdim=True)  # [n_edges, 1]
+     if normalize:
+         vectors_normed = vectors / (lengths + eps)

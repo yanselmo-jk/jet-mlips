@@ -36,6 +36,8 @@ def build_csr(dst: torch.Tensor, n_nodes: int):
     edges) rowptr counts the real edges only and the padding sorts last: it is never visited."""
     m = EDGE_MASK
     if m is not None and m.numel() == dst.numel():
+        if dst.is_cuda and has_op('build_csr_masked'):   # no sort: a pair list comes grouped by dst (csrc/csr.cu)
+            return torch.ops.jet_mlip.build_csr_masked(dst, m, n_nodes)
         d = dst.int()
         counts = torch.zeros(n_nodes, dtype=torch.int32, device=d.device)
         counts.index_add_(0, d.clamp(max=n_nodes - 1), m * (d < n_nodes))   # padding dst may lie past n_nodes
@@ -103,11 +105,13 @@ def species_linear_weight(tp):
     return W.contiguous(), paths
 
 
-def species_linear(x, species, weight, paths: List[int], dim_out: int, bias=None):
+def species_linear(x, species, weight, paths: List[int], dim_out: int, bias=None, out_ir_mul: bool = False):
     """out = e3nn TP(x, one_hot(species)) as one (V, U) matrix per species and irrep path (fp32 CUDA, CUDA-graph
     capturable; grad x only). weight, paths from species_linear_weight; species (N,) int in [0, S). species None:
-    an e3nn Linear (weight, paths from linear_weight), bias (dim_out,) added to the columns the paths write."""
-    return torch.ops.jet_mlip.species_linear(x, species, weight, paths, dim_out, bias)
+    an e3nn Linear (weight, paths from linear_weight), bias (dim_out,) added to the columns the paths write.
+    out_ir_mul: the output in cuEq's ir_mul layout (off + m*mul + u) instead of e3nn's mul_ir, written (and its
+    gradient read) by the kernel: no layout copy either way."""
+    return torch.ops.jet_mlip.species_linear(x, species, weight, paths, dim_out, bias, out_ir_mul)
 
 
 def linear_weight(lin, modal: int = 0):

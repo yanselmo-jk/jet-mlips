@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from e3nn import o3
-from jet_mlip import ops, reference, tables
+from jet_mlip import neighbors, ops, reference, tables
 
 from common.radial_table import DEFAULT_N, interpolate, make_radial_table
 
@@ -209,9 +209,46 @@ class RMSNorm(torch.nn.Module):
         return torch.cat(out, dim=-1)
 
 
+def _hook_ase():
+    """ASE: the torch NequixCalculator of a patched model builds its graph on the GPU. Wraps
+    NequixCalculator.calculate once: for a patched model on CUDA it is upstream's torch branch with
+    jet_mlip.neighbors in place of preprocess_graph's matscipy list and the tensors made on the device (senders = j,
+    receivers = i, shifts fp32, the cell only when fully periodic, as upstream). Everything else (jax, an unpatched
+    model, use_compile before its first call, JET_ASE_GPU_NL=0) takes upstream's calculate. No-op when
+    nequix.calculator is not loaded (LAMMPS)."""
+    mod = sys.modules.get('nequix.calculator')
+    if mod is None or getattr(mod.NequixCalculator.calculate, 'jet', False):
+        return
+    from ase.calculators.calculator import Calculator, all_changes
+    from ase.stress import full_3x3_to_voigt_6_stress
+    orig = mod.NequixCalculator.calculate
+
+    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+        if not (self.backend == 'torch' and self.compile_state and getattr(self.model, 'jet_patched', False)
+                and neighbors.available(self.device)):
+            return orig(self, atoms, properties, system_changes)
+        Calculator.calculate(self, atoms)
+        dev, n = self.device, len(atoms)
+        pos = torch.as_tensor(atoms.positions, device=dev)   # fp64 for the list, as matscipy gets it
+        i, j, shift = neighbors.neighbor_list(pos, atoms.cell.array, atoms.pbc, self.cutoff)
+        species = torch.as_tensor(list(map(self.atom_indices.__getitem__, atoms.numbers.tolist())), device=dev)
+        cell = torch.as_tensor(atoms.cell.array, dtype=torch.float32, device=dev)[None] if atoms.pbc.all() else None
+        n_node, n_edge = (torch.tensor([k], dtype=torch.int32, device=dev) for k in (n, i.numel()))
+        n_graph = torch.zeros(n, dtype=torch.int64, device=dev)
+        e, forces, stress = self.model(species, pos.float(), shift.float(), torch.stack([j, i]), cell, n_node, n_edge,
+                                       n_graph)
+        energy = _NQ.scatter(e, n_graph, dim=0, dim_size=1)[0].item()
+        self.results['energy'] = self.results['free_energy'] = energy
+        self.results['forces'] = forces.detach().cpu().numpy()
+        self.results['stress'] = None if stress is None else full_3x3_to_voigt_6_stress(stress[0].detach().cpu().numpy())
+    calculate.jet = True
+    mod.NequixCalculator.calculate = calculate
+
+
 def patch_model(model, radial_table: int = DEFAULT_N):
     """Attach fused convolutions to every NequixTorchConvolution of a NequixTorch model (in place; returns it).
-    radial_table=0 keeps the exact W(r) on the torch reference path (fp64 checks; no parameter gradients)."""
+    radial_table=0 keeps the exact W(r) on the torch reference path (fp64 checks; no parameter gradients). Its ASE
+    calculator then builds the graph on the GPU (_hook_ase)."""
     device = next(model.parameters()).device
     layers = [m for m in model.modules() if type(m).__name__ == 'NequixTorchConvolution']
     if not layers:
@@ -239,4 +276,6 @@ def patch_model(model, radial_table: int = DEFAULT_N):
         e = model.readout(features) * model.scale + model.shift
         return e + model.atom_energies[species, None]
     model.node_energies = node_energies
+    model.jet_patched = True
+    _hook_ase()
     return model

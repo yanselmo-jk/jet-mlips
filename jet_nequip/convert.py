@@ -7,15 +7,21 @@ against the installed nequip. Blocks with a mul above the kernel's 128 (NequIP-O
 """
 import copy
 import os
+import sys
+import types
 
 import torch
-from jet_mlip import ops, reference, tables
+from jet_mlip import neighbors, ops, reference, tables
+from nequip.data import AtomicDataDict
 from nequip.nn.utils import with_edge_vectors_
 
 from common.radial_table import DEFAULT_N, interpolate, make_radial_table, make_radial_tables
+from jet_equflash.convert import _Gather, _Scatter   # the slice column maps as one autograd node each way
 
 CSR = None   # (rowptr, perm) of the step's edge list by dst, set by jet_nequip.mliap around a graph step (built once
 # per pair list instead of once per layer); None or another size: every convolution builds its own
+
+TYPES = None   # (N,) int64 atom type of every node row, set with CSR by jet_nequip.mliap on one rank: all rows are local
 
 SLICE = 32   # channels per kernel call for a mul > 128 block: 32-channel slices are faster per layer than mul-128
 # calls on H200 (measured on EquFlash)
@@ -148,11 +154,20 @@ class JetTPScatter(torch.nn.Module):
             for name, shape in (('w1', (8, 64)), ('w2', (64, 64)), ('w3', (64, nw)), ('coeffs', (8,))):
                 self.register_buffer(f'{name}{i}', torch.zeros(shape, dtype=table.dtype), persistent=False)   # nequip may leave fp64 as default
         if self.wide:
-            # the slice outputs tile the full out: `cat(slice_outs, 1)[:, inv]` is the e3nn layout
+            # the slices' out columns tile the block out and their x columns are disjoint (_Scatter / _Gather copy each
+            # way without a zero fill or an add); x columns no slice reads (an irrep without a path) are one more
+            # gather output, unused: its gradient is the zero fill
             tags = torch.cat([out_cols for *_, out_cols in slices])
             assert torch.equal(tags.sort().values, torch.arange(tp.irreps_out.dim)), 'slices do not tile the block out'
-            self.register_buffer('inv', torch.empty_like(tags).scatter_(0, tags, torch.arange(tags.numel())),
-                                 persistent=False)
+            for i, (*_, out_cols) in enumerate(slices):
+                self.register_buffer(f'o_idx{i}', out_cols, persistent=False)
+            cols = torch.cat([x_cols for _, _, x_cols, _ in slices])
+            read = torch.zeros(tp.irreps_in1.dim, dtype=torch.bool)
+            read[cols] = True
+            assert read.sum() == cols.numel(), 'slices share an x column'
+            if not read.all():
+                self.register_buffer(f'x_idx{len(slices)}', (~read).nonzero().view(-1), persistent=False)
+            self.n_x, self.out_dim = len(slices) + int(not read.all()), tp.irreps_out.dim
 
     def forward(self, x, edge_attr, edge_weight, edge_dst, edge_src):
         return self._conv(x, edge_attr, edge_src, edge_dst, x.shape[0])
@@ -163,7 +178,7 @@ class JetTPScatter(torch.nn.Module):
         if self.per_pair:
             idx, vec = self.pair_map[vec[:, 3].long()], vec[:, :3]
         vec = vec.contiguous()
-        xs = [x.index_select(1, self.get_buffer(f'x_idx{i}')) for i in range(len(self.cfgs))] if self.wide else [x]
+        xs = _Gather.apply(x, *[self.get_buffer(f'x_idx{i}') for i in range(self.n_x)]) if self.wide else [x]
         if x.is_cuda and x.dtype == torch.float32 and ops.has_op('conv_fused'):
             csr = CSR
             if csr is None or csr[0].numel() != n_out + 1 or csr[1].numel() != dst.numel():
@@ -172,8 +187,8 @@ class JetTPScatter(torch.nn.Module):
             outs = [torch.ops.jet_mlip.conv_fused(xh, vec, src.int(), rowptr, perm, self.get_buffer(f'w1{i}'),
                                                   self.get_buffer(f'w2{i}'), self.get_buffer(f'w3{i}'),
                                                   self.get_buffer(f'coeffs{i}'), 1.0, 0.0, self.r_max, 1.0,
-                                                  ops.config_id(self.cfgs[i]), self.get_buffer(f'table{i}'), True, idx)
-                    for i, xh in enumerate(xs)]
+                                                  ops.config_id(cfg), self.get_buffer(f'table{i}'), True, idx)
+                    for i, (cfg, xh) in enumerate(zip(self.cfgs, xs))]
         else:
             sh = reference.spherical_harmonics(self.cfgs[0].irreps_sh, vec)
             r = vec.norm(dim=-1)
@@ -181,7 +196,10 @@ class JetTPScatter(torch.nn.Module):
                         0, dst, reference.tp3(cfg, xh[src], sh,
                                               interpolate(self.get_buffer(f'table{i}'), self.r_max, r, idx).to(x.dtype)))
                     for i, (cfg, xh) in enumerate(zip(self.cfgs, xs))]
-        return torch.cat(outs, 1)[:, self.inv] if self.wide else outs[0]
+        if not self.wide:
+            return outs[0]
+        # not cat(outs, 1)[:, inv]: the backward of advanced indexing is a sort-based index_put (half the OAM-XL step)
+        return _Scatter.apply(self.out_dim, [self.get_buffer(f'o_idx{i}') for i in range(len(outs))], *outs)
 
 
 class EdgeVecAttrs(torch.nn.Module):
@@ -209,6 +227,37 @@ class _NoWeights(torch.nn.Module):
 
     def forward(self, x):
         return x[:, :0]
+
+
+class _CutoffOnly(torch.nn.Module):
+    """BesselEdgeLengthEncoding without its Bessel basis: with every edge_mlp a _NoWeights nothing reads the edge
+    embedding (an empty (E, 0) tensor here); the cutoff stays, the ZBL pair term reads it."""
+
+    def __init__(self, enc, cutoff_field):
+        super().__init__()
+        self.enc, self.cutoff_field = enc, cutoff_field
+
+    def forward(self, data):
+        cutoff = self.enc.cutoff(data[self.enc.norm_length_field]).to(self.enc._output_dtype)
+        data[self.cutoff_field] = cutoff
+        data[self.enc.edge_invariant_field] = cutoff.new_zeros((cutoff.shape[0], 0))
+        return data
+
+    @classmethod
+    def of(cls, enc):
+        """The stub for `enc`, or `enc` itself if its forward is not 'cutoff and Bessel * cutoff' (the packaged models
+        carry their own nequip): a probe must give the same cutoff, under the same key, and no other key."""
+        try:
+            x = torch.linspace(0.1, 0.9, 5, dtype=enc.bessel_weights.dtype, device=enc.bessel_weights.device).unsqueeze(-1)
+            with torch.no_grad():
+                ref = enc({enc.norm_length_field: x})
+                extra = [k for k in ref if k not in (enc.norm_length_field, enc.edge_invariant_field)]
+                stub = cls(enc, extra[0])
+                out = stub({enc.norm_length_field: x})
+            ok = len(extra) == 1 and out.keys() == ref.keys() and torch.equal(out[extra[0]], ref[extra[0]])
+        except (AttributeError, IndexError, KeyError, RuntimeError, TypeError):   # another encoding contract
+            ok = False
+        return stub if ok else enc
 
 
 class _JetGlue(torch.nn.Module):
@@ -316,9 +365,118 @@ def patch_glue(model, which=None):
     return n
 
 
+def _alpha(block):
+    """The scalar a block multiplies x by before its convolution; None if it is not one scalar (per-type norm)."""
+    if hasattr(block, 'scatter_norm_factor'):   # the packaged foundation models' nequip
+        return 1.0 if block.scatter_norm_factor is None else float(block.scatter_norm_factor)
+    norm = getattr(block, 'avg_num_neighbors_norm', None)
+    return float(norm.norm_const) if norm is not None and norm.norm_const.numel() == 1 else None
+
+
+@torch._dynamo.disable   # one opaque step per block, not one per op with compiled glue in between
+def _local_forward(self, data):
+    """InteractionBlock.forward on node rows that are all local (TYPES set: no ghost row, no exchange) as four jet ops:
+    the self-connection by atom type (no node_attrs argmax), linear_1 with the scatter normalization folded in, the
+    convolution, linear_2; no [:num_local] slice. Without TYPES: the upstream forward."""
+    x, t = data[AtomicDataDict.NODE_FEATURES_KEY], TYPES
+    if t is None or t.numel() != x.shape[0]:
+        return super(type(self), self).forward(data)
+    lin, ei = torch.ops.jet_mlip.species_linear, data[AtomicDataDict.EDGE_INDEX_KEY]
+    sc = None if self.sc is None else lin(x, t, self.sc.w, self.sc.paths, self.sc.dim_out, None)
+    x = lin(x, None, self.w1, self.linear_1.paths, self.linear_1.dim_out, None)
+    x = self.tp_scatter._conv(x, data[AtomicDataDict.EDGE_ATTRS_KEY], ei[1], ei[0], x.shape[0])
+    x = lin(x, None, self.linear_2.w, self.linear_2.paths, self.linear_2.dim_out, None)
+    data[AtomicDataDict.NODE_FEATURES_KEY] = x if sc is None else x + sc
+    return data
+
+
+def patch_block_forward(model):
+    """Give the InteractionBlocks of a patched CUDA model `_local_forward` (in place), for a caller that sets TYPES
+    when every node row is local (jet_nequip.mliap on one rank). The packaged models carry their own nequip, so a
+    block is swapped only if its glue is all jet ops and a random probe of its own forward gives the same features.
+    Returns the number of blocks swapped."""
+    global TYPES
+    n, classes = 0, {}
+    for block in [m for m in model.modules() if type(m).__name__ == 'InteractionBlock']:
+        alpha, cls = _alpha(block), type(block)
+        if alpha is None or not (isinstance(block.linear_1, JetLinear) and isinstance(block.linear_2, JetLinear)
+                                 and isinstance(block.tp_scatter, JetTPScatter) and block.linear_1.w.is_cuda
+                                 and (block.sc is None or isinstance(block.sc, JetSelfConnection))):
+            continue
+        block.register_buffer('w1', alpha * block.linear_1.w, persistent=False)
+        N, E, kw = 6, 24, dict(device=block.w1.device, dtype=block.w1.dtype)   # (nequip leaves fp64 as torch's default)
+        g = torch.Generator(kw['device']).manual_seed(0)
+        t = torch.arange(N, device=kw['device']) % (1 if block.sc is None else block.sc.w.shape[0])
+        vec = (torch.rand(E, 3, generator=g, **kw) - 0.5) * block.tp_scatter.r_max
+        data = {AtomicDataDict.NODE_FEATURES_KEY: torch.randn(N, block.linear_1.e3nn.irreps_in.dim, generator=g, **kw),
+                AtomicDataDict.NODE_ATTRS_KEY: None if block.sc is None else block.sc.key.t()[t],
+                AtomicDataDict.EDGE_ATTRS_KEY: torch.cat([vec, vec[:, :1] * 0], 1) if block.tp_scatter.per_pair else vec,
+                AtomicDataDict.EDGE_INDEX_KEY: torch.randint(0, N, (2, E), device=kw['device'], generator=g),
+                AtomicDataDict.EDGE_EMBEDDING_KEY: vec[:, :0], AtomicDataDict.ATOM_TYPE_KEY: t,
+                AtomicDataDict.LMP_MLIAP_DATA_KEY: types.SimpleNamespace(nlocal=N)}
+        try:
+            with torch.no_grad():
+                ref = block(dict(data))[AtomicDataDict.NODE_FEATURES_KEY]
+                # same class name: the blocks are found by type name
+                block.__class__ = classes.setdefault(cls, type(cls.__name__, (cls,), {'forward': _local_forward}))
+                TYPES = t
+                out = block(dict(data))[AtomicDataDict.NODE_FEATURES_KEY]
+            ok = out.shape == ref.shape and bool((out - ref).abs().max() <= 1e-4 * ref.abs().max())
+        except (AttributeError, KeyError, RuntimeError, TypeError):   # another forward contract
+            ok = False
+        finally:
+            TYPES = None
+        if not ok:
+            block.__class__ = cls
+        n += ok
+    return n
+
+
+def _neighborlist(data, r_max):
+    """nequip neighbour-list backend 'jet': one frame on a CUDA device through jet_mlip.neighbors, the edge_index /
+    edge_cell_shift of the matscipy backend (edge order aside); anything else goes to that backend."""
+    from nequip.data import _nl
+    pos = data[AtomicDataDict.POSITIONS_KEY]
+    if not pos.is_cuda or AtomicDataDict.num_frames(data) != 1:
+        return _nl.NEIGHBORLIST_BACKEND_OPTIONS[_nl.NEIGHBORLIST_BACKEND_MATSCIPY].fn(data, r_max)
+    cell, pbc = data.get(AtomicDataDict.CELL_KEY), data.get(AtomicDataDict.PBC_KEY)
+    i, j, shift = neighbors.neighbor_list(pos, torch.zeros(3, 3) if cell is None else cell.view(3, 3),
+                                          (False,) * 3 if pbc is None else pbc.view(3), r_max)
+    data[AtomicDataDict.EDGE_INDEX_KEY] = torch.stack([i, j])
+    if cell is not None:
+        data[AtomicDataDict.EDGE_CELL_SHIFT_KEY] = shift.to(pos.dtype)
+    return data
+
+
+def _hook_ase():
+    """ASE: the NequIPCalculator of a patched model builds its neighbour list on the GPU. Registers `_neighborlist`
+    with nequip and wraps NequIPCalculator.atoms_to_data once: a calculator on a CPU-only backend whose model is
+    patched switches to 'jet' and moves its transforms to the model device (nequip's own handling of a CUDA
+    backend). No-op when nequip's ASE integration is not loaded (LAMMPS) or jet_mlip.neighbors is not available."""
+    ase = sys.modules.get('nequip.integrations.ase')
+    if ase is None or getattr(ase.NequIPCalculator.atoms_to_data, 'jet', False):
+        return
+    from nequip.data import _nl
+    from nequip.data.transforms import NeighborListTransform
+    _nl.register_neighborlist_backend('jet', _neighborlist, supports_cuda=True, overwrite=True)
+    orig = ase.NequIPCalculator.atoms_to_data
+
+    def atoms_to_data(self, atoms):
+        if not self._move_to_device_before_transforms and getattr(self.model, 'jet_patched', False) \
+                and neighbors.available(self.device):
+            nl = [t for t in self.transforms if isinstance(t, NeighborListTransform)]
+            if len(nl) == 1:
+                nl[0].backend = 'jet'
+                self.transforms = [t.to(self.device) for t in self.transforms]
+                self._move_to_device_before_transforms = True
+        return orig(self, atoms)
+    atoms_to_data.jet = True
+    ase.NequIPCalculator.atoms_to_data = atoms_to_data
+
+
 def patch_model(model, radial_table: int = DEFAULT_N):
     """Attach fused convolutions to every InteractionBlock of a NequIP model and jet ops to the glue around them
-    (patch_glue), in place; returns it."""
+    (patch_glue), in place; returns it. Its ASE calculator then builds the neighbour list on the GPU (_hook_ase)."""
     device = next(model.parameters()).device
     n = 0
     for name, m in list(model.named_modules()):
@@ -336,5 +494,11 @@ def patch_model(model, radial_table: int = DEFAULT_N):
             setattr(parent, name.rsplit('.', 1)[-1], EdgeVecAttrs(m.out_field, dtype, nt).to(device))
     if n == 0:
         raise ValueError('jet_nequip: no InteractionBlock found in the model')
+    for name, m in list(model.named_modules()):
+        if type(m).__name__ == 'BesselEdgeLengthEncoding':
+            parent = model.get_submodule(name.rsplit('.', 1)[0]) if '.' in name else model
+            setattr(parent, name.rsplit('.', 1)[-1], _CutoffOnly.of(m))
     patch_glue(model)
+    model.jet_patched = True
+    _hook_ase()
     return model

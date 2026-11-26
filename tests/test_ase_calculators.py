@@ -1,6 +1,7 @@
 """JET-patched models, driven through their family's own ASE calculator, match the official calculator's energy and
 forces (and still run BFGS). One test per family; each skips when CUDA, the family package or the model is unavailable.
-The reference is always a second, unpatched calculator on the same structure."""
+The reference is always a second, unpatched calculator on the same structure (its own CPU neighbour list; the patched
+calculator builds its list on the GPU, jet_mlip.neighbors)."""
 import os
 from pathlib import Path
 
@@ -23,9 +24,14 @@ def ef(calc, atoms):
     return calc.get_potential_energy(atoms), calc.get_forces(atoms)
 
 
-def check(ref, jet, atoms, model, names):
+def check(ref, jet, atoms, model, names, gpu_nl=True):
+    from unittest import mock
+
+    from jet_mlip import neighbors
     e0, f0 = ef(ref, atoms)
-    e1, f1 = ef(jet, atoms)
+    with mock.patch.object(neighbors, 'neighbor_list', wraps=neighbors.neighbor_list) as nl:
+        e1, f1 = ef(jet, atoms)
+    assert nl.called == (gpu_nl and neighbors.available('cuda'))   # the patched calculator lists its pairs on the GPU
     assert abs(e1 - e0) / len(atoms) < 1e-4, (e0, e1)
     assert np.abs(f1 - f0).max() < 2e-3
     assert any(type(m).__name__ in names for m in model.modules()), names
@@ -108,4 +114,4 @@ def test_equflash():
     jet = calculator.UCalculator(checkpoint_path=ckpt, cpu=False)
     model = getattr(jet.trainer.model, 'module', jet.trainer.model)
     convert.patch_model(model)
-    check(ref, jet, structure(), model, ('JetTPScatter',))
+    check(ref, jet, structure(), model, ('JetTPScatter',), gpu_nl=False)   # GGNN lists its pairs on the GPU itself

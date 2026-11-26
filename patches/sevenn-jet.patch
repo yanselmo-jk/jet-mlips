@@ -53,7 +53,7 @@ index 8773a09..a504dee 100644
  REG_PARAM = 'regularization_param'
  REG_WEIGHT = 'regularization_weight'
 diff --git a/sevenn/calculator.py b/sevenn/calculator.py
-index a3d85da..81d4564 100644
+index a3d85da..7ce4a7c 100644
 --- a/sevenn/calculator.py
 +++ b/sevenn/calculator.py
 @@ -35,6 +35,9 @@ class SevenNetCalculator(Calculator):
@@ -126,7 +126,32 @@ index a3d85da..81d4564 100644
  
              self.type_map = cp.config[KEY.TYPE_MAP]
              self.cutoff = cp.config[KEY.CUTOFF]
-@@ -244,6 +272,7 @@ class SevenNetD3Calculator(SumCalculator):
+@@ -146,6 +174,7 @@ class SevenNetCalculator(Calculator):
+             self.sevennet_config = sevennet_config
+ 
+         self.model = model_loaded
++        self.enable_jet = enable_jet  # also: the neighbour list on the GPU (calculate)
+         if self.compute_atomic_virial:
+             force_output = self.model._modules.get('force_output')
+             if force_output is None or not hasattr(
+@@ -222,9 +251,13 @@ class SevenNetCalculator(Calculator):
+         Calculator.calculate(self, atoms, properties, system_changes)
+         if atoms is None:
+             raise ValueError('No atoms to evaluate')
+-        data = AtomGraphData.from_numpy_dict(
+-            unlabeled_atoms_to_graph(atoms, self.cutoff, with_shift=False)
+-        )
++        graph = None
++        if self.enable_jet:
++            from sevenn.nn.jet_helper import ase_graph
++            graph = ase_graph(atoms, self.cutoff, self.device)
++        if graph is None:
++            graph = unlabeled_atoms_to_graph(atoms, self.cutoff, with_shift=False)
++        data = AtomGraphData.from_numpy_dict(graph)
+         if self.modal:
+             data[KEY.DATA_MODALITY] = self.modal
+ 
+@@ -244,6 +277,7 @@ class SevenNetD3Calculator(SumCalculator):
          enable_cueq: bool = False,
          enable_flash: bool = False,
          enable_oeq: bool = False,
@@ -134,7 +159,7 @@ index a3d85da..81d4564 100644
          sevennet_config: Optional[Any] = None,
          damping_type: str = 'damp_bj',
          functional_name: str = 'pbe',
-@@ -275,6 +304,8 @@ class SevenNetD3Calculator(SumCalculator):
+@@ -275,6 +309,8 @@ class SevenNetD3Calculator(SumCalculator):
              if True, use flashTP backend.
          enable_oeq: bool, default=False
              if True, use OpenEquivariance backend.
@@ -143,7 +168,7 @@ index a3d85da..81d4564 100644
          sevennet_config: dict | None, default=None
              hold meta information
          damping_type: str, default='damp_bj'
-@@ -309,6 +340,7 @@ class SevenNetD3Calculator(SumCalculator):
+@@ -309,6 +345,7 @@ class SevenNetD3Calculator(SumCalculator):
              enable_cueq=enable_cueq,
              enable_flash=enable_flash,
              enable_oeq=enable_oeq,
@@ -692,10 +717,10 @@ index f60fb75..86f2fe2 100644
          local_features = node_features
 diff --git a/sevenn/nn/jet_helper.py b/sevenn/nn/jet_helper.py
 new file mode 100644
-index 0000000..8d08554
+index 0000000..14abc74
 --- /dev/null
 +++ b/sevenn/nn/jet_helper.py
-@@ -0,0 +1,598 @@
+@@ -0,0 +1,625 @@
 +"""jet backend: one fused CUDA kernel per convolution layer (Bessel * cutoff
 ++ radial MLP + spherical harmonics + uvu tensor product + scatter).
 +
@@ -712,6 +737,7 @@ index 0000000..8d08554
 +from typing import Final, List, Optional, Tuple
 +
 +import e3nn.util.jit
++import numpy as np
 +import torch
 +import torch.nn as nn
 +import torch.nn.functional as F
@@ -758,6 +784,32 @@ index 0000000..8d08554
 +        raise ImportError('jet is not available')
 +
 +    return wrapper
++
++
++def ase_graph(atoms, cutoff: float, device):
++    """sevenn.train.dataload.unlabeled_atoms_to_graph with the neighbour list built on the GPU
++    (jet_mlip.neighbors: matscipy's pairs): the same dict, edge_index and the fp64 edge_vec as
++    tensors on `device`. None if that list is not available (CPU, JET_ASE_GPU_NL=0, a jet_mlip
++    without it): the caller takes unlabeled_atoms_to_graph."""
++    try:
++        from jet_mlip import neighbors
++    except ImportError:
++        return None
++    if not neighbors.available(device):
++        return None
++    pos, z, cell = atoms.get_positions(), atoms.get_atomic_numbers(), np.array(atoms.get_cell())
++    x = torch.as_tensor(pos, device=device)
++    i, j, shift = neighbors.neighbor_list(x, cell, atoms.get_pbc(), cutoff)
++    return {
++        KEY.NODE_FEATURE: z,
++        KEY.ATOMIC_NUMBERS: z,
++        KEY.POS: pos,
++        KEY.EDGE_IDX: torch.stack([i, j]),
++        KEY.EDGE_VEC: x[j] - x[i] + shift.double() @ torch.as_tensor(cell, device=device),
++        KEY.CELL_VOLUME: np.array(atoms.cell.volume),
++        KEY.NUM_ATOMS: np.array(len(z)),
++        KEY.INFO: {},
++    }
 +
 +
 +@compile_mode('script')
@@ -4261,10 +4313,18 @@ index 3912b41..33614b9 100644
 +  return cutoff;
 +}
 diff --git a/sevenn/pair_e3gnn/pair_e3gnn.h b/sevenn/pair_e3gnn/pair_e3gnn.h
-index 038d5ca..c933e64 100644
+index 038d5ca..f5d813b 100644
 --- a/sevenn/pair_e3gnn/pair_e3gnn.h
 +++ b/sevenn/pair_e3gnn/pair_e3gnn.h
-@@ -23,6 +23,16 @@ PairStyle(e3gnn, PairE3GNN)
+@@ -13,6 +13,7 @@ See the README file in the top-level LAMMPS directory.
+ 
+ #ifdef PAIR_CLASS
+ PairStyle(e3gnn, PairE3GNN)
++PairStyle(jet/e3gnn, PairE3GNN)
+ 
+ #else
+ 
+@@ -23,6 +24,16 @@ PairStyle(e3gnn, PairE3GNN)
  
  #include <torch/torch.h>
  
@@ -4281,7 +4341,7 @@ index 038d5ca..c933e64 100644
  namespace LAMMPS_NS {
  class PairE3GNN : public Pair {
  private:
-@@ -33,12 +43,69 @@ private:
+@@ -33,12 +44,69 @@ private:
    int nelements;
    bool print_info = false;
  
@@ -4352,7 +4412,7 @@ index 038d5ca..c933e64 100644
  
    void settings(int, char **);
    // read Atom type string from input script & related coeff
-@@ -47,6 +114,7 @@ public:
+@@ -47,6 +115,7 @@ public:
  
    void init_style();
    double init_one(int, int);
@@ -4558,10 +4618,18 @@ index b8f49e4..43cd2af 100644
    std::vector<long> &idx_map = comm_index_unpack_forward[comm_phase];
  
 diff --git a/sevenn/pair_e3gnn/pair_e3gnn_parallel.h b/sevenn/pair_e3gnn/pair_e3gnn_parallel.h
-index 2ddf783..6531348 100644
+index 2ddf783..a8d7d0f 100644
 --- a/sevenn/pair_e3gnn/pair_e3gnn_parallel.h
 +++ b/sevenn/pair_e3gnn/pair_e3gnn_parallel.h
-@@ -45,6 +45,11 @@ private:
+@@ -13,6 +13,7 @@ See the README file in the top-level LAMMPS directory.
+ 
+ #ifdef PAIR_CLASS
+ PairStyle(e3gnn/parallel, PairE3GNNParallel)
++PairStyle(jet/e3gnn/parallel, PairE3GNNParallel)
+ 
+ #else
+ 
+@@ -45,6 +46,11 @@ private:
    void comm_preprocess();
    bool comm_preprocess_done = false;
  

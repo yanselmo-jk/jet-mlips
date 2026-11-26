@@ -31,6 +31,7 @@ from nequip.integrations.lammps_mliap.lmp_mliap_wrapper import (  # noqa: E402
 from nequip.model.saved_models.load_utils import _get_model_file_path  # noqa: E402
 from nequip.train.lightning import _SOLE_MODEL_KEY  # noqa: E402
 
+from jet_nequip import convert  # noqa: E402
 from jet_nequip.mliap import NequIPGraphMLIAPWrapper  # noqa: E402
 from tests import lammps_stub  # noqa: E402
 
@@ -110,6 +111,9 @@ def test_graph_matches_eager(name, model_path, monkeypatch):
     # one rank: node rows are exactly nlocal and no layer runs upstream's ghost exchange
     assert graph.key[1] == len(atoms)
     assert not any(type(m).__name__ == 'LAMMPSMLIAPGhostExchangeModule' for m in graph.model.modules())
+    # ... and every block runs as four jet ops: the packaged model's own block forward passed the probe
+    forwards = [type(m).forward for m in graph.model.modules() if type(m).__name__ == 'InteractionBlock']
+    assert forwards and all(f is convert._local_forward for f in forwards)
 
 
 def test_save_load_round_trip(tmp_path, model_path):

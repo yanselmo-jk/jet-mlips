@@ -10,6 +10,7 @@ upstream eager path. A failed capture raises.
 import argparse
 import copy
 import os
+import sys
 
 import torch
 
@@ -90,6 +91,12 @@ class SevenNetGraphMLIAPWrapper(GraphMLIAP, SevenNetMLIAPWrapper):
         self.graph_forces(lmp_data)
 
 
+E3GNN_HINT = ('WARNING: for SevenNet models pair_style jet/e3gnn (= e3gnn) is faster than ML-IAP at every size measured (H200, '
+              'nano-6.0 / 7net-0 / omni, 512-32768 atoms; e.g. nano-6.0 Si 512 atoms 0.55 vs 0.77 ms/step). Recommended: '
+              '`sevenn get_model <model> --enable_jet -o model.pt`, `pair_style jet/e3gnn`, LAMMPS built with SEVENN=1 '
+              '(README, "SevenNet\'s own pair style").')
+
+
 def main(args=None):
     parser = argparse.ArgumentParser(description='Create a SevenNet LAMMPS ML-IAP file (jet + CUDA-graph wrapper).')
     parser.add_argument('model_path', help='checkpoint path or pretrained name (e.g. 7net-0)')
@@ -101,6 +108,7 @@ def main(args=None):
     parser.add_argument('--no-jet', action='store_true', help='e3nn convolutions instead of jet (A/B)')
     parser.add_argument('--no-graph', action='store_true', help='plain upstream wrapper instead of CUDA-graph replay')
     args = parser.parse_args(args=args)
+    print(E3GNN_HINT, file=sys.stderr)
 
     kw = dict(modal=args.modal, use_jet=not args.no_jet, exact_backward=args.exact_backward)
     if args.radial_table is not None:

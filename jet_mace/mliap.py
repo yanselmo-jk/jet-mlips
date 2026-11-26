@@ -1,6 +1,6 @@
 """LAMMPS ML-IAP wrapper for jet_mace-patched MACE models on the shared graph path (jet_mlip/mliap.py: ghost fold,
 padding masked out of the conv CSR, CUDA-graph replay). JET_MACE_CUDA_GRAPH=0 or CPU -> the upstream eager path.
-JET_MACE_COMPILE=0 -> no torch.compile. A failed capture raises.
+JET_MACE_COMPILE=0 -> no torch.compile; both are read when LAMMPS runs. A failed capture raises.
 One rank: the fold leaves no ghost row, so the model runs without a LAMMPS class on exactly nlocal rows: no per-layer
 exchange copy, and no row truncation, whose backward zero-fills and copies every message tensor (0.4 of 10.6 ms per
 step, MP-0 medium, 5632 atoms).
@@ -24,9 +24,6 @@ class LAMMPS_MLIAP_MACE_Graph(GraphMLIAP, LAMMPS_MLIAP_MACE):
 
     def __init__(self, model, **kwargs):
         super().__init__(model, **kwargs)
-        if os.environ.get('JET_MACE_COMPILE', '1') != '0':   # inductor fuses the elementwise / layout glue between the cuEq ops
-            torch._dynamo.config.recompile_limit = 64      # (static shapes: one compile per capture key, then replayed)
-            self.model.model = torch.compile(self.model.model, dynamic=False)
         self.r_max = float(model.r_max)
 
     def _alloc(self, key):
@@ -62,7 +59,8 @@ class LAMMPS_MLIAP_MACE_Graph(GraphMLIAP, LAMMPS_MLIAP_MACE):
             'total_charge': self.model.total_charge,
             'total_spin': self.model.total_spin,
         }
-        convert.CSR, skip.NODES = (self.s_rowptr, self.s_perm), (self.s_z, self.s_one, self.s_zperm)
+        convert.CSR, convert.SPECIES = (self.s_rowptr, self.s_perm), self.s_types
+        skip.NODES = (self.s_z, self.s_one, self.s_zperm)
         try:
             # call the inner model: the wrapper's forward adds compute_edge_forces=True, whose grad() consumes the graph
             # the shared step still needs for dE/d vec
@@ -70,7 +68,7 @@ class LAMMPS_MLIAP_MACE_Graph(GraphMLIAP, LAMMPS_MLIAP_MACE):
                                     compute_stress=False, compute_displacement=False,
                                     compute_edge_forces=False, lammps_mliap=True)['node_energy']
         finally:
-            convert.CSR = skip.NODES = None
+            convert.CSR = convert.SPECIES = skip.NODES = None
 
     def graph_forces(self, lmp_data):
         try:
@@ -91,6 +89,11 @@ class LAMMPS_MLIAP_MACE_Graph(GraphMLIAP, LAMMPS_MLIAP_MACE):
             # at run time (the wrapper is pickled at deploy; v0.2.1 pickles lack the shared-path attributes)
             self.r_cut, self.vec_dtype, self.index_dtype = self.r_max, self.dtype, torch.int64
             self.use_graph = os.environ.get('JET_MACE_CUDA_GRAPH', '1') != '0'
+            inner = getattr(self.model.model, '_orig_mod', self.model.model)   # pickles up to v0.5.0: compiled at deploy
+            if os.environ.get('JET_MACE_COMPILE', '1') != '0':   # inductor fuses the elementwise / layout glue between the cuEq ops
+                torch._dynamo.config.recompile_limit = 64      # (static shapes: one compile per capture key, then replayed)
+                inner = torch.compile(inner, dynamic=False)
+            self.model.model = inner
         if self.device.type != 'cuda' or not self.use_graph:
             return super().compute_forces(data)
         self.step += 1

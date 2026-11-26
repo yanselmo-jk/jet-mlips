@@ -57,6 +57,25 @@ def test_matches_e3nn(irreps_in, irreps_out, S):
     assert (gx - gref).abs().max() <= 1e-5 * gref.abs().max()
 
 
+@pytest.mark.parametrize('irreps_in,irreps_out,S', CASES)
+def test_out_ir_mul(irreps_in, irreps_out, S):
+    """out_ir_mul: the same numbers as the mul_ir output moved to ir_mul (reference.to_ir_mul), and the same grad x
+    from the gradient handed over in ir_mul."""
+    from jet_mlip.reference import to_ir_mul
+    tp, x, species = make(irreps_in, irreps_out, S, 1000)
+    W, paths = ops.species_linear_weight(tp)
+    args = (species.cuda(), W.float().cuda(), paths, tp.irreps_out.dim)
+    blocks = [(mul, ir.dim) for mul, ir in tp.irreps_out]
+    g = torch.randn(len(x), tp.irreps_out.dim).cuda()
+    xa, xb = x.cuda().requires_grad_(), x.cuda().requires_grad_()
+    a = ops.species_linear(xa, *args)
+    b = ops.species_linear(xb, *args, out_ir_mul=True)
+    assert torch.equal(to_ir_mul(a.detach(), blocks), b.detach())
+    ga, = torch.autograd.grad(a, xa, g)
+    gb, = torch.autograd.grad(b, xb, to_ir_mul(g, blocks))
+    assert torch.equal(ga, gb)
+
+
 def test_many_node_tiles():
     """Few species, many nodes: several node tiles per species segment (the last one partial) in every tile shape."""
     tp, x, species = make(*CASES[-1][:2], 3, 2777, seed=3)

@@ -69,6 +69,8 @@ class NequIPGraphMLIAPWrapper(GraphMLIAP, NequIPLAMMPSMLIAPWrapper):
             for m in self.model.modules():
                 if type(getattr(m, 'ghost_exchange', None)).__name__ == 'LAMMPSMLIAPGhostExchangeModule':
                     m.ghost_exchange = _NoExchange()
+            if self.jet:   # ... and no [:num_local] slice either: each block as four jet ops (_step hands over the types)
+                convert.patch_block_forward(self.model)
         if self.compile and os.environ.get('JET_NEQUIP_COMPILE', '1') != '0':   # static shapes: one compile per key
             torch._inductor.config.freezing = 1
             torch._dynamo.config.recompile_limit = 64
@@ -93,10 +95,11 @@ class NequIPGraphMLIAPWrapper(GraphMLIAP, NequIPLAMMPSMLIAPWrapper):
 
     def _step(self):
         convert.CSR = (self.s_rowptr, self.s_perm)
+        convert.TYPES = self.s_types if single_rank() else None   # one rank: every node row is a local atom
         try:
             super()._step()
         finally:
-            convert.CSR = None
+            convert.CSR = convert.TYPES = None
 
     def _forward(self, vec):
         data = {

@@ -1,8 +1,8 @@
-# JET-MLIPs example: SevenNet's own pair_style e3gnn (LAMMPS built with SEVENN=1) with the GPU D3 correction jet/d3,
+# JET-MLIPs example: SevenNet's own pair_style jet/e3gnn (= e3gnn; LAMMPS built with SEVENN=1) with the GPU D3 correction jet/d3,
 # NVT at 300 K on a small LiPF6 EC/EMC electrolyte box (348 atoms, types Li C H O N F S P B).
 #   sevenn get_model 7net-0 --enable_jet -o 7net-0_jet        # writes 7net-0_jet.pt
 #   lmp -in in.sevenn_d3 -var model 7net-0_jet.pt
-# Without D3: pair_style e3gnn and pair_coeff * * ${model} Li C H O N F S P B.
+# Without D3: pair_style jet/e3gnn and pair_coeff * * ${model} Li C H O N F S P B.
 units           metal
 atom_style      atomic
 boundary        p p p
@@ -11,8 +11,8 @@ newton          on
 variable        model index 7net-0_jet.pt
 read_data       electrolyte_348.data
 
-pair_style      hybrid/overlay e3gnn jet/d3 9000 1600 damp_bj pbe
-pair_coeff      * * e3gnn ${model} Li C H O N F S P B
+pair_style      hybrid/overlay jet/e3gnn jet/d3 9000 1600 damp_bj pbe
+pair_coeff      * * jet/e3gnn ${model} Li C H O N F S P B
 pair_coeff      * * jet/d3 Li C H O N F S P B
 
 minimize        1.0e-4 1.0e-6 200 2000      # relax the box for this model first

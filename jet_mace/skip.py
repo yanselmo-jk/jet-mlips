@@ -118,6 +118,7 @@ class SpeciesLinear(torch.nn.Module):
         self.meta = meta   # (in offset, out offset, 2l+1, mul_in, mul_out) per path
         self.n_elements = n_elements
 
+    @torch._dynamo.disable   # one opaque step: else torch.compile puts a compiled copy of x between the Triton launches
     def forward(self, x, node_attrs):
         nodes = NODES
         if nodes is not None and nodes[0].numel() == x.shape[0]:
