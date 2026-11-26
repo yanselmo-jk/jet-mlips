@@ -42,7 +42,8 @@ machine with the same OS and CUDA driver generation, then build there (the kerne
    pip install -e . --no-deps --no-build-isolation
    ```
 
-3. Build LAMMPS from the extracted source folder (the one holding `src/`; a separate copy for `SEVENN=1`).
+3. Build LAMMPS (KOKKOS with CUDA, as `jet/mliap` needs) from the extracted source folder (the one holding `src/`;
+   a separate copy for `SEVENN=1`).
    `OFFLINE=1` skips the pip step (cython and cupy are already in the env):
 
    ```bash

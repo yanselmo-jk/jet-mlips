@@ -42,13 +42,14 @@ How it works: `docs/design.md`.
 Tested torch and CUDA (Python 3.12, g++ 12; each family's tests and forces against the official model, v0.3.1):
 
 
-| torch  | CUDA             | SevenNet | MACE            | NequIP | Nequix | EquFlash |
-| ------ | ---------------- | -------- | --------------- | ------ | ------ | -------- |
-| 2.7.1  | 12.6, 12.8       | yes      | yes             | yes    | yes    | yes      |
-| 2.8.0  | 12.6, 12.8       | yes      | yes (2x slower) | yes    | yes    | yes      |
-| 2.9.1  | 12.6, 12.8, 13.0 | yes      | yes (2x slower) | yes    | yes    | yes      |
-| 2.10.0 | 12.6, 12.8, 13.0 | yes      | yes (2x slower) | yes    | yes    | yes      |
-| 2.11.0 | 12.6, 12.8, 13.0 | yes      | yes (2x slower) | yes    | yes    | yes      |
+| torch          | CUDA             | SevenNet | MACE             | NequIP | Nequix | EquFlash |
+| -------------- | ---------------- | -------- | ---------------- | ------ | ------ | -------- |
+| 2.7.1          | 12.6, 12.8       | yes      | yes              | yes    | yes    | yes      |
+| 2.8.0          | 12.6, 12.8       | yes      | yes (~2% slower) | yes    | yes    | yes      |
+| 2.9.1 - 2.11.0 | 12.6, 12.8, 13.0 | yes      | yes (~2% slower) | yes    | yes    | yes      |
+
+MACE on torch >= 2.8: torch.compile does not run with e3nn 0.4.4, so the model runs uncompiled (2.2% slower on torch 2.11,
+MACE-MP-0 medium, 5632 atoms, H200).
 
 
 - LAMMPS (optional): cmake and, for several GPUs, an MPI (tested Open MPI 4.1 and 5.0). `lammps/build_lammps.sh`
@@ -69,15 +70,15 @@ python -m common.patch_tool mace     # MACE only
 
 - `JET_CONFIGS`: the model families whose kernels are compiled. `all` (default) builds every family; a comma list
 builds only those, e.g. `JET_CONFIGS=mace` or `JET_CONFIGS=sevenn,nequip` (names: `sevenn`, `mace`, `nequip`,
-`nequix`, `equflash`). Each family covers all its supported models. Rebuild with the same value.
-- Build time and memory (measured on an H200 server with `MAX_JOBS=32`): `all` about 5 min, `mace` about 1.5 min.
-The largest kernel needs about 7 GB RAM per compile job (`mace` only: 3 GB), so total RAM grows with `MAX_JOBS`.
-Compiler out of memory: use `MAX_JOBS=1 JET_LOW_RAM=1`.
+`nequix`, `equflash`).
 - `JET_CUDA_ARCH`: your GPU's compute capability without the dot (8.9 -&gt; `89`); look it up at
 [https://developer.nvidia.com/cuda/gpus](https://developer.nvidia.com/cuda/gpus).
 - The build belongs to the env's torch: use one checkout per env and run from it.
-- Patch (SevenNet and MACE only, once per env): they call JET from inside the installed package, for ASE and LAMMPS
-alike; the other three are rewritten after loading. Patches take `--check` (dry run) and `--reverse` (undo).
+
+### Offline machines
+
+Nothing in JET needs the network: give local files instead of names and downloads. Step by step:
+`docs/offline-installation.md`.
 
 ## 3. Use
 
@@ -150,7 +151,7 @@ in Å (defaults: those of `jet/d3 9000 1600`). Energy, forces and stress (stress
 
 ```bash
 conda activate <env>
-bash lammps/build_lammps.sh              # installs `lmp` into this env: pair_style jet/mliap (ML-IAP), jet/d3
+bash lammps/build_lammps.sh              # installs `lmp` into this env (KOKKOS, CUDA): pair_style jet/mliap (ML-IAP), jet/d3
 SEVENN=1 bash lammps/build_lammps.sh     # instead: the same plus SevenNet's pair_style jet/e3gnn (= e3gnn)
 ```
 
@@ -221,7 +222,7 @@ pair_coeff * * jet/mliap Li C H O N F S P B
 pair_coeff * * jet/d3 Li C H O N F S P B
 ```
 
-`jet/d3 <r_cut^2> <CN r_cut^2> <damping> <functional>` (squared cut-offs in bohr^2) 
+`jet/d3 <r_cut²> <CN r_cut²> <damping> <functional>` (squared cut-offs in bohr²)
 
 &lt;damping&gt;:`damp_zero` or `damp_bj`
 
@@ -242,11 +243,6 @@ pair_coeff * * model.pt Li C H O N F S P B
 ```bash
 lmp -in in.lammps
 ```
-
-### Offline machines
-
-Nothing in JET needs the network: give local files instead of names and downloads. Step by step:
-`docs/offline-installation.md`.
 
 ## 4. Check and test
 
