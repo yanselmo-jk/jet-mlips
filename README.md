@@ -248,28 +248,14 @@ lmp -in in.lammps
 Nothing in JET needs the network: give local files instead of names and downloads. Step by step:
 `docs/offline-installation.md`.
 
-## 4. Limits
-
-- Multi-GPU: one node only. Two multi-GPU runs on one node: give each its own port, `mpirun -x MASTER_PORT=29541 ...`.
-- EquFlash V2 runs without the CUDA graph (slower than v1).
-- Not supported: MACE-OMOL, 7net-l3i5.
-- Training is not supported. The SevenNet / MACE train-mode path (tp3 kernels) is built only with
-`JET_TRAIN=1` and is not maintained here.
-- A model with a layer shape JET was not built for stops with `jet: config not compiled: <shape>`. Add its shapes
-and rebuild (any family):
-  ```bash
-  python -m jet_mlip.shapes <family> <model> --apply   # <model> as for deploy; appends the missing shapes to jet_mlip/configs.py
-  JET_CONFIGS=all JET_CUDA_ARCH=90 MAX_JOBS=4 pip install -e jet_mlip --no-build-isolation   # rebuild (section 2, same JET_CONFIGS)
-  ```
-
-## 5. Check and test
+## 4. Check and test
 
 ```bash
 python -m pytest tests/<family>_jet       # in that family's env, GPU
 python -m pytest jet_mlip/tests            # kernel and shared LAMMPS wrapper
 ```
 
-## 6. Update
+## 5. Update
 
 ```bash
 python -m common.patch_tool mace --reverse; python -m jet_mlip.patch_sevenn --reverse
@@ -289,6 +275,20 @@ v0.5.0
 - The layers around the convolution optimized.
 - LAMMPS: `pair_style jet/mliap` (= `mliap unified <file> 0`) and `jet/e3gnn` (= SevenNet's `e3gnn`).
 - ASE: the neighbour list is built on the GPU (SevenNet, MACE, NequIP, Nequix).
+
+## Limits
+
+- Multi-GPU: one node only. Two multi-GPU runs on one node: give each its own port, `mpirun -x MASTER_PORT=29541 ...`.
+- EquFlash V2 runs without the CUDA graph (slower than v1).
+- Not supported: MACE-OMOL, 7net-l3i5.
+- Training is not supported. The SevenNet / MACE train-mode path (tp3 kernels) is built only with
+`JET_TRAIN=1` and is not maintained here.
+- A model with a layer shape JET was not built for stops with `jet: config not compiled: <shape>`. Add its shapes
+and rebuild (any family):
+  ```bash
+  python -m jet_mlip.shapes <family> <model> --apply   # <model> as for deploy; appends the missing shapes to jet_mlip/configs.py
+  JET_CONFIGS=all JET_CUDA_ARCH=90 MAX_JOBS=4 pip install -e jet_mlip --no-build-isolation   # rebuild (section 2, same JET_CONFIGS)
+  ```
 
 ## License
 
