@@ -62,9 +62,11 @@ grep -q "mliap:fill" src/KOKKOS/pair_mliap_kokkos.cpp || git apply -C1 "$HERE/$H
 grep -q "mliap-accel: neighdata" src/KOKKOS/mliap_data_kokkos.cpp || git apply -C1 "$HERE/lammps_mliap_kokkos_neighdata.patch"
 # ML-IAP global virial by reduction instead of 6 atomics contended by every pair (3.07M pairs, H200: 27 -> 0.32 ms per call)
 grep -q "mliap-accel: virial reduce" src/KOKKOS/mliap_unified_kokkos.cpp || git apply -C1 "$HERE/lammps_mliap_kokkos_virial.patch"
+# `pair_style jet/mliap <model.pt>` (= `mliap unified <model.pt> 0`), KOKKOS only: the JET ML-IAP models need Kokkos device data
+grep -q "PairJetMLIAPKokkos" src/KOKKOS/pair_mliap_kokkos.h || git apply -C1 "$HERE/lammps_mliap_kokkos_jet_style.patch"
 
 # GPU D3 pair style jet/d3 (jet_d3/, custom BJ parameters): D3=1 copies the sources and appends
-# one CMake block (once). `pair_style hybrid/overlay mliap unified m.pt 0 jet/d3 9000 1600 damp_bj custom s6 s8 a1 a2`.
+# one CMake block (once). `pair_style hybrid/overlay jet/mliap m.pt jet/d3 9000 1600 damp_bj custom s6 s8 a1 a2`.
 if [ "${D3:-1}" = 1 ]; then
   cp "$HERE/../jet_d3/pair_jet_d3.cu" "$HERE/../jet_d3/pair_jet_d3.h" "$HERE/../jet_d3/pair_jet_d3_pars.h" src/
   grep -q 'mlip-accel: pair_jet_d3' cmake/CMakeLists.txt || cat >> cmake/CMakeLists.txt <<'CM'

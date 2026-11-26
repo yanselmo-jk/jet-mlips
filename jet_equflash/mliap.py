@@ -19,6 +19,7 @@ import torch
 from torch_geometric.data import Batch
 
 from common.radial_table import DEFAULT_N
+from jet_mlip import ops
 from jet_mlip.mliap import GraphMLIAP, single_rank
 
 try:
@@ -64,6 +65,8 @@ class EquFlashMLIAPWrapper(GGNNLAMMPSMLIAPWrapper):
 
 
 class EquFlashJetMLIAPWrapper(GraphMLIAP, GGNNLAMMPSMLIAPWrapper):
+    pad_nodes = False   # one rank: node rows = nlocal (padding edges sit on local rows, masked out of the CSR)
+
     def __init__(self, ckpt_path: str, radial_table: int = DEFAULT_N):
         super().__init__(ckpt_path)
         self.radial_table = radial_table
@@ -73,12 +76,33 @@ class EquFlashJetMLIAPWrapper(GraphMLIAP, GGNNLAMMPSMLIAPWrapper):
         nlocal, ncap = key[0], key[1]
         self.s_num_atoms = torch.tensor([nlocal, ncap - nlocal], dtype=torch.int64, device=self.device)
         self.s_natoms = torch.tensor(nlocal, dtype=torch.int64, device=self.device)
+        self.s_rowptr = torch.zeros(ncap + 1, dtype=torch.int32, device=self.device)
+        self.s_perm = torch.zeros(key[2], dtype=torch.int32, device=self.device)
+        local = not key[4]   # one rank: no ghost row is left, so no layer exchanges or slices its input
+        for m in self.model.modules():
+            if hasattr(type(m), 'local_only'):
+                m.local_only = local
+
+    def _prep(self):
+        """The convolutions' CSR (dst = edge_index row 0) belongs to the pair list: once per list, not per layer."""
+        super()._prep()
+        ops.EDGE_MASK = self.s_mask
+        try:
+            rowptr, perm = ops.build_csr(self.s_ei[0], self.key[1])
+        finally:
+            ops.EDGE_MASK = None
+        self.s_rowptr.copy_(rowptr)
+        self.s_perm.copy_(perm)
 
     def _forward(self, vec):
         nlocal = self.key[0]
         batch = Batch(edge_vec=vec, atomic_numbers=self.s_types[:nlocal], edge_index=self.s_ei,
                       num_atoms=self.s_num_atoms, natoms=self.s_natoms, lmp_data=self.lmp_stand_in)
-        return self.model(batch)['atomic_energy']
+        convert.CSR = (self.s_rowptr, self.s_perm)
+        try:
+            return self.model(batch)['atomic_energy']
+        finally:
+            convert.CSR = None
 
     def compute_forces(self, lmp_data):
         if self.model is None:

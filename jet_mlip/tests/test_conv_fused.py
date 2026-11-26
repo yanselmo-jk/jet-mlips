@@ -203,8 +203,8 @@ def test_capacity_tail_rows(split):
 @pytest.mark.parametrize('cfg', [_param(CFGS[1], 'nano-L1'), _param(NET0_L1, 'net0-L1')])
 @pytest.mark.parametrize('table', [False, True])
 def test_denominator_in_kernel(cfg, table):
-    """fp32: denominator divided inside the kernel == op(denom=1) then torch out.div(denom), bitwise
-    (forward and grad_vec; grad_x is an atomic sum, not compared)."""
+    """fp32: denominator divided inside the kernel == op(denom=1) then torch out.div(denom): the forward bitwise,
+    grad_vec to rounding (grad_x is an atomic sum, not compared)."""
     t, _, n_out = random_case(cfg, n=40, seed=6, n_out=35)
     x, vec, src, dst, w1, w2, w3, coeffs = [v.float() if v.is_floating_point() else v for v in t]
     vec.requires_grad_(True)
@@ -219,7 +219,9 @@ def test_denominator_in_kernel(cfg, table):
     a, b = f(1.0).div(d), f(float(d))
     assert torch.equal(a, b)
     gout = torch.randn(a.shape, generator=torch.Generator().manual_seed(8)).to(DEV)
-    assert torch.equal(torch.autograd.grad(a, vec, gout)[0], torch.autograd.grad(b, vec, gout)[0])
+    # the path groups add into an edge's row in any order (atomics; with one block per SM they overlap in time)
+    ga, gb = (torch.autograd.grad(o, vec, gout)[0] for o in (a, b))
+    assert (ga - gb).abs().max() <= 1e-6 * ga.abs().max(), ((ga - gb).abs().max(), ga.abs().max())
 
 
 def test_backward_without_grad_x():
@@ -291,7 +293,9 @@ def test_table_idx_3d_identical(cfg):
                              table=tab, table_idx=idx)
         res.append((out,) + torch.autograd.grad(out, (xx, vv), gout))
     for a, b in zip(*res):
-        assert torch.allclose(a, b, atol=1e-6, rtol=1e-6), (a - b).abs().max()
+        # the path groups add into a row in any order (atomics; with one block per SM they overlap in time): the
+        # rounding of that sum, relative to the largest term
+        assert torch.allclose(a, b, atol=1e-6 * b.abs().max().item(), rtol=1e-5), (a - b).abs().max()
 
 
 def test_table_rank_mismatch():

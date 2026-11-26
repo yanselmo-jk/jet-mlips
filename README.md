@@ -150,7 +150,7 @@ in Å (defaults: those of `jet/d3 9000 1600`). Energy, forces and stress (stress
 
 ```bash
 conda activate <env>
-bash lammps/build_lammps.sh              # installs `lmp` into this env: pair_style mliap unified, jet/d3
+bash lammps/build_lammps.sh              # installs `lmp` into this env: pair_style jet/mliap (ML-IAP), jet/d3
 SEVENN=1 bash lammps/build_lammps.sh     # instead: the same plus SevenNet's pair_style e3gnn
 ```
 
@@ -193,10 +193,13 @@ official `mace_create_lammps_model <model> --format mliap` instead.
 **3. Run:**
 
 ```
-pair_style mliap unified medium_jet.pt 0        # any deployed file
+pair_style jet/mliap medium_jet.pt              # any deployed file
 pair_coeff * * Li C H O N F S P B               # elements in LAMMPS type order
 thermo_style custom step pe temp                # keep a model quantity in the thermo output
 ```
+
+`jet/mliap` is `mliap unified <file> 0` (which still works) on KOKKOS only: run with `-k on g N -sf kk`; without KOKKOS
+the style does not exist.
 
 ```bash
 lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in in.lammps
@@ -223,8 +226,8 @@ Worth it from ~50k atoms per GPU (3 H200: 360k atoms 1.9-2.2x faster).
 **D3 dispersion** (every family): `pair_style jet/d3` on the GPU, overlaid on the model.
 
 ```
-pair_style hybrid/overlay mliap unified medium_jet.pt 0 jet/d3 9000 1600 damp_bj pbe
-pair_coeff * * mliap Li C H O N F S P B
+pair_style hybrid/overlay jet/mliap medium_jet.pt jet/d3 9000 1600 damp_bj pbe
+pair_coeff * * jet/mliap Li C H O N F S P B
 pair_coeff * * jet/d3 Li C H O N F S P B
 ```
 

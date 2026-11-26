@@ -1,6 +1,9 @@
 """LAMMPS ML-IAP wrapper for jet_mace-patched MACE models on the shared graph path (jet_mlip/mliap.py: ghost fold,
-padding masked out of the conv CSR, CUDA-graph replay). Single MPI rank; JET_MACE_CUDA_GRAPH=0 or CPU -> the upstream
-eager path. JET_MACE_COMPILE=0 -> no torch.compile. A failed capture raises.
+padding masked out of the conv CSR, CUDA-graph replay). JET_MACE_CUDA_GRAPH=0 or CPU -> the upstream eager path.
+JET_MACE_COMPILE=0 -> no torch.compile. A failed capture raises.
+One rank: the fold leaves no ghost row, so the model runs without a LAMMPS class on exactly nlocal rows: no per-layer
+exchange copy, and no row truncation, whose backward zero-fills and copies every message tensor (0.4 of 10.6 ms per
+step, MP-0 medium, 5632 atoms).
 """
 import os
 
@@ -10,16 +13,41 @@ import torch.nn.functional as F
 os.environ.setdefault('TORCHINDUCTOR_CACHE_DIR', os.path.expanduser('~/.cache/torchinductor'))   # /tmp is a small tmpfs here
 from mace.calculators.lammps_mliap_mace import LAMMPS_MLIAP_MACE
 
+from jet_mlip import ops
 from jet_mlip.mliap import GraphMLIAP
+
+from . import convert, skip
 
 
 class LAMMPS_MLIAP_MACE_Graph(GraphMLIAP, LAMMPS_MLIAP_MACE):
+    pad_nodes = False
+
     def __init__(self, model, **kwargs):
         super().__init__(model, **kwargs)
         if os.environ.get('JET_MACE_COMPILE', '1') != '0':   # inductor fuses the elementwise / layout glue between the cuEq ops
             torch._dynamo.config.recompile_limit = 64      # (static shapes: one compile per capture key, then replayed)
             self.model.model = torch.compile(self.model.model, dynamic=False)
         self.r_max = float(model.r_max)
+
+    def _alloc(self, key):
+        super()._alloc(key)
+        i32 = dict(dtype=torch.int32, device=self.device)
+        self.s_rowptr, self.s_perm = torch.zeros(key[1] + 1, **i32), torch.zeros(key[2], **i32)
+        self.s_z, self.s_zperm = torch.zeros(key[1], **i32), torch.zeros(key[1], **i32)
+        self.s_one = torch.ones(key[1], dtype=self.dtype, device=self.device)
+
+    def _prep(self):
+        """Per pair list, not per step and layer: the conv CSR and the species order of the skip connections."""
+        super()._prep()
+        ops.EDGE_MASK = self.s_mask
+        try:
+            rowptr, perm = ops.build_csr(self.s_ei[0], self.key[1])
+        finally:
+            ops.EDGE_MASK = None
+        self.s_rowptr.copy_(rowptr)
+        self.s_perm.copy_(perm)
+        self.s_z.copy_(self.s_types)
+        self.s_zperm.copy_(torch.argsort(self.s_z, stable=True))   # int32 keys: half the radix passes of int64
 
     def _forward(self, vec):
         nlocal = self.key[0]
@@ -28,17 +56,21 @@ class LAMMPS_MLIAP_MACE_Graph(GraphMLIAP, LAMMPS_MLIAP_MACE):
             'node_attrs': F.one_hot(self.s_types, self.num_species).to(self.dtype),
             'edge_index': torch.stack([self.s_ei[1], self.s_ei[0]]),
             'batch': torch.zeros(nlocal, dtype=torch.int64, device=self.device),
-            'lammps_class': self.lmp_stand_in,
+            'lammps_class': self.lmp_stand_in if self.key[4] else None,   # several ranks: remote rows, exchanged per layer
             'natoms': self.nlg,
             'head': self.model.head,
             'total_charge': self.model.total_charge,
             'total_spin': self.model.total_spin,
         }
-        # call the inner model: the wrapper's forward adds compute_edge_forces=True, whose grad() consumes the graph
-        # the shared step still needs for dE/d vec
-        return self.model.model(batch, training=False, compute_force=False, compute_virials=False,
-                                compute_stress=False, compute_displacement=False,
-                                compute_edge_forces=False, lammps_mliap=True)['node_energy']
+        convert.CSR, skip.NODES = (self.s_rowptr, self.s_perm), (self.s_z, self.s_one, self.s_zperm)
+        try:
+            # call the inner model: the wrapper's forward adds compute_edge_forces=True, whose grad() consumes the graph
+            # the shared step still needs for dE/d vec
+            return self.model.model(batch, training=False, compute_force=False, compute_virials=False,
+                                    compute_stress=False, compute_displacement=False,
+                                    compute_edge_forces=False, lammps_mliap=True)['node_energy']
+        finally:
+            convert.CSR = skip.NODES = None
 
     def graph_forces(self, lmp_data):
         try:

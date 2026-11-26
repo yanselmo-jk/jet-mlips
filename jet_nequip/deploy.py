@@ -1,4 +1,4 @@
-"""Deploy a NequIP model for LAMMPS ML-IAP (`pair_style mliap unified <out> 0`) with the jet_nequip fused
+"""Deploy a NequIP model for LAMMPS ML-IAP (`pair_style jet/mliap <out>`) with the jet_nequip fused
 convolution and CUDA-graph replay. The upstream `create_lmp_mliap_file.py` body, plus `--radial_table`, `--no-jet`
 (official modifiers only, unpatched, for A/B) and `--no-graph` (upstream compile path: dynamic=True, no graph).
 

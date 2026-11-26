@@ -1167,9 +1167,11 @@ Args<T> make_args(const at::Tensor& x, const at::Tensor& vec, const at::Tensor& 
   return a;
 }
 
+// One block per SM as soon as there is a node for each (nodes are handed out per warp): with fewer than 8 nodes per SM
+// the warps of ceil(n_out / 8) full blocks shared half of the SMs (512 atoms: 64 blocks on 132 SMs).
 inline int grid_for(int n_out) {
   const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-  return std::max(1, std::min(sms, (n_out + WARPS - 1) / WARPS));
+  return std::max(1, std::min(sms, n_out));
 }
 
 template <class T, class Cfg, int EPL, bool BWD, bool TABLE>

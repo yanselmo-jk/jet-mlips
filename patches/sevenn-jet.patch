@@ -610,7 +610,7 @@ index 513d55c..365f72b 100644
  
          # infer
 diff --git a/sevenn/model_build.py b/sevenn/model_build.py
-index f0482f1..4ab9ab0 100644
+index f0482f1..67f41cf 100644
 --- a/sevenn/model_build.py
 +++ b/sevenn/model_build.py
 @@ -311,11 +311,14 @@ def patch_cue(layers: OrderedDict, config: Dict[str, Any]) -> OrderedDict:
@@ -630,7 +630,7 @@ index f0482f1..4ab9ab0 100644
      if not flash_helper.is_flash_available():
          warnings.warn(
              (
-@@ -360,11 +363,43 @@ def patch_oeq(layers: OrderedDict, config: Dict[str, Any]) -> OrderedDict:
+@@ -360,11 +363,46 @@ def patch_oeq(layers: OrderedDict, config: Dict[str, Any]) -> OrderedDict:
      return layers
  
  
@@ -660,6 +660,9 @@ index f0482f1..4ab9ab0 100644
 +                str(config.get(KEY.JET_EXACT_BACKWARD, 'split')),
 +                int(t),  # block index: indexes jet_layer_nout (halo pruning)
 +            )
++        elif (glue := jet_helper.patch_glue(module)) is not None:
++            # self-connections, linears, gates: jet_mlip::species_linear / gate in eval mode
++            updates[k] = glue
 +
 +    layers.update(updates)
 +    return layers
@@ -689,10 +692,10 @@ index f60fb75..86f2fe2 100644
          local_features = node_features
 diff --git a/sevenn/nn/jet_helper.py b/sevenn/nn/jet_helper.py
 new file mode 100644
-index 0000000..3f63ce0
+index 0000000..8d08554
 --- /dev/null
 +++ b/sevenn/nn/jet_helper.py
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,598 @@
 +"""jet backend: one fused CUDA kernel per convolution layer (Bessel * cutoff
 ++ radial MLP + spherical harmonics + uvu tensor product + scatter).
 +
@@ -706,7 +709,7 @@ index 0000000..3f63ce0
 +import operator
 +import warnings
 +from copy import deepcopy
-+from typing import List, Optional, Tuple
++from typing import Final, List, Optional, Tuple
 +
 +import e3nn.util.jit
 +import torch
@@ -722,6 +725,9 @@ index 0000000..3f63ce0
 +
 +from .convolution import IrrepsConvolution
 +from .edge_embedding import BesselBasis, EdgeEmbedding, XPLORCutoff
++from .equivariant_gate import EquivariantGate
++from .linear import IrrepsLinear
++from .self_connection import SelfConnectionIntro, SelfConnectionLinearIntro
 +
 +try:
 +    import jet_mlip
@@ -986,6 +992,187 @@ index 0000000..3f63ce0
 +        return data
 +
 +
++class _JetFolded:
++    """Mixin of the jet glue modules: `jet_w` (and `jet_b`) are inference weights folded from the e3nn module's
++    trained ones (non-persistent buffers), built by build_jet_weight(): lazily in eager mode, by
++    optimize_for_inference before deploy; dropped in train mode (the e3nn module runs there). State dict unchanged.
++    Subclasses annotate jet_paths and jet_ready (TorchScript reads the concrete class's annotations only). jet_ready
++    (the weights are built) is Final: a constant when scripted, so a deployed module compiles one branch only and
++    freezing drops the other one's weights (a run-time check on jet_w kept both: 7net-omni deploy 424 -> 342 MB)."""
++
++    def _jet_init(self, src: nn.Module) -> None:
++        nn.Module.__init__(self)
++        assert not src.layer_instantiated, 'already instantiated; cannot patch'
++        self.__dict__.update(deepcopy(src.__dict__))
++        self.jet_paths = []
++        self.jet_dim_out: int = 0
++        self.jet_ready = False
++        self.register_buffer('jet_w', torch.zeros(0), persistent=False)
++        self.register_buffer('jet_b', torch.zeros(0), persistent=False)
++
++    def _jet_fold(self, mod: Optional[nn.Module]):   # -> (W, paths, bias table or None) or None
++        raise NotImplementedError
++
++    @torch.jit.unused
++    def build_jet_weight(self) -> None:
++        """Fill jet_w (jet_b) from the current weights (no-op if built, not fp32, or the op is missing)."""
++        mod = self.fc_tensor_product if isinstance(self, SelfConnectionIntro) else self.linear
++        if self.jet_w.numel() > 0 or mod is None or mod.weight.dtype != torch.float32 \
++                or not jet_ops.has_op('species_linear'):
++            return
++        r = self._jet_fold(mod)
++        if r is not None:
++            self.jet_w, self.jet_paths = r[0].detach().contiguous(), r[1]
++            if len(r) > 2 and r[2] is not None:
++                self.jet_b = r[2].detach().contiguous()
++            self.jet_dim_out = mod.irreps_out.dim
++            self.jet_ready = True
++
++    def train(self, mode: bool = True):
++        if mode:   # derived from the weights: rebuilt on the next eval-mode forward
++            self.jet_ready = False
++            self.jet_w = self.jet_w[:0]
++            self.jet_b = self.jet_b[:0]
++        return super().train(mode)
++
++
++@compile_mode('script')
++class JetSelfConnectionIntro(_JetFolded, SelfConnectionIntro):
++    """'nequip' self-connection: the e3nn TP of x with the one-hot species is one linear map per species and
++    irrep, run as jet_mlip::species_linear in eval mode (fp32 CUDA)."""
++
++    jet_paths: List[int]
++    jet_ready: Final[bool]
++
++    def __init__(self, sc: SelfConnectionIntro) -> None:
++        self._jet_init(sc)
++
++    @torch.jit.unused
++    def _jet_fold(self, mod):
++        return jet_ops.species_linear_weight(mod)
++
++    def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
++        assert self.fc_tensor_product is not None, 'Layer is not instantiated'
++        x = data[self.key_x]
++        operand = data[self.key_operand]
++        if operand.shape[0] != x.shape[0]:
++            # halo pruning: node attributes cover all nodes, x only the live rows
++            operand = operand[: x.shape[0]]
++        if not self.training and not torch.jit.is_scripting() and x.is_cuda:
++            self.build_jet_weight()
++        # scripted: jet_ready is a constant, the e3nn branch is not compiled
++        if self.jet_ready \
++                and (torch.jit.is_scripting() or (x.is_cuda and x.dtype == torch.float32)):
++            if KEY.ATOM_TYPE in data:   # species index, the input of the one-hot
++                species = data[KEY.ATOM_TYPE][: x.shape[0]]
++            else:
++                species = operand.argmax(-1)
++            out = torch.ops.jet_mlip.species_linear(x, species, self.jet_w, self.jet_paths, self.jet_dim_out)
++        else:
++            out = self.fc_tensor_product(x, operand)
++        data[KEY.SELF_CONNECTION_TEMP] = out
++        return data
++
++
++@compile_mode('script')
++class JetSelfConnectionLinearIntro(_JetFolded, SelfConnectionLinearIntro):
++    """'linear' self-connection (e3nn Linear) as jet_mlip::species_linear (one shared weight) in eval mode."""
++
++    jet_paths: List[int]
++    jet_ready: Final[bool]
++
++    def __init__(self, sc: SelfConnectionLinearIntro) -> None:
++        self._jet_init(sc)
++
++    @torch.jit.unused
++    def _jet_fold(self, mod):
++        return jet_ops.linear_weight(mod)
++
++    def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
++        assert self.linear is not None, 'Layer is not instantiated'
++        x = data[self.key_x]
++        if not self.training and not torch.jit.is_scripting() and x.is_cuda:
++            self.build_jet_weight()
++        if self.jet_ready \
++                and (torch.jit.is_scripting() or (x.is_cuda and x.dtype == torch.float32)):
++            out = torch.ops.jet_mlip.species_linear(x, None, self.jet_w, self.jet_paths, self.jet_dim_out)
++        else:
++            out = self.linear(x)
++        data[KEY.SELF_CONNECTION_TEMP] = out
++        return data
++
++
++@compile_mode('script')
++class JetLinear(_JetFolded, IrrepsLinear):
++    """IrrepsLinear (e3nn Linear) as jet_mlip::species_linear (one shared weight) in eval mode on non-batch data;
++    a modal linear's one-hot input block becomes a bias (one_hot(modal) @ jet_b) instead of a cat to x."""
++
++    jet_paths: List[int]
++    jet_ready: Final[bool]
++
++    def __init__(self, lin: IrrepsLinear) -> None:
++        self._jet_init(lin)
++
++    @torch.jit.unused
++    def _jet_fold(self, mod):
++        return jet_ops.linear_weight(mod, self.num_modalities if self.num_modalities > 1 else 0)
++
++    def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
++        assert self.linear is not None, 'Layer is not instantiated'
++        x = data[self.key_input]
++        if not self.training and not torch.jit.is_scripting() and x.is_cuda:
++            self.build_jet_weight()
++        if self.jet_ready and not self._is_batch_data \
++                and (torch.jit.is_scripting() or (x.is_cuda and x.dtype == torch.float32)):
++            bias: Optional[torch.Tensor] = None
++            if self.num_modalities > 1:
++                bias = (data[self.key_modal_attr].reshape(1, -1).to(x.dtype) @ self.jet_b).reshape(-1)
++            data[self.key_output] = torch.ops.jet_mlip.species_linear(
++                x, None, self.jet_w, self.jet_paths, self.jet_dim_out, bias
++            )
++        else:
++            if self.num_modalities > 1:
++                data = self._patch_modal_to_data(data)
++            data[self.key_output] = self.linear(data[self.key_input])
++        return data
++
++
++@compile_mode('script')
++class JetGate(EquivariantGate):
++    """EquivariantGate (e3nn Gate) as jet_mlip::gate in eval mode: one kernel per direction instead of the
++    Extract / activation / elementwise-product / cat chain. Tables are structural (no weights)."""
++
++    def __init__(self, g: EquivariantGate) -> None:
++        nn.Module.__init__(self)
++        self.__dict__.update(deepcopy(g.__dict__))
++        t = jet_ops.gate_tables(self.gate) if jet_ops.has_op('gate') else None
++        for name, v in zip(('jet_fi', 'jet_ff', 'jet_bi', 'jet_bf'), t if t is not None else [torch.zeros(0)] * 4):
++            self.register_buffer(name, v, persistent=False)
++
++    def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
++        x = data[self.key_x]
++        if not self.training and self.jet_fi.numel() > 0 \
++                and (torch.jit.is_scripting() or (x.is_cuda and x.dtype == torch.float32)):
++            data[self.key_x] = torch.ops.jet_mlip.gate(x, self.jet_fi, self.jet_ff, self.jet_bi, self.jet_bf)
++        else:
++            data[self.key_x] = self.gate(x)
++        return data
++
++
++def patch_glue(module: nn.Module) -> Optional[nn.Module]:
++    """jet replacement of an e3nn glue module of the interaction blocks / readout, None to keep it."""
++    t = type(module)
++    if t is SelfConnectionIntro and module.key_operand == KEY.NODE_ATTR:
++        return JetSelfConnectionIntro(module)
++    if t is SelfConnectionLinearIntro:
++        return JetSelfConnectionLinearIntro(module)
++    if t is IrrepsLinear:
++        return JetLinear(module)
++    if t is EquivariantGate:
++        return JetGate(module)
++    return None
++
++
 +# ---- inference-time rewrites of the e3nn glue (forward bitwise identical) ----------------
 +@compile_mode('script')
 +class _Split(nn.Module):
@@ -1057,14 +1244,17 @@ index 0000000..3f63ce0
 +
 +def optimize_for_inference(model: nn.Module) -> nn.Module:
 +    """In-place, for jet inference models (deploy / ASE calculator / ML-IAP): e3nn Linear
-+    input narrows -> split, Gate Extract -> split views. Forward bitwise identical, state_dict
-+    keys unchanged; a module that cannot be rewritten is left as it is."""
++    input narrows -> split, Gate Extract -> split views (forward bitwise identical), and the
++    species_linear weights of the jet self-connections / linears built (fp32 rounding level).
++    state_dict keys unchanged; a module that cannot be rewritten is left as it is."""
 +    for mod in model.modules():
 +        try:
 +            if isinstance(mod, Linear):
 +                _split_linear(mod)
 +            elif isinstance(mod, Gate):
 +                _split_gate(mod)
++            elif isinstance(mod, _JetFolded):
++                mod.build_jet_weight()
 +        except Exception as e:   # pragma: no cover - defensive, the model still works unrewritten
 +            import warnings
 +            warnings.warn(f'jet optimize_for_inference: {type(mod).__name__} left as is ({e})')
@@ -3030,8 +3220,10 @@ index 7fd1010..0000000
 -#endif
 sec_new.patch
 sevenn
+sec_new.patch
+sevenn
 diff --git a/sevenn/pair_e3gnn/pair_e3gnn.cpp b/sevenn/pair_e3gnn/pair_e3gnn.cpp
-index 3912b41..06c5635 100644
+index 3912b41..33614b9 100644
 --- a/sevenn/pair_e3gnn/pair_e3gnn.cpp
 +++ b/sevenn/pair_e3gnn/pair_e3gnn.cpp
 @@ -16,14 +16,27 @@
@@ -3127,7 +3319,7 @@ index 3912b41..06c5635 100644
    // compute
    /*
       This compute function is ispired/modified from stress branch of pair-nequip
-@@ -81,172 +133,469 @@ void PairE3GNN::compute(int eflag, int vflag) {
+@@ -81,172 +133,479 @@ void PairE3GNN::compute(int eflag, int vflag) {
      ev_setup(eflag, vflag);
    else
      evflag = vflag_fdotr = 0;
@@ -3500,6 +3692,16 @@ index 3912b41..06c5635 100644
 +    torch::NoGradGuard no_grad; // force/virial reduction below needs no graph
 +    dev_edge_src = edge_index[0];
 +    dev_edge_dst = edge_index[1];
++    if (gpu && force_reduce_op) {
++      // one kernel: force rows and virial (double) into dev_out; voigt rows only for vflag_atom (below)
++      dev_out = torch::empty({3L * nlocal + 8}, torch::TensorOptions().dtype(torch::kDouble).device(device));
++      torch::jit::Stack fr{dev_dEdr.contiguous(), ev.detach(), in_rowptr, in_nbr, dev_out};
++      force_reduce_op->callBoxed(fr);
++      dev_out.narrow(0, 3L * nlocal, 1).copy_(dev_energy.reshape({1}));
++      dev_out.narrow(0, 3L * nlocal + 7, 1).copy_(in_total);
++      dev_voigt = torch::Tensor();
++      return;
++    }
 +    // force reduction on the device, only (nlocal, 3) comes back to the host. Ghost
 +    // nodes (halo) get a force on their one LAMMPS image, which reverse comm folds
 +    // onto the owner.
@@ -3728,11 +3930,18 @@ index 3912b41..06c5635 100644
      virial[0] += virial_stress[0];
      virial[1] += virial_stress[1];
      virial[2] += virial_stress[2];
-@@ -255,9 +604,13 @@ void PairE3GNN::compute(int eflag, int vflag) {
+@@ -255,9 +614,20 @@ void PairE3GNN::compute(int eflag, int vflag) {
      virial[5] += virial_stress[4];
  
      if (vflag_atom) {
 -      auto per_atom_stress = per_atom_stress_tensor.accessor<float, 2>();
++      if (gpu && force_reduce_op) { // fused force path: this step's voigt rows on demand (eager, after the replay)
++        const auto rij = in_edge_vec;
++        dev_voigt = torch::cat({rij * dev_dEdr,
++                                (rij.select(1, 0) * dev_dEdr.select(1, 1)).unsqueeze(-1),
++                                (rij.select(1, 1) * dev_dEdr.select(1, 2)).unsqueeze(-1),
++                                (rij.select(1, 2) * dev_dEdr.select(1, 0)).unsqueeze(-1)}, 1);
++      }
 +      torch::Tensor per_atom_stress_tensor =
 +          torch::zeros({nlocal, 6}, dev_voigt.options());
 +      per_atom_stress_tensor.index_add_(0, dev_edge_dst, dev_voigt);
@@ -3744,7 +3953,7 @@ index 3912b41..06c5635 100644
          const int i = graph_index_to_i[gi];
          vatom[i][0] += -per_atom_stress[gi][0];
          vatom[i][1] += -per_atom_stress[gi][1];
-@@ -271,23 +624,155 @@ void PairE3GNN::compute(int eflag, int vflag) {
+@@ -271,21 +641,153 @@ void PairE3GNN::compute(int eflag, int vflag) {
  
    if (eflag_atom) {
      torch::Tensor atomic_energy_tensor =
@@ -3770,13 +3979,7 @@ index 3912b41..06c5635 100644
 +    }
 +  }
 +}
- 
--  // if it was the first MD step
--  if (this->nedges_bound == -1) {
--    this->nedges_bound = nedges * 1.2;
--  } // else if the nedges is too small, increase the bound
--  else if (nedges > this->nedges_bound / 1.2) {
--    this->nedges_bound = nedges * 1.2;
++
 +// halo mode: freeze the graph rows for the coming neighbor-list interval (until the next
 +// rebuild). Shells are the BFS hop count from the local atoms over the full neighbor list as
 +// built (pairs within cutoff+skin): local atoms hop 0, then hop 1..num_conv. One node per tag,
@@ -3866,7 +4069,13 @@ index 3912b41..06c5635 100644
 +      halo_pad[k] = std::max(nb(nreal[k]), halo_pad[k + 1] + (long)group[num_conv - k].size());
 +    halo_pad[0] = halo_pad[1] + nb((long)group[num_conv].size());
 +  }
-+
+ 
+-  // if it was the first MD step
+-  if (this->nedges_bound == -1) {
+-    this->nedges_bound = nedges * 1.2;
+-  } // else if the nedges is too small, increase the bound
+-  else if (nedges > this->nedges_bound / 1.2) {
+-    this->nedges_bound = nedges * 1.2;
 +  // row assignment: hop 0 at [0, nloc), hop h at [P_{L-h+1}, ...); the gaps are padding rows
 +  tag_to_graph.assign(natoms + 1, -1);
 +  node_to_i.assign((size_t)halo_pad[0], -1);
@@ -3874,7 +4083,7 @@ index 3912b41..06c5635 100644
 +  for (int a : group[0]) {
 +    node_to_i[row] = a;
 +    tag_to_graph[tag[a]] = row++;
-+  }
+   }
 +  for (int h = 1; h <= num_conv; h++) {
 +    row = (int)halo_pad[num_conv - h + 1];
 +    for (int a : group[h]) {
@@ -3888,9 +4097,9 @@ index 3912b41..06c5635 100644
 +    std::string ns;
 +    for (int k = 0; k <= num_conv; k++) ns += " " + std::to_string(nreal[k]);
 +    utils::logmesg(lmp, "PairE3GNN: rank {} hop shells n_0..n_{}:{}\n", comm->me, num_conv, ns);
-   }
- }
- 
++  }
++}
++
 +void PairE3GNN::finish() {
 +  if (!timing || tsteps == 0) return;
 +  double m[6];
@@ -3903,12 +4112,10 @@ index 3912b41..06c5635 100644
 +    utils::logmesg(lmp, "PairE3GNN GPU edges: {} neighbor-list uploads, {} edge-capacity regrows\n", trebuilds, tregrows);
 +  for (double &t : tsum) t = 0;
 +  tsteps = tcaptures = trebuilds = tregrows = 0;
-+}
-+
+ }
+ 
  // allocate arrays (called from coeff)
- void PairE3GNN::allocate() {
-   allocated = 1;
-@@ -295,6 +780,7 @@ void PairE3GNN::allocate() {
+@@ -295,6 +797,7 @@ void PairE3GNN::allocate() {
  
    memory->create(setflag, n + 1, n + 1, "pair:setflag");
    memory->create(cutsq, n + 1, n + 1, "pair:cutsq");
@@ -3916,7 +4123,7 @@ index 3912b41..06c5635 100644
    memory->create(map, n + 1, "pair:map");
  }
  
-@@ -321,12 +807,14 @@ void PairE3GNN::coeff(int narg, char **arg) {
+@@ -321,12 +824,14 @@ void PairE3GNN::coeff(int narg, char **arg) {
    std::unordered_map<std::string, std::string> meta_dict = {
        {"chemical_symbols_to_index", ""},
        {"cutoff", ""},
@@ -3931,7 +4138,7 @@ index 3912b41..06c5635 100644
        {"time", ""}};
  
    // model loading from input
-@@ -346,11 +834,31 @@ void PairE3GNN::coeff(int narg, char **arg) {
+@@ -346,11 +851,34 @@ void PairE3GNN::coeff(int narg, char **arg) {
  
    cutoff = std::stod(meta_dict["cutoff"]);
    cutoff_square = cutoff * cutoff;
@@ -3957,13 +4164,16 @@ index 3912b41..06c5635 100644
 +    edge_build_op = c10::Dispatcher::singleton().findOp({"jet_mlip::edge_build", ""});
 +    gpu_edges = edge_build_op.has_value();
 +    cand_build_op = c10::Dispatcher::singleton().findOp({"jet_mlip::cand_build", ""});
++    const char *ff_flag = std::getenv("SEVENN_FUSED_FORCE");
++    if (!(ff_flag && std::strcmp(ff_flag, "0") == 0))
++      force_reduce_op = c10::Dispatcher::singleton().findOp({"jet_mlip::force_reduce", ""});
 +    utils::logmesg(lmp, gpu_edges ? "PairE3GNN: edge list built on the GPU (jet_mlip::edge_build)\n"
 +                                  : "PairE3GNN: jet_mlip::edge_build not registered, edge list built on the host\n");
 +  }
  
    if (meta_dict["model_type"].compare("E3_equivariant_model") != 0) {
      error->all(FLERR, "given model type is not E3_equivariant_model");
-@@ -374,8 +882,9 @@ void PairE3GNN::coeff(int narg, char **arg) {
+@@ -374,8 +902,9 @@ void PairE3GNN::coeff(int narg, char **arg) {
        if (chem_vec[j].compare(arg[i]) == 0) {
          map[i - 2] = j;
          found_flag = true;
@@ -3975,7 +4185,7 @@ index 3912b41..06c5635 100644
          break;
        }
      }
-@@ -412,15 +921,66 @@ void PairE3GNN::coeff(int narg, char **arg) {
+@@ -412,15 +941,66 @@ void PairE3GNN::coeff(int narg, char **arg) {
  
  // init specific to this pair
  void PairE3GNN::init_style() {
@@ -4038,20 +4248,20 @@ index 3912b41..06c5635 100644
 +      d3_prelaunch = reinterpret_cast<void (*)(Pair *)>(d3->extract("d3_prelaunch", dim));
 +    }
 +  }
-+}
-+
-+void *PairE3GNN::extract(const char *str, int &dim) {
-+  dim = 0;
-+  return std::strcmp(str, "sevenn_pair_first") == 0 ? this : nullptr; // hybrid order probe (init_style)
  }
  
 -double PairE3GNN::init_one(int i, int j) { return cutoff; }
++void *PairE3GNN::extract(const char *str, int &dim) {
++  dim = 0;
++  return std::strcmp(str, "sevenn_pair_first") == 0 ? this : nullptr; // hybrid order probe (init_style)
++}
++
 +double PairE3GNN::init_one(int i, int j) {
 +  cutghost[i][j] = cutghost[j][i] = cutoff; // ghost list search range (halo mode)
 +  return cutoff;
 +}
 diff --git a/sevenn/pair_e3gnn/pair_e3gnn.h b/sevenn/pair_e3gnn/pair_e3gnn.h
-index 038d5ca..6883a9c 100644
+index 038d5ca..c933e64 100644
 --- a/sevenn/pair_e3gnn/pair_e3gnn.h
 +++ b/sevenn/pair_e3gnn/pair_e3gnn.h
 @@ -23,6 +23,16 @@ PairStyle(e3gnn, PairE3GNN)
@@ -4071,7 +4281,7 @@ index 038d5ca..6883a9c 100644
  namespace LAMMPS_NS {
  class PairE3GNN : public Pair {
  private:
-@@ -33,12 +43,66 @@ private:
+@@ -33,12 +43,69 @@ private:
    int nelements;
    bool print_info = false;
  
@@ -4120,6 +4330,9 @@ index 038d5ca..6883a9c 100644
 +  bool gpu_nlist = false;
 +  std::optional<c10::OperatorHandle> cand_build_op;
 +  std::vector<int> ident; // graph row ii -> local atom ii (gpu_nlist: no list->ilist)
++  // GPU edges: force + virial from dE/dr by jet_mlip::force_reduce in one kernel straight into dev_out (else
++  // zeros + 2 index_add + voigt rows + cats); SEVENN_FUSED_FORCE=0 disables
++  std::optional<c10::OperatorHandle> force_reduce_op;
 +
 +  // pair_style hybrid/overlay e3gnn d3: D3 launch entry point (see init_style())
 +  Pair *d3_pair = nullptr;
@@ -4139,7 +4352,7 @@ index 038d5ca..6883a9c 100644
  
    void settings(int, char **);
    // read Atom type string from input script & related coeff
-@@ -47,6 +111,7 @@ public:
+@@ -47,6 +114,7 @@ public:
  
    void init_style();
    double init_one(int, int);

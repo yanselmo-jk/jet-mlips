@@ -107,6 +107,9 @@ def test_graph_matches_eager(name, model_path, monkeypatch):
     assert de < 1e-5, f'{name}: dE/atom {de:.3e} eV'
     assert df < 1e-4, f'{name}: max|dF| {df:.3e} eV/A'
     assert graph.n_captures >= 1
+    # one rank: node rows are exactly nlocal and no layer runs upstream's ghost exchange
+    assert graph.key[1] == len(atoms)
+    assert not any(type(m).__name__ == 'LAMMPSMLIAPGhostExchangeModule' for m in graph.model.modules())
 
 
 def test_save_load_round_trip(tmp_path, model_path):

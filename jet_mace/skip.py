@@ -20,6 +20,7 @@ import triton.language as tl
 
 BM, BN, BK = 64, 64, 32   # fixed tiles (autotune would break the CUDA-graph capture); 4070S sweep: BK 32 < 64, BN 128 ~ 64
 INTERPRET = os.environ.get('TRITON_INTERPRET') == '1'   # CPU kernel runs through the interpreter, else torch fallback
+NODES = None   # (z, a, perm) of the node rows, set by jet_mace.mliap during a step: built once per pair list there
 
 
 @triton.jit
@@ -118,9 +119,14 @@ class SpeciesLinear(torch.nn.Module):
         self.n_elements = n_elements
 
     def forward(self, x, node_attrs):
-        z = node_attrs.argmax(1).int()
-        a = node_attrs.gather(1, z.long()[:, None])[:, 0]
-        return _MM.apply(x.contiguous(), a, z, torch.argsort(z, stable=True).int(), self)   # kernel assumes unit column stride
+        nodes = NODES
+        if nodes is not None and nodes[0].numel() == x.shape[0]:
+            z, a, perm = nodes
+        else:
+            z = node_attrs.argmax(1).int()
+            a = node_attrs.gather(1, z.long()[:, None])[:, 0]
+            perm = torch.argsort(z, stable=True).int()
+        return _MM.apply(x.contiguous(), a, z, perm, self)   # kernel assumes unit column stride
 
     def _mm(self, x, a, z, perm, transposed):
         """out = a * x @ W[z] per path (W^T when transposed: the backward). x (N, irreps_in1), out (N, irreps_out)."""

@@ -4,7 +4,7 @@
 
 LAMMPS:
 
-    pair_style mliap unified out.pt 0
+    pair_style jet/mliap out.pt      # = mliap unified out.pt 0, KOKKOS only
     pair_coeff * * <symbols in LAMMPS type order>
 """
 import argparse

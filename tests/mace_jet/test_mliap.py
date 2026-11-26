@@ -67,4 +67,5 @@ def test_graph_wrapper_matches_eager(name):
         assert abs(d1.energy - d0.energy) < 1e-4 * n
         assert torch.allclose(d1.eatoms, d0.eatoms, atol=1e-4)
         assert torch.allclose(d1.pair_forces, d0.pair_forces, atol=2e-3)
+        assert graph.key[:2] == (n, n)   # one rank: no ghost and no padding row
     assert graph.n_captures >= 2 and graph.n_replays >= 1

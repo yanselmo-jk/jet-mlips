@@ -1,16 +1,21 @@
 """Swap the per-edge radial MLP + uvu tensor product + scatter of NequIP interaction blocks for jet_mlip's fused
-convolution (deploy-time radial table). `patch_model(model)` attaches a `JetTPScatter` to every interaction block
-and replaces the spherical-harmonic edge attrs by the raw edge vectors. Only submodules with a stable call contract
+convolution (deploy-time radial table). `patch_model(model)` attaches a `JetTPScatter` to every interaction block,
+replaces the spherical-harmonic edge attrs by the raw edge vectors and runs the e3nn glue around the convolution
+(self-connection, linears, gate) as jet_mlip ops (`patch_glue`). Only submodules with a stable call contract
 are touched: the packaged foundation models carry their own older nequip copy, so nothing is isinstance-checked
 against the installed nequip. Blocks with a mul above the kernel's 128 (NequIP-OAM-XL's 320) run as 32-channel slices.
 """
 import copy
+import os
 
 import torch
 from jet_mlip import ops, reference, tables
 from nequip.nn.utils import with_edge_vectors_
 
 from common.radial_table import DEFAULT_N, interpolate, make_radial_table, make_radial_tables
+
+CSR = None   # (rowptr, perm) of the step's edge list by dst, set by jet_nequip.mliap around a graph step (built once
+# per pair list instead of once per layer); None or another size: every convolution builds its own
 
 SLICE = 32   # channels per kernel call for a mul > 128 block: 32-channel slices are faster per layer than mul-128
 # calls on H200 (measured on EquFlash)
@@ -160,7 +165,10 @@ class JetTPScatter(torch.nn.Module):
         vec = vec.contiguous()
         xs = [x.index_select(1, self.get_buffer(f'x_idx{i}')) for i in range(len(self.cfgs))] if self.wide else [x]
         if x.is_cuda and x.dtype == torch.float32 and ops.has_op('conv_fused'):
-            rowptr, perm = ops.build_csr(dst.int(), n_out)   # one CSR for all slices
+            csr = CSR
+            if csr is None or csr[0].numel() != n_out + 1 or csr[1].numel() != dst.numel():
+                csr = ops.build_csr(dst.int(), n_out)   # one CSR for all slices
+            rowptr, perm = csr
             outs = [torch.ops.jet_mlip.conv_fused(xh, vec, src.int(), rowptr, perm, self.get_buffer(f'w1{i}'),
                                                   self.get_buffer(f'w2{i}'), self.get_buffer(f'w3{i}'),
                                                   self.get_buffer(f'coeffs{i}'), 1.0, 0.0, self.r_max, 1.0,
@@ -203,8 +211,114 @@ class _NoWeights(torch.nn.Module):
         return x[:, :0]
 
 
+class _JetGlue(torch.nn.Module):
+    """An e3nn glue module of a block as one jet_mlip op on fp32 CUDA (first-order autograd in x); elsewhere (CPU,
+    fp64) the e3nn module itself, kept as `self.e3nn`. The op's constant inputs are buffers folded from the weights
+    at patch time: inference only."""
+
+    def __init__(self, e3nn_module, **buffers):
+        super().__init__()
+        self.e3nn = e3nn_module
+        for name, t in buffers.items():
+            self.register_buffer(name, t, persistent=False)
+
+    def forward(self, x, *args):
+        if x.is_cuda and x.dtype == torch.float32:
+            return self._jet(x, *args)
+        return self.e3nn(x, *args)
+
+
+class JetLinear(_JetGlue):
+    """e3nn o3.Linear (linear_1 / linear_2): one GEMM per irrep in the mul_ir layout, no reshape / cat."""
+
+    def __init__(self, lin, w, paths):
+        super().__init__(lin, w=w)
+        self.paths, self.dim_out = paths, lin.irreps_out.dim
+
+    @torch._dynamo.disable   # as JetTPScatter._conv: no fake-tensor rule
+    def _jet(self, x):
+        return torch.ops.jet_mlip.species_linear(x, None, self.w, self.paths, self.dim_out, None)
+
+
+class JetSelfConnection(_JetGlue):
+    """The self-connection FullyConnectedTensorProduct(x, node_attrs): node_attrs is a function of the atom type
+    (`attrs` (T, V): the type embedding rows), so the product is one linear map per type and irrep, w[t] = attrs[t] @
+    (e3nn weight with its path normalization). The block hands over node_attrs, not the types: the type is the row of
+    `attrs` nearest to it (equal rows have equal maps)."""
+
+    def __init__(self, tp, w, paths, attrs):
+        super().__init__(tp, w=(attrs @ w).contiguous(), key=attrs.t().contiguous(), norm=attrs.square().sum(1) / 2)
+        self.paths, self.dim_out = paths, tp.irreps_out.dim
+
+    @torch._dynamo.disable
+    def _jet(self, x, node_attrs):
+        species = (node_attrs @ self.key - self.norm).argmax(1)
+        return torch.ops.jet_mlip.species_linear(x, species, self.w, self.paths, self.dim_out, None)
+
+
+class JetGate(_JetGlue):
+    """e3nn nn.Gate: one elementwise kernel per direction instead of the Extract / activation / product / cat chain."""
+
+    def __init__(self, gate, tables):
+        super().__init__(gate, **dict(zip(('fi', 'ff', 'bi', 'bf'), tables)))
+
+    @torch._dynamo.disable
+    def _jet(self, x):
+        return torch.ops.jet_mlip.gate(x, self.fi, self.ff, self.bi, self.bf)
+
+
+GLUE = 'sc,linear,gate'
+
+
+def patch_glue(model, which=None):
+    """Swap the e3nn glue around every convolution for jet_mlip ops (in place): `sc` the self-connection, `linear`
+    linear_1 / linear_2, `gate` the Gate. which: comma list, default JET_NEQUIP_GLUE or all three ('' = none). A module
+    the ops do not cover (ops.*_weight / gate_tables return None) and a jet_mlip built without the ops keep e3nn.
+    Returns the number of modules swapped."""
+    which = set((os.environ.get('JET_NEQUIP_GLUE', GLUE) if which is None else which).split(','))
+    device = next(model.parameters()).device
+    embed = [m for m in model.modules() if type(m).__name__ == 'NodeTypeEmbed'
+             and not getattr(m, 'do_categorical_graph_field_embed', False)]
+    n = 0
+
+    def swap(parent, name, make, fold):
+        nonlocal n
+        folded = fold(copy.deepcopy(getattr(parent, name)).cpu())   # fold on the CPU, whatever device the model is on
+        if folded is not None:
+            setattr(parent, name, make(getattr(parent, name), *folded).to(device))
+            n += 1
+
+    def fold_linear(lin):
+        r = ops.linear_weight(lin) if lin.weight.dtype == torch.float32 else None
+        return r and r[:2]
+
+    def fold_sc(tp):
+        attrs = embed[0].embed_module.weight.detach().cpu()
+        r = ops.species_linear_weight(tp) if tp.weight.dtype == torch.float32 else None
+        return r and (*r, attrs)
+
+    def fold_gate(gate):
+        t = ops.gate_tables(gate)
+        return t and (t,)
+
+    for m in model.modules():
+        if type(m).__name__ == 'InteractionBlock' and ops.has_op('species_linear'):
+            for name in ('linear_1', 'linear_2') if 'linear' in which else ():
+                if type(getattr(m, name)).__name__ == 'Linear':
+                    swap(m, name, JetLinear, fold_linear)
+            sc = getattr(m, 'sc', None)
+            if 'sc' in which and type(sc).__name__ == 'FullyConnectedTensorProduct' and len(embed) == 1 \
+                    and embed[0].embed_module.weight.shape[1] == sc.irreps_in2.dim:
+                swap(m, 'sc', JetSelfConnection, fold_sc)
+        elif type(m).__name__ == 'ConvNetLayer' and 'gate' in which and ops.has_op('gate') \
+                and type(m.equivariant_nonlin).__name__ == 'Gate':
+            swap(m, 'equivariant_nonlin', JetGate, fold_gate)
+    return n
+
+
 def patch_model(model, radial_table: int = DEFAULT_N):
-    """Attach fused convolutions to every InteractionBlock of a NequIP model (in place; returns it)."""
+    """Attach fused convolutions to every InteractionBlock of a NequIP model and jet ops to the glue around them
+    (patch_glue), in place; returns it."""
     device = next(model.parameters()).device
     n = 0
     for name, m in list(model.named_modules()):
@@ -222,4 +336,5 @@ def patch_model(model, radial_table: int = DEFAULT_N):
             setattr(parent, name.rsplit('.', 1)[-1], EdgeVecAttrs(m.out_field, dtype, nt).to(device))
     if n == 0:
         raise ValueError('jet_nequip: no InteractionBlock found in the model')
+    patch_glue(model)
     return model

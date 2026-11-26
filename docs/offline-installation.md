@@ -50,7 +50,7 @@ machine with the same OS and CUDA driver generation, then build there (the kerne
    LAMMPS_DIR=$PWD/lammps-stable_22Jul2025_update6 OFFLINE=1 bash lammps/build_lammps.sh
    ```
 
-   The ML-IAP patches it applies are `lammps/*.patch`.
+   The ML-IAP patches it applies are `lammps/*.patch`; one of them adds `pair_style jet/mliap` (KOKKOS only).
 
 4. Deploy with the model file instead of a name:
 
@@ -58,3 +58,29 @@ machine with the same OS and CUDA driver generation, then build there (the kerne
    python -m jet_mlip.deploy mace   /path/to/mace_checkpoint.model          medium_jet.pt
    python -m jet_mlip.deploy nequip /path/to/NequIP-OAM-L-0.1.nequip.zip    oam-l.nequip.lmp.pt
    ```
+
+5. Run (README "Run"):
+
+   ```
+   pair_style jet/mliap medium_jet.pt     # = mliap unified medium_jet.pt 0, KOKKOS only
+   pair_coeff * * Li C H O N F S P B
+   ```
+
+   ```bash
+   lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in in.lammps
+   ```
+
+## 3. Updating an offline install
+
+1. Bring the new repository over. With the env active, undo the old package patches (the recorded files) and apply
+   the new ones (0.5.0 changes both):
+
+   ```bash
+   python -m jet_mlip.patch_sevenn --reverse && python -m jet_mlip.patch_sevenn          # SevenNet
+   python -m common.patch_tool mace --reverse && python -m common.patch_tool mace         # MACE
+   ```
+
+2. Rebuild JET (section 2, step 2).
+3. Rebuild LAMMPS (step 3). The ML-IAP tree takes the new patches in place. For `SEVENN=1` start from a freshly
+   extracted LAMMPS folder: the script copies SevenNet's `pair_e3gnn` only once.
+4. Deploy the models again.

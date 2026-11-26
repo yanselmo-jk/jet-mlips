@@ -3,7 +3,7 @@ jet_equflash's fused convolution (`--no-jet`: the plain upstream wrapper, for A/
 
     python -m jet_equflash.deploy <ckpt.pt> <out.pt> [--radial_table N] [--no-jet]
 
-    pair_style mliap unified out.pt 0
+    pair_style jet/mliap out.pt      # = mliap unified out.pt 0, KOKKOS only
     pair_coeff * * Si O H        # LAMMPS type order; element_types is every chemical symbol, so elems = Z
 """
 import argparse

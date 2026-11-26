@@ -11,7 +11,10 @@ Once per step the model runs on static device buffers and is replayed from a CUD
   - padding never computed: padded edges (vector (r_cut, 0, 0), ends spread over the local rows) are masked out of the
     conv CSR and sorted last (ops.EDGE_MASK -> ops.build_csr), so the kernels stop at the real edge count. Scatters
     outside the CSR (upstream convs, MACE density, ZBL) add W(r_cut) = 0, spread so no row serializes the atomics.
-  - one capture, then replay: no per-layer exchange, no launches from Python inside the model.
+  - one capture, then replay: no per-layer exchange, no launches from Python inside the model. Two graphs: the pair
+    list (ghost fold, types, mask, a family's CSR: _prep) and the model (_step). One rank replays the first, and probes
+    the exchange, only when LAMMPS hands over another pair list than the step before (a crystal keeps its list between
+    neighbour builds; a liquid changes it nearly every step).
 A family wrapper subclasses its upstream ML-IAP class and this mixin, sets self.device, self.r_cut, self.vec_dtype,
 self.index_dtype and implements _forward(vec) -> per-node energies (first nlocal rows used), reading self.s_ei
 (2, ecap: row 0 = pair_i, row 1 = owner of pair_j), self.s_types, self.nlg (nlocal, ncap - nlocal) and
@@ -99,8 +102,9 @@ class LammpsStandIn:
 
 
 class GraphMLIAP:
-    caps, graph, key = None, None, None
-    n_captures = n_replays = n_checks = 0   # read by the family tests
+    caps, graph, key, last = None, None, None, None
+    pad_nodes = True   # one rank: False = exactly nlocal node rows instead of a bucket (the key holds nlocal anyway)
+    n_captures = n_replays = n_checks = n_lists = 0   # read by the family tests
     _last_nlocal = -1
 
     def _forward(self, vec):
@@ -131,8 +135,8 @@ class GraphMLIAP:
         self.r_lmask = torch.ones(nlocal, dtype=torch.float64, device=dev)   # several ranks: real local rows (nlocal is a capacity)
         self.r_rtypes = torch.zeros(ncap, dtype=torch.int64, device=dev)   # remote rows' elements (several ranks)
         self.r_rij = torch.zeros(ecap, 3, dtype=torch.float64, device=dev)
-        self.r_pi = torch.zeros(ecap, dtype=torch.int64, device=dev)
-        self.r_pj = torch.zeros(ecap, dtype=torch.int64, device=dev)
+        self.r_pi = torch.zeros(ecap, dtype=torch.int32, device=dev)   # LAMMPS' dtype: compared with its arrays
+        self.r_pj = torch.zeros(ecap, dtype=torch.int32, device=dev)
         self.r_n = torch.zeros((), dtype=torch.int64, device=dev)   # npairs
         self.r_owner = torch.arange(tcap, dtype=torch.int64, device=dev)
         xchg = sel = splits = None
@@ -151,21 +155,22 @@ class GraphMLIAP:
         torch.cuda.empty_cache()   # a dead graph's private pool is only freed on an OOM retry otherwise
 
     def _prep(self):
-        """Model buffers from the raw inputs (captured): padded edges get vector (r_cut, 0, 0), both ends on local row
-        e % nlocal, and are masked out of the conv CSR."""
-        nlocal, ncap = self.key[0], self.key[1]
+        """Pair-list buffers from the raw inputs (captured, the first graph): padded edges have both ends on local row
+        e % nlocal and are masked out of the conv CSR."""
+        nlocal = self.key[0]
         real = self.r_edge < self.r_n
         self.s_types[:nlocal] = self.r_elems
         # remote rows (several ranks): their elements; padding rows: a valid type
         self.s_types[nlocal:] = self.r_rtypes[nlocal:] if self.key[4] else self.r_elems[0]
-        self.s_vec.copy_(torch.where(real.unsqueeze(1), self.r_rij, self.r_pad))
         pad = self.r_edge % nlocal   # spread over the local rows: unmasked scatters (upstream convs) do not pile onto one row
         self.s_ei[0].copy_(torch.where(real, self.r_pi, pad))
-        self.s_ei[1].copy_(torch.where(real, self.r_owner[self.r_pj.clamp(0, self.r_owner.numel() - 1)], pad))   # ghost fold
+        self.s_ei[1].copy_(torch.where(real, self.r_owner[self.r_pj.long().clamp(0, self.r_owner.numel() - 1)], pad))   # ghost fold
         self.s_mask.copy_(real)
 
     def _step(self):
+        """The model graph: padded edges get vector (r_cut, 0, 0)."""
         nlocal = self.key[0]
+        self.s_vec.copy_(torch.where(self.s_mask.bool().unsqueeze(1), self.r_rij, self.r_pad))
         vec = self.s_vec.detach().requires_grad_(True)
         ops.EDGE_MASK = self.s_mask
         try:
@@ -229,8 +234,8 @@ class GraphMLIAP:
         the maps against LAMMPS' elements."""
         rank = _dist().get_rank() if not single_rank() else 0
         elems = torch.as_tensor(lmp_data.elems).to(self.device).long()
-        pj = self.r_pj[:npairs]
-        bad = (self.s_types[self.r_owner[pj]] != elems[pj]).sum().item()   # each edge's row = its LAMMPS atom j's element
+        pj = self.r_pj[:npairs].long()
+        bad =(self.s_types[self.r_owner[pj]] != elems[pj]).sum().item()   # each edge's row = its LAMMPS atom j's element
         if self.key[4]:   # the exchange itself: send the local elements, the remote rows must receive their LAMMPS element
             x = self.r_rtypes.new_zeros(self.key[1], 1, dtype=torch.float64)
             x[:nlocal, 0] = elems[:nlocal].double()
@@ -262,9 +267,55 @@ class GraphMLIAP:
     def graph_forces(self, lmp_data):
         """The whole step for a CUDA device; the caller checks npairs > 1. Several ranks: every rank takes the same
         capture decision (the warm-up steps and the replays both run collectives)."""
-        nlocal, ntotal, npairs = lmp_data.nlocal, lmp_data.ntotal, lmp_data.npairs
+        nlocal, npairs = lmp_data.nlocal, lmp_data.npairs
         multi = not single_rank()
         torch.cuda.synchronize()   # Kokkos writes the LAMMPS arrays on another stream
+        pi, pj = torch.as_tensor(lmp_data.pair_i), torch.as_tensor(lmp_data.pair_j)
+        # one rank, the pair list of the step before: ghost fold, types and CSR stand (a ghost that takes another row or
+        # starts to be read changes the list; a row no pair reads may be stale), only the vectors are new
+        new = (multi or self.graph is None or (nlocal, npairs) != self.last
+               or not (torch.equal(pj, self.r_pj[:npairs]) and torch.equal(pi, self.r_pi[:npairs])))
+        if new:
+            self._new_list(lmp_data, pi, pj, multi)
+            self.last = (nlocal, npairs)
+            self.n_lists += 1
+        self.r_rij[:npairs].copy_(torch.as_tensor(lmp_data.rij))
+        if self.graph is None:
+            try:
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(2):   # warm-up: lazy inits (cuBLAS, kernel attributes, compile) must not be captured
+                        self._prep()
+                        self._step()
+                torch.cuda.current_stream().wait_stream(s)
+                graphs = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+                for g, part in zip(graphs, (self._prep, self._step)):
+                    with torch.cuda.graph(g):
+                        part()
+                self.graph = graphs
+                self.n_captures += 1
+                if os.environ.get('JET_MLIAP_LOG'):
+                    print(f'{type(self).__name__}: capture {self.n_captures} key {self.key}', flush=True)
+            except Exception as e:
+                # no silent eager fallback: after a failed capture the eager step gave wrong energies (SevenNet, 2026-11-04)
+                raise RuntimeError(f'{type(self).__name__}: CUDA graph capture failed; disable the graph path') from e
+        else:
+            if new:
+                self.graph[0].replay()
+            self.graph[1].replay()
+            self.n_replays += 1
+            if self._check_due(nlocal, multi):
+                self._check(npairs, nlocal, lmp_data)
+        e_local = self.o_eatoms[:nlocal]
+        if getattr(lmp_data, 'eflag', 1):   # LAMMPS reads it only then (pair_mliap_kokkos eflag_global): skip the sync (test stubs lack eflag)
+            lmp_data.energy = e_local.sum().item()
+        torch.as_tensor(lmp_data.eatoms).copy_(e_local)
+        lmp_data.update_pair_forces_gpu(self.o_pair_f[:npairs])
+
+    def _new_list(self, lmp_data, pi, pj, multi):
+        """Raw inputs of another pair list: capacities (-> _alloc, re-capture), the exchange probe, the copies."""
+        nlocal, ntotal, npairs = lmp_data.nlocal, lmp_data.ntotal, lmp_data.npairs
         # several ranks: atoms migrate at every neighbour rebuild, so the local block is a capacity too (dummy rows
         # masked out of the energy) and the remote rows start after it; one rank: exactly nlocal
         base = self._cap('local', nlocal, NODE_BUCKET) if multi else nlocal
@@ -280,14 +331,15 @@ class GraphMLIAP:
             torch.cuda.synchronize()
             codes = out[nlocal:ntotal, 0]
             if multi:
-                pj = torch.as_tensor(lmp_data.pair_j).to(self.device).long()
+                pjl = pj.to(self.device).long()
                 ref = torch.zeros(ntotal - nlocal, dtype=torch.bool, device=self.device)
-                ref[pj[pj >= nlocal] - nlocal] = True
+                ref[pjl[pjl >= nlocal] - nlocal] = True
                 remote = self._remote_map(codes, base, ref)
                 nrows, pneed = base + remote[1].numel() + 1, remote[5]   # + 1: the spare row the exchange pads hit
             else:
                 remote = codes.long()
-        key = (base, self._cap('atoms', nrows, NODE_BUCKET), self._cap('pairs', npairs, EDGE_BUCKET),
+        ncap = self._cap('atoms', nrows, NODE_BUCKET) if multi or self.pad_nodes else nrows
+        key = (base, ncap, self._cap('pairs', npairs, EDGE_BUCKET),
                self._cap('total', ntotal, NODE_BUCKET), self._cap('peer', pneed, PEER_BUCKET, PEER_HEADROOM) if multi else 0)
         changed = key != self.key
         if multi:   # one rank's re-capture forces all of them
@@ -305,9 +357,8 @@ class GraphMLIAP:
             self.r_elems[nlocal:] = self.r_elems[0]
             self.r_lmask.fill_(1.0)
             self.r_lmask[nlocal:] = 0.0
-        self.r_rij[:npairs].copy_(torch.as_tensor(lmp_data.rij))
-        self.r_pi[:npairs].copy_(torch.as_tensor(lmp_data.pair_i))
-        self.r_pj[:npairs].copy_(torch.as_tensor(lmp_data.pair_j))
+        self.r_pi[:npairs].copy_(pi)
+        self.r_pj[:npairs].copy_(pj)
         self.r_n.fill_(npairs)
         if multi:
             owner, uq, inv, far, cnt, _ = remote
@@ -320,33 +371,3 @@ class GraphMLIAP:
             self._fill_xchg(uq, cnt, key[4], base)
         elif remote is not None:
             self.r_owner[nlocal:ntotal] = remote
-        if self.graph is None:
-            try:
-                s = torch.cuda.Stream()
-                s.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(s):
-                    for _ in range(2):   # warm-up: lazy inits (cuBLAS, kernel attributes, compile) must not be captured
-                        self._prep()
-                        self._step()
-                torch.cuda.current_stream().wait_stream(s)
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    self._prep()
-                    self._step()
-                self.graph = g
-                self.n_captures += 1
-                if os.environ.get('JET_MLIAP_LOG'):
-                    print(f'{type(self).__name__}: capture {self.n_captures} key {self.key}', flush=True)
-            except Exception as e:
-                # no silent eager fallback: after a failed capture the eager step gave wrong energies (SevenNet, 2026-11-04)
-                raise RuntimeError(f'{type(self).__name__}: CUDA graph capture failed; disable the graph path') from e
-        else:
-            self.graph.replay()
-            self.n_replays += 1
-            if self._check_due(nlocal, multi):
-                self._check(npairs, nlocal, lmp_data)
-        e_local = self.o_eatoms[:nlocal]
-        if getattr(lmp_data, 'eflag', 1):   # LAMMPS reads it only then (pair_mliap_kokkos eflag_global): skip the sync (test stubs lack eflag)
-            lmp_data.energy = e_local.sum().item()
-        torch.as_tensor(lmp_data.eatoms).copy_(e_local)
-        lmp_data.update_pair_forces_gpu(self.o_pair_f[:npairs])

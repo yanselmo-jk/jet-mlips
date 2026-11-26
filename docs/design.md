@@ -30,7 +30,7 @@ swapped (fused JET convolution with a radial table). Static buckets + CUDA graph
 
 | option | patch added | pair styles |
 |---|---|---|
-| (always) | ML-IAP Kokkos: host comm fix, neighbour data, virial reduction (`lammps/*.patch`) | `mliap unified` (MACE, NequIP, Nequix, EquFlash) |
+| (always) | ML-IAP Kokkos: host comm fix, neighbour data, virial reduction (`lammps/*.patch`) | `jet/mliap` (= `mliap unified <file> 0`, KOKKOS only; MACE, NequIP, Nequix, EquFlash, SevenNet ML-IAP) |
 | `D3=1` (default) | `jet_d3/` (GPU D3, also `custom s6 s8 a1 a2` BJ parameters) | `jet/d3` |
 | `SEVENN=1` | `sevenn patch_lammps --jet` (needs sevenn + jet_mlip in the env; own source tree) | `e3gnn`, `e3gnn/parallel` |
 
@@ -38,13 +38,13 @@ A binary runs the models of its own env: MACE (e3nn 0.4.4) needs its own env and
 (`SEVENN=1` build in a NequIP env with sevenn installed). An env with its own CUDA toolkit builds with it (e.g. EquFlash's
 env: CUDA 13.4 and conda-forge openmpi; `conda activate equflash; bash lammps/build_lammps.sh`, no `CUDA_HOME` from another env).
 
-`mliap unified`: run with `-k on g 1 -sf kk -pk kokkos newton on neigh half`. On one GPU every family (MACE, NequIP,
+`jet/mliap`: run with `-k on g 1 -sf kk -pk kokkos newton on neigh half`. On one GPU every family (MACE, NequIP,
 Nequix, EquFlash v1, SevenNet ML-IAP) runs one shared CUDA-graph path (`jet_mlip/mliap.py`: ghosts folded onto their
 owners, padded edges masked out of the convolution, one capture per size bucket, then replay). EquFlash V2 runs eager
 (its graph capture is invalidated). Print a thermo quantity that needs the model (`thermo_style custom step pe temp`).
 
 Several GPUs (`mpirun -np N lmp -k on g N ...`, add `gpu/aware off` to `-pk kokkos` with a non-CUDA-aware MPI, v0.4.0):
-every `mliap unified` family stays on the shared graph path; atoms owned by another rank are remote rows refreshed per
+every `jet/mliap` family stays on the shared graph path; atoms owned by another rank are remote rows refreshed per
 layer by NCCL inside the graph (`jet_mlip/mliap.py`). With the graph off (`JET_<FAMILY>_CUDA_GRAPH=0`) MACE, NequIP,
 SevenNet and EquFlash take their official per-layer LAMMPS exchange; Nequix eager is one rank only.
 

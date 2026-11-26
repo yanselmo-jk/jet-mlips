@@ -2,7 +2,7 @@
 # GPU D3 correction jet/d3, NVT at 300 K on a small LiPF6 EC/EMC electrolyte box (348 atoms, types Li C H O N F S P B).
 #   lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in in.mliap_d3 -var model medium_jet.pt
 #   several GPUs: mpirun -np N lmp -k on g N -sf kk -pk kokkos newton on neigh half gpu/aware off -in in.mliap_d3 -var model ...
-# Without D3: pair_style mliap unified ${model} 0 and pair_coeff * * Li C H O N F S P B.
+# Without D3: pair_style jet/mliap ${model} and pair_coeff * * Li C H O N F S P B.
 units           metal
 atom_style      atomic
 atom_modify     map yes
@@ -12,8 +12,8 @@ newton          on
 variable        model index medium_jet.pt
 read_data       electrolyte_348.data
 
-pair_style      hybrid/overlay mliap unified ${model} 0 jet/d3 9000 1600 damp_bj pbe
-pair_coeff      * * mliap Li C H O N F S P B
+pair_style      hybrid/overlay jet/mliap ${model} jet/d3 9000 1600 damp_bj pbe
+pair_coeff      * * jet/mliap Li C H O N F S P B
 pair_coeff      * * jet/d3 Li C H O N F S P B
 
 minimize        1.0e-4 1.0e-6 200 2000      # relax the box for this model first

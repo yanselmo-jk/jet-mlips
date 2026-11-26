@@ -1,0 +1,33 @@
+--- a/src/KOKKOS/pair_mliap_kokkos.h
++++ b/src/KOKKOS/pair_mliap_kokkos.h
+@@ -20,6 +20,8 @@
+ PairStyle(mliap/kk,PairMLIAPKokkos<LMPDeviceType>);
+ PairStyle(mliap/kk/device,PairMLIAPKokkos<LMPDeviceType>);
+ PairStyle(mliap/kk/host,PairMLIAPKokkos<LMPHostType>);
++PairStyle(jet/mliap/kk,PairJetMLIAPKokkos<LMPDeviceType>);
++PairStyle(jet/mliap/kk/device,PairJetMLIAPKokkos<LMPDeviceType>);
+ // clang-format off
+ #else
+ 
+@@ -118,6 +120,21 @@
+   friend void pair_virial_fdotr_compute<PairMLIAPKokkos>(PairMLIAPKokkos*);
+ };
+ 
++
++// jet-mlips: `pair_style jet/mliap <model.pt>` = `pair_style mliap unified <model.pt> 0`, KOKKOS (GPU) only: the JET
++// ML-IAP models run their CUDA graph path on Kokkos device data; without KOKKOS the style does not exist.
++template<class DeviceType>
++class PairJetMLIAPKokkos : public PairMLIAPKokkos<DeviceType> {
++public:
++  PairJetMLIAPKokkos(class LAMMPS *lmp) : PairMLIAPKokkos<DeviceType>(lmp) {}
++  void settings(int narg, char **arg) override {
++    if (narg != 1) this->error->all(FLERR, "Illegal pair_style jet/mliap command: pair_style jet/mliap <model.pt>");
++    char unified[] = "unified", ghost[] = "0";
++    char *args[3] = {unified, arg[0], ghost};
++    PairMLIAPKokkos<DeviceType>::settings(3, args);
++  }
++};
++
+ }
+ #endif
+ #endif

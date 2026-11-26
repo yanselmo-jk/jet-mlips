@@ -27,6 +27,8 @@ from jet_mlip import ops, reference, tables
 from common.radial_table import DEFAULT_N, interpolate, make_radial_table
 
 
+CSR = None   # (rowptr, perm) of the receivers, set by jet_equflash.mliap around a graph step: built once per pair list
+
 SLICE = 32   # channels per kernel call: 8 x mul-32 is 2.8x faster than 2 x mul-128 per layer (H200, 264k edges;
 # the kernel re-reads x for every path group and the group count grows with mul, so x traffic ~ mul^2)
 
@@ -169,7 +171,9 @@ class JetTPScatter(torch.nn.Module):
         xs = _Gather.apply(x, *self.in_idx.unbind(0))
         vec = vec.contiguous()
         if x.is_cuda and x.dtype == torch.float32 and ops.has_op('conv_fused') and self.table is not None:
-            rowptr, perm = ops.build_csr(dst.int(), x.shape[0])   # one CSR for all slices
+            csr = CSR   # one CSR for all slices (and, from the ML-IAP graph path, for every layer)
+            rowptr, perm = csr if csr is not None and csr[0].numel() == x.shape[0] + 1 \
+                and csr[1].numel() == dst.numel() else ops.build_csr(dst.int(), x.shape[0])
             outs = [torch.ops.jet_mlip.conv_fused(xh, vec, src.int(), rowptr, perm, self.w1, self.w2, self.w3,
                                                   self.coeffs, self.denominator, 0.0, self.r_max, 1.0,
                                                   ops.config_id(self.cfg), tab, True, None)
@@ -279,11 +283,19 @@ def to_fp64(model):
 def _jet_forward(self, x, edge_index, edge_embedding, edge_attr, lmp_data=None):
     """The upstream layer minus its radial MLP / TP / scatter / denominator: one fused convolution on the layer's
     edge vectors (`patch_model` stashes them). edge_index is (dst, src), as upstream: out[dst] += TP(x[src], ...).
-    LAMMPS ML-IAP: upstream's exchange first turns nlocal rows into ntotal (locals + ghosts); slice the locals back."""
-    if self.use_lammps_mliap:
+    LAMMPS ML-IAP: upstream's exchange first turns nlocal rows into ntotal (locals + ghosts); slice the locals back.
+    `local_only` (jet_equflash.mliap, one rank: the ghost fold leaves no ghost row) skips both: the exchange would be a
+    zeros / cat / gather copy of x and the slice a zero fill + copy in the backward."""
+    if self.use_lammps_mliap and not self.local_only:
         x = self.exchange(x, lmp_data)
         return self.jet(x, self.edge_vec, edge_index[1], edge_index[0])[:lmp_data.nlocal]
     return self.jet(x, self.edge_vec, edge_index[1], edge_index[0])
+
+
+def _no_edge_embedding(data):
+    empty = data['edge_vec'].new_zeros(0)
+    data['edge_embedding'] = data['edge_attr'] = empty
+    return data
 
 
 def patch_model(model, radial_table: int = DEFAULT_N):
@@ -296,8 +308,12 @@ def patch_model(model, radial_table: int = DEFAULT_N):
     classes = {}
     for layer in layers:
         layer.jet = JetTPScatter(model, layer, radial_table).to(device)
-        layer.__class__ = classes.setdefault(type(layer),
-                                             type('JetConvolution', (type(layer),), {'forward': _jet_forward}))
+        layer.__class__ = classes.setdefault(type(layer), type('JetConvolution', (type(layer),),
+                                                               {'forward': _jet_forward, 'local_only': False}))
+    if radial_table > 0 and type(model).__name__ == 'EquFlash' and type(model.edge_embedding).__name__ == 'EdgeEmbedding':
+        # every convolution is fused and makes its own radial / angular terms from the edge vectors: no block reads
+        # the edge embedding or spherical harmonics (radial_table=0 keeps them for the exact-W reference path)
+        model.edge_embedding.forward = _no_edge_embedding
     orig = model.forward
 
     def forward(batch):

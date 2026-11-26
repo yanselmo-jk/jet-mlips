@@ -1,4 +1,4 @@
-"""Deploy a MACE model for LAMMPS ML-IAP (`pair_style mliap unified <out> 0`) with the jet_mace fused convolution.
+"""Deploy a MACE model for LAMMPS ML-IAP (`pair_style jet/mliap <out>`) with the jet_mace fused convolution.
 
     python -m jet_mace.deploy medium out.pt [--radial_table 4096] [--no-cueq] [--head HEAD]
 

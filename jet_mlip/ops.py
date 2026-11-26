@@ -2,7 +2,7 @@
 library is not built (slow; for tests and CPU)."""
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -70,6 +70,139 @@ def cand_build(x, ncenters: int, cut_sq: float):
     (ncenters+1) int32 and cand_j int32: per center ii the rows j != ii with |x[j]-x[ii]|^2 < cut_sq (cell
     list, deterministic order), edge_build's candidate input. Allocates and syncs: call per rebuild only."""
     return torch.ops.jet_mlip.cand_build(x, ncenters, cut_sq)
+
+
+def force_reduce(dEdr, vec, rowptr, nbr, out) -> None:
+    """pair_e3gnn's force and virial in one kernel (CUDA-graph capturable). dEdr / vec (cap, 3) f32 per edge, rowptr
+    (nrows+1) int32 = edge_build's CSR over centers, nbr (cap) int32. Writes out (3n+8) f64: force rows
+    F_i = sum_{e: ctr=i} dEdr - sum_{e: nbr=i} dEdr in [0, 3n), virial -sum voigt(vec, dEdr) in [3n+1, 3n+7)
+    (order xx yy zz xy yz zx); out[3n] and out[3n+7] are zeroed for the caller."""
+    torch.ops.jet_mlip.force_reduce(dEdr, vec, rowptr, nbr, out)
+
+
+def species_linear_weight(tp):
+    """(weight (S, P), paths) of species_linear from an e3nn FullyConnectedTensorProduct(irreps_in, S x 0e,
+    irreps_out) with shared weights (sevenn's 'nequip' self-connection): path (in irrep -> same out irrep) block
+    [s, u*V + w] = path_weight / sqrt(2l+1) * w[u, s, w], e3nn's normalization folded in. None if the TP is not of
+    that form (in2 not one S x 0e, a non-'uvw' path, an irrep in two paths, more than 16 paths)."""
+    i1, i2, io = tp.irreps_in1, tp.irreps_in2, tp.irreps_out
+    if len(i2) != 1 or str(i2[0].ir) != '0e' or not tp.shared_weights or len(tp.instructions) > 16 \
+            or not all(i.connection_mode == 'uvw' and i.has_weight for i in tp.instructions):
+        return None
+    s1, so = i1.slices(), io.slices()
+    paths, blocks, seen = [], [], set()
+    for ins, w in zip(tp.instructions, tp.weight_views()):
+        if ('i', ins.i_in1) in seen or ('o', ins.i_out) in seen:
+            return None
+        seen |= {('i', ins.i_in1), ('o', ins.i_out)}
+        d = i1[ins.i_in1].ir.dim
+        if w.numel() > 0:
+            paths += [s1[ins.i_in1].start, so[ins.i_out].start, i1[ins.i_in1].mul, io[ins.i_out].mul, d]
+            blocks.append((w.detach() * (ins.path_weight / d ** 0.5)).transpose(0, 1).reshape(i2[0].mul, -1))
+    W = torch.cat(blocks, 1) if blocks else tp.weight.new_zeros(i2[0].mul, 0)
+    return W.contiguous(), paths
+
+
+def species_linear(x, species, weight, paths: List[int], dim_out: int, bias=None):
+    """out = e3nn TP(x, one_hot(species)) as one (V, U) matrix per species and irrep path (fp32 CUDA, CUDA-graph
+    capturable; grad x only). weight, paths from species_linear_weight; species (N,) int in [0, S). species None:
+    an e3nn Linear (weight, paths from linear_weight), bias (dim_out,) added to the columns the paths write."""
+    return torch.ops.jet_mlip.species_linear(x, species, weight, paths, dim_out, bias)
+
+
+def linear_weight(lin, modal: int = 0):
+    """(weight (1, P), paths, bias table (modal, dim_out) or None) of species_linear for an e3nn o3.Linear with shared
+    internal weights and no bias: block [0, u*V + w] = path_weight * w[u, w]. modal > 0: the last input irrep is
+    sevenn's modal one-hot (modal x 0e appended to x by IrrepsLinear); its paths become the table (bias =
+    one_hot(modal) @ table). None if an input or output irrep is in two x paths, or a modal path has no x path."""
+    if any(i.i_in == -1 for i in lin.instructions) or not (lin.shared_weights and lin.internal_weights) \
+            or len(lin.instructions) > 16:
+        return None
+    ii, io = lin.irreps_in, lin.irreps_out
+    s1, so = ii.slices(), io.slices()
+    mi = len(ii) - 1 if modal else -2
+    if modal and (ii[mi].mul != modal or str(ii[mi].ir) != '0e'):
+        return None
+    paths, blocks, seen, table, modal_out = [], [], set(), None, []
+    if modal:
+        table = lin.weight.new_zeros(modal, io.dim)
+    for _, ins, w in lin.weight_views(yield_instruction=True):
+        w = w.detach() * ins.path_weight
+        if ins.i_in == mi:
+            table[:, so[ins.i_out]] = w
+            modal_out.append(ins.i_out)
+            continue
+        if ('i', ins.i_in) in seen or ('o', ins.i_out) in seen:
+            return None
+        seen |= {('i', ins.i_in), ('o', ins.i_out)}
+        if w.numel() > 0:
+            paths += [s1[ins.i_in].start, so[ins.i_out].start, ii[ins.i_in].mul, io[ins.i_out].mul, ii[ins.i_in].ir.dim]
+            blocks.append(w.reshape(1, -1))
+    if any(('o', o) not in seen for o in modal_out):
+        return None   # the kernel adds the bias only to columns a path writes
+    W = torch.cat(blocks, 1) if blocks else lin.weight.new_zeros(1, 0)
+    return W.contiguous(), paths, table
+
+
+_ACTS = {'silu': 1, 'tanh': 2, 'sigmoid': 3}
+
+
+def _act(a):
+    """(code, cst) of one e3nn Activation entry: None or normalize2mom(f)."""
+    if a is None:
+        return 0, 1.0
+    code = _ACTS.get(getattr(a.f, '__name__', None))
+    if code is None:
+        raise ValueError(f'jet gate: unsupported activation {a.f}')
+    return code, 1.0 if a._is_id else float(a.cst)
+
+
+def gate_tables(gate):
+    """Per-column tables of the gate op (fwd_i (Dout, 4) int32, fwd_f (Dout, 2), bwd_i (Din, 5) int32, bwd_f (Din, 2))
+    for an e3nn nn.Gate: the Extract order (sorted input irreps), the activations with their normalize2mom constants
+    and the ElementwiseTensorProduct coefficient (probed) folded in. None if an activation is not silu / tanh /
+    sigmoid / identity. See csrc/gate.cu for the table layout."""
+    from e3nn.nn._gate import _Sortcut   # gate.sc may already be jet's _Split view: rebuild e3nn's own column order
+    try:
+        acts_s = [_act(a) for (mul, _), a in zip(gate.act_scalars.irreps_in, gate.act_scalars.acts) for _ in range(mul)]
+        acts_g = [_act(a) for (mul, _), a in zip(gate.act_gates.irreps_in, gate.act_gates.acts) for _ in range(mul)]
+    except ValueError:
+        return None
+    cut = _Sortcut(gate.irreps_scalars, gate.irreps_gates, gate.irreps_gated).cut
+    sl = cut.irreps_in.slices()
+    s_cols, g_cols, x_cols = ([c for i in ins for c in range(sl[i].start, sl[i].stop)] for ins in cut.instructions)
+    fi, ff = [], []
+    bi, bf = [[0] * 5 for _ in range(cut.irreps_in.dim)], [[0.0, 0.0] for _ in range(cut.irreps_in.dim)]
+    for j, (code, cst) in zip(s_cols, acts_s):   # one scalar channel each (Activation's own irreps, unsimplified)
+        bi[j], bf[j] = [1, len(fi), 0, code, 0], [cst, 1.0]
+        fi.append([j, -1, code, 0])
+        ff.append([cst, 1.0])
+    if gate.irreps_gated.dim:
+        with torch.no_grad():
+            coef = gate.mul(torch.ones(1, gate.irreps_gated.dim), torch.ones(1, gate.irreps_gates.dim))[0].tolist()
+        u = col = 0
+        for mul, ir in gate.irreps_gated:
+            d = ir.dim
+            for _ in range(mul):
+                gj, (code, cst), c, o0, src0 = g_cols[u], acts_g[u], coef[col], len(fi), x_cols[col]
+                assert all(abs(coef[col + m] - c) <= 1e-6 * abs(c) for m in range(d))
+                for m in range(d):
+                    assert x_cols[col + m] == src0 + m
+                    bi[src0 + m], bf[src0 + m] = [2, o0 + m, gj, code, 0], [cst, c]
+                    fi.append([src0 + m, gj, code, 0])
+                    ff.append([cst, c])
+                bi[gj], bf[gj] = [3, o0, src0, code, d], [cst, c]
+                col += d
+                u += 1
+    assert len(fi) == gate.irreps_out.dim
+    i32 = dict(dtype=torch.int32)
+    return (torch.tensor(fi, **i32), torch.tensor(ff, dtype=torch.float32), torch.tensor(bi, **i32),
+            torch.tensor(bf, dtype=torch.float32))
+
+
+def gate(x, tables):
+    """e3nn Gate as one CUDA kernel per direction (fp32, first-order autograd in x); tables from gate_tables."""
+    return torch.ops.jet_mlip.gate(x, *tables)
 
 
 DEFAULT_RADIAL_TABLE = 2048   # requested grid points (rounded down by table_points); at the fp32 floor for 7net-nano / 0 / omni

@@ -125,6 +125,22 @@ def test_capture_once_then_replay():
     assert w.n_captures == 1 and w.n_replays >= 1, (w.n_captures, w.n_replays)
 
 
+def test_pair_list_reuse():
+    """The pair list of the step before with other vectors: only the model graph replays. Another list of the same
+    size (here the same pairs in another order) goes through the fold again."""
+    w = Toy()
+    atoms = structures()['LiF rocksalt']
+    check(w, stub(atoms))
+    d = stub(atoms)
+    d.rij *= 1.001
+    check(w, d)
+    assert (w.n_lists, w.n_captures, w.n_replays) == (1, 1, 1)
+    d = stub(atoms)
+    d.pair_i, d.pair_j, d.rij = d.pair_i.flip(0), d.pair_j.flip(0), d.rij.flip(0)
+    check(w, d)
+    assert (w.n_lists, w.n_captures, w.n_replays) == (2, 1, 2)
+
+
 def test_capacity_growth(monkeypatch):
     """More pairs than the edge cap re-captures; a small bucket keeps the second cell cheap."""
     monkeypatch.setattr(mliap, 'EDGE_BUCKET', 64)

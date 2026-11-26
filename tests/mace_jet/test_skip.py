@@ -5,6 +5,7 @@ import mace  # noqa: F401  isort:skip
 import pytest
 import torch
 
+from jet_mace import skip
 from jet_mace.cueq import to_cueq_hybrid
 from jet_mace.skip import SpeciesLinear
 
@@ -39,6 +40,15 @@ def test_species_linear_matches_skip_tp(name, device):
         dfwd, dgrad = (o0 - o1).abs().max().item(), (x0.grad - x1.grad).abs().max().item()
         print(f'{name} block {blk}: |dfwd| {dfwd:.2e} |dgrad| {dgrad:.2e}')
         assert dfwd < 1e-5 and dgrad < 1e-5, (dfwd, dgrad)
+        # the node tables handed over by the ML-IAP graph path (jet_mace.mliap._prep) instead of an argsort per call
+        # the species forward derives (argmax: padding rows -> 0); other species groups change the CPU fallback's
+        # matmul batch and its last bit
+        zz = na.argmax(1)
+        skip.NODES = (zz.int(), na.gather(1, zz[:, None])[:, 0], torch.argsort(zz, stable=True).int())
+        try:
+            assert torch.equal(new(x, na.new_zeros(na.shape)), o1)   # node_attrs not read
+        finally:
+            skip.NODES = None
 
 
 @pytest.mark.parametrize('device', DEVICES)

@@ -14,8 +14,10 @@ from ase.data import chemical_symbols
 from lammps.mliap.mliap_unified_abc import MLIAPUnified
 
 from common.radial_table import DEFAULT_N
+from jet_mlip import ops
 from jet_mlip.mliap import GraphMLIAP, LammpsStandIn, single_rank
 
+from . import convert
 from .convert import load_model, patch_model
 
 
@@ -39,6 +41,8 @@ class _StandInExchange(torch.autograd.Function):
 
 class NequixMLIAPWrapper(GraphMLIAP, MLIAPUnified):
     """MLIAPUnified over a Nequix torch model; jet=True swaps in jet_nequix's fused convolution."""
+
+    pad_nodes = False   # one rank: node rows = nlocal (padding edges sit on local rows, masked out of the CSR)
 
     def __init__(self, model_path, radial_table: int = DEFAULT_N, jet: bool = True):
         with open(model_path, 'rb') as f:
@@ -64,6 +68,11 @@ class NequixMLIAPWrapper(GraphMLIAP, MLIAPUnified):
         self.r_max = self.r_cut = float(self.model.cutoff)
         self.vec_dtype, self.index_dtype = torch.float32, torch.int64
         self.use_graph = self.device != 'cpu' and os.environ.get('JET_NEQUIX_CUDA_GRAPH', '1') != '0'
+        if self.use_graph and self.jet and single_rank() and os.environ.get('JET_NEQUIX_COMPILE', '1') != '0':
+            # static shapes (one compile per capacity key): inductor fuses the layer norm / gate / linear glue between
+            # the fused convolutions (opaque to it). One rank only: compiled, the layers' exchange pre-hooks gave
+            # wrong forces on several ranks (5.6 eV/A at step 0, eq5k 3x3x3)
+            self.model.node_energies = torch.compile(self.model.node_energies, dynamic=False)
         if not single_rank():
             if not self.use_graph:
                 raise RuntimeError('jet_nequix: several MPI ranks need the CUDA graph path (CUDA, JET_NEQUIX_CUDA_GRAPH=1)')
@@ -113,9 +122,29 @@ class NequixMLIAPWrapper(GraphMLIAP, MLIAPUnified):
         f = torch.autograd.grad(e.sum(), vec)[0]   # dE/drij: LAMMPS' sign convention, no flip
         self._store(lmp_data, e.detach(), f)
 
+    def _alloc(self, key):
+        super()._alloc(key)
+        self.s_rowptr = torch.zeros(key[1] + 1, dtype=torch.int32, device=self.device)
+        self.s_perm = torch.zeros(key[2], dtype=torch.int32, device=self.device)
+
+    def _prep(self):
+        """The convolutions' CSR belongs to the pair list: built here once per list, not per layer and step."""
+        super()._prep()
+        ops.EDGE_MASK = self.s_mask
+        try:
+            rowptr, perm = ops.build_csr(self.s_ei[0], self.key[1])
+        finally:
+            ops.EDGE_MASK = None
+        self.s_rowptr.copy_(rowptr)
+        self.s_perm.copy_(perm)
+
     def _forward(self, vec):
-        # all ncap rows: padding edges point at the last (padding) row, and the model indexes it
-        return self.model.node_energies(vec, self.s_types, self.s_ei[1], self.s_ei[0])
+        # all ncap rows (several ranks: the remote rows too); padding edges sit on local rows, masked out of the CSR
+        convert.CSR = (self.s_rowptr, self.s_perm) if self.jet else None
+        try:
+            return self.model.node_energies(vec, self.s_types, self.s_ei[1], self.s_ei[0])
+        finally:
+            convert.CSR = None
 
     def compute_descriptors(self, lmp_data):
         pass

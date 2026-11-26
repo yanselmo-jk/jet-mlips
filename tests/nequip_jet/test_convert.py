@@ -23,6 +23,7 @@ from nequip.data.transforms import ChemicalSpeciesToAtomTypeMapper, NeighborList
 from nequip.model import NequIPGNNModel  # noqa: E402
 from nequip.utils.global_state import set_global_state  # noqa: E402
 
+from jet_mlip import ops  # noqa: E402
 from jet_nequip import convert  # noqa: E402
 
 TYPE_NAMES = ['H', 'C', 'O']
@@ -171,3 +172,29 @@ def test_cols_are_a_weight_permutation(request, model_name):
 
 def test_wide_model_is_sliced(model_wide):
     assert all(len(convert.slice_configs(b)) > 1 for b in blocks(model_wide)[1:])
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and ops.has_op('species_linear') and ops.has_op('gate')),
+                    reason='no CUDA jet_mlip glue ops')
+@pytest.mark.parametrize('model_name', ['model', 'model_pec'])
+def test_glue_matches_e3nn(request, model_name):
+    """Every jet glue op against the e3nn module it replaces: forward and grad x, fp32 CUDA."""
+    model = copy.deepcopy(request.getfixturevalue(model_name)).cuda()
+    assert convert.patch_glue(model, 'sc,linear,gate') == 11   # 3 layers: 6 linears, 2 self-connections, 3 gates
+    assert convert.patch_glue(model, 'sc,linear,gate') == 0    # already swapped
+    attrs = next(m for m in model.modules() if type(m).__name__ == 'NodeTypeEmbed').embed_module.weight.detach()
+    torch.manual_seed(0)
+    seen = set()
+    for m in model.modules():
+        if not isinstance(m, convert._JetGlue):
+            continue
+        seen.add(type(m).__name__)
+        sc = isinstance(m, convert.JetSelfConnection)
+        x = torch.randn(300, (m.e3nn.irreps_in1 if sc else m.e3nn.irreps_in).dim, device='cuda', dtype=torch.float32, requires_grad=True)
+        args = (attrs[torch.randint(0, len(TYPE_NAMES), (300,), device='cuda')],) if sc else ()
+        out, ref = m(x, *args), m.e3nn(x, *args)
+        g = torch.randn_like(ref)
+        gx, gref = (torch.autograd.grad(o, x, g)[0] for o in (out, ref))
+        assert (out - ref).abs().max() <= 1e-5 * ref.abs().max(), type(m).__name__
+        assert (gx - gref).abs().max() <= 1e-5 * gref.abs().max(), type(m).__name__
+    assert seen == {'JetLinear', 'JetSelfConnection', 'JetGate'}

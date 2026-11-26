@@ -16,6 +16,8 @@ from jet_mlip import ops, reference, tables
 
 from common.radial_table import DEFAULT_N, interpolate, make_radial_table
 
+CSR = None   # (rowptr, perm) of the receivers, set by jet_nequix.mliap around a graph step: built once per pair list
+
 
 def _load_nequix_model():
     """`nequix.torch_impl.model` loaded from its files, without running nequix/__init__.py (it imports jax, whose
@@ -126,7 +128,9 @@ class JetTPScatter(torch.nn.Module):
             xp[:, self.xcols] = x
             x = xp
         if x.is_cuda and x.dtype == torch.float32 and ops.has_op('conv_fused') and self.table is not None:
-            rowptr, perm = ops.build_csr(dst.int(), x.shape[0])
+            csr = CSR
+            rowptr, perm = csr if csr is not None and csr[0].numel() == x.shape[0] + 1 \
+                and csr[1].numel() == dst.numel() else ops.build_csr(dst.int(), x.shape[0])
             out = torch.ops.jet_mlip.conv_fused(x, vec.contiguous(), src.int(), rowptr, perm, self.w1, self.w2,
                                                   self.w3, self.coeffs, self.denominator, 0.0, self.r_max, 1.0,
                                                   ops.config_id(self.cfg), self.table, True, None)
@@ -138,7 +142,9 @@ class JetTPScatter(torch.nn.Module):
                  else self.exact_w(r.double().cpu()).to(device=r.device, dtype=x.dtype))
             out = x.new_zeros(x.shape[0], self.cfg.out_dim)
             out = out.index_add_(0, dst, reference.tp3(self.cfg, x[src], sh, w)) / self.denominator
-        return out if self.outcols is None else out[:, self.outcols]
+        # index_select: its backward is an index_add; advanced indexing's is a sort-based scatter (2.4 of 24 ms per step,
+        # mp-1, 5632 atoms)
+        return out if self.outcols is None else out.index_select(1, self.outcols)
 
 
 class JetConvolution(NequixTorchConvolution):
@@ -155,6 +161,54 @@ class JetConvolution(NequixTorchConvolution):
         return self.gate(features)
 
 
+class JetLinear(torch.nn.Module):
+    """e3nn o3.Linear (linear_1 / linear_2 / skip) as one jet_mlip species_linear call on fp32 CUDA (one launch instead
+    of a GEMM per irrep and a cat; first-order grad in x); else the e3nn module itself, kept as `lin`."""
+
+    def __init__(self, lin, w, paths):
+        super().__init__()
+        self.lin, self.paths, self.dim_out = lin, paths, lin.irreps_out.dim
+        self.register_buffer('w', w, persistent=False)
+
+    def forward(self, x):
+        return self._jet(x) if x.is_cuda and x.dtype == torch.float32 else self.lin(x)
+
+    @torch._dynamo.disable   # no fake-tensor rule: an opaque step for torch.compile
+    def _jet(self, x):
+        return torch.ops.jet_mlip.species_linear(x.contiguous(), None, self.w, self.paths, self.dim_out, None)
+
+
+class RMSNorm(torch.nn.Module):
+    """Nequix's RMSLayerNorm (std_balance_degrees) over precomputed int slices: the upstream loop reads e3nn Irreps,
+    which torch.compile cannot guard. Same parameters (the upstream module is kept as `ln`)."""
+
+    def __init__(self, ln):
+        super().__init__()
+        if not ln.std_balance_degrees:
+            raise NotImplementedError('jet_nequix: RMSLayerNorm without std_balance_degrees')
+        self.ln, self.eps, self.centering = ln, float(ln.eps), bool(ln.centering)
+        self.blocks = [(s.start, s.stop, mir.mul, mir.ir.dim, mir.ir.l == 0) for mir, s in zip(ln.irreps, ln.input_slices)]
+
+    def forward(self, x):
+        chunks, norm, k = [], 0, len(self.blocks)
+        for a, b, mul, d, scalar in self.blocks:
+            c = x[:, a:b].reshape(-1, mul, d)
+            if self.centering and scalar:
+                c = c - c.mean(dim=-2, keepdim=True)
+            chunks.append(c)
+            norm = norm + (c.square() / (d * k)).sum(-2, keepdim=True).mean(-1, keepdim=True)
+        norm = (norm + self.eps).pow(-0.5)
+        out = []
+        for i, (c, (a, b, mul, d, scalar)) in enumerate(zip(chunks, self.blocks)):
+            if self.ln.affine_weight is not None:
+                c = c * self.ln.affine_weight[i][:, None]
+            c = c * norm
+            if self.ln.affine_bias is not None and scalar:
+                c = c + self.ln.affine_bias[i][:, None]
+            out.append(c.reshape(-1, mul * d))
+        return torch.cat(out, dim=-1)
+
+
 def patch_model(model, radial_table: int = DEFAULT_N):
     """Attach fused convolutions to every NequixTorchConvolution of a NequixTorch model (in place; returns it).
     radial_table=0 keeps the exact W(r) on the torch reference path (fp64 checks; no parameter gradients)."""
@@ -167,11 +221,22 @@ def patch_model(model, radial_table: int = DEFAULT_N):
             raise NotImplementedError('jet_nequix: load with use_kernel=False (openequivariance conv)')
         layer.jet = JetTPScatter(model, layer, radial_table).to(device)
         layer.__class__ = JetConvolution
-    orig = model.node_energies
-
+        if type(layer.layer_norm).__name__ == 'RMSLayerNorm':
+            layer.layer_norm = RMSNorm(layer.layer_norm)
+        for name in ('linear_1', 'linear_2', 'skip') if ops.has_op('species_linear') else ():
+            lin = getattr(layer, name)
+            r = ops.linear_weight(lin) if isinstance(lin, o3.Linear) and lin.weight.dtype == torch.float32 else None
+            if r is not None and r[2] is None:
+                setattr(layer, name, JetLinear(lin, r[0].clone(), r[1]).to(device))
     def node_energies(displacements, species, senders, receivers):
-        for layer in layers:   # the layers only get sh / radial basis, not the vectors the fused convolution needs
+        """Upstream's node_energies without the spherical harmonics and radial basis no patched layer reads: the
+        fused convolution makes its own from the edge vectors."""
+        for layer in layers:
             layer.edge_vec = displacements
-        return orig(displacements, species, senders, receivers)
+        features = torch.nn.functional.one_hot(species, model.n_species).to(displacements.dtype)
+        for layer in model.layers:
+            features = layer(features, species, None, None, senders, receivers)
+        e = model.readout(features) * model.scale + model.shift
+        return e + model.atom_energies[species, None]
     model.node_energies = node_energies
     return model

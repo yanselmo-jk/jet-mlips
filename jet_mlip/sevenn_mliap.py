@@ -8,12 +8,13 @@ upstream eager path. A failed capture raises.
         [--exact_backward split|recompute] [--no-jet] [--no-graph]
 """
 import argparse
+import copy
 import os
 
 import torch
 
 import sevenn._keys as KEY
-from sevenn.mliap import SevenNetMLIAPWrapper
+from sevenn.mliap import MLIAPWrappedConvolution, MLIAPWrappedIrrepsLinear, SevenNetMLIAPWrapper
 
 from jet_mlip import ops
 from jet_mlip.mliap import GraphMLIAP
@@ -21,6 +22,8 @@ from jet_mlip.mliap import GraphMLIAP
 
 class SevenNetGraphMLIAPWrapper(GraphMLIAP, SevenNetMLIAPWrapper):
     """CUDA-graph ML-IAP wrapper. The parent's eager path is the fallback (CPU, several ranks, --no-graph)."""
+
+    pad_nodes = False
 
     def _ensure_model_initialized(self):
         if self.model is not None:
@@ -40,24 +43,43 @@ class SevenNetGraphMLIAPWrapper(GraphMLIAP, SevenNetMLIAPWrapper):
                     if getattr(m, 'use_modal_wise_' + name):
                         setattr(m, name, torch.nn.Parameter(getattr(m, name)[mi].clone(), requires_grad=False))
                         setattr(m, 'use_modal_wise_' + name, False)
+        # one rank: the fold leaves no ghost row, so the graph runs the model without upstream's ghost wrappers (their
+        # narrow / zeros / cat / exchange copies of every feature tensor: 8 of 150 ms, 7net-omni, 32768 atoms). Same
+        # modules; self.model keeps the wrappers for the eager path and several ranks.
+        self.serial = copy.copy(self.model)
+        inner = {MLIAPWrappedConvolution: 'conv', MLIAPWrappedIrrepsLinear: 'linear'}
+        self.serial._modules = {k: getattr(m, inner.get(type(m), ''), m) for k, m in self.model._modules.items()}
         # read at run time (the wrapper is pickled at deploy)
         self.use_graph = os.environ.get('JET_SEVENN_CUDA_GRAPH', '1') != '0'
         self.r_cut, self.vec_dtype = float(self.cutoff), torch.float32
         self.index_dtype = torch.int32 if self.use_jet else torch.int64
 
-    def _forward(self, vec):
-        ncap = self.key[1]
+    def _alloc(self, key):
+        super()._alloc(key)
+        self.s_rowptr = torch.zeros(key[1] + 1, dtype=torch.int32, device=self.device)
+        self.s_perm = torch.zeros(key[2], dtype=torch.int32, device=self.device)
+
+    def _prep(self):
+        super()._prep()
         # SevenNet's convs take a CSR from the data dict (row 0 = dst) instead of building one
-        rowptr, perm = ops.build_csr(self.s_ei[0], ncap)
+        ops.EDGE_MASK = self.s_mask
+        try:
+            rowptr, perm = ops.build_csr(self.s_ei[0], self.key[1])
+        finally:
+            ops.EDGE_MASK = None
+        self.s_rowptr.copy_(rowptr)
+        self.s_perm.copy_(perm)
+
+    def _forward(self, vec):
         data = {
-            KEY.JET_ROWPTR: rowptr, KEY.JET_PERM: perm, KEY.JET_SRC: self.s_ei[1].int(),
+            KEY.JET_ROWPTR: self.s_rowptr, KEY.JET_PERM: self.s_perm, KEY.JET_SRC: self.s_ei[1].int(),
             KEY.EDGE_VEC: vec,
             KEY.EDGE_IDX: self.s_ei,
             KEY.ATOMIC_NUMBERS: self.s_types,
             KEY.MLIAP_NUM_LOCAL_GHOST: self.nlg,
             KEY.LAMMPS_DATA: self.lmp_stand_in,
         }
-        return self.model(data)[KEY.ATOMIC_ENERGY]
+        return (self.model if self.key[4] else self.serial)(data)[KEY.ATOMIC_ENERGY]
 
     def compute_forces(self, lmp_data):
         self._ensure_model_initialized()

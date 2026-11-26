@@ -45,8 +45,14 @@ def test_patched_model_matches_upstream(model, device, dtype, tol_e, tol_f):
     e0, f0 = ref.get_potential_energy(atoms), ref.get_forces(atoms)
     acc = calc(model, dtype, device)
     acc.models[0] = convert.patch_model(acc.models[0], radial_table=1024)
+    sh_calls = []
+    acc.models[0].spherical_harmonics.register_forward_hook(lambda *a: sh_calls.append(1))
     e1, f1 = acc.get_potential_energy(atoms), acc.get_forces(atoms)
     assert all(b.macetp.n_eval_calls > 0 for b in acc.models[0].interactions)   # the fused path really ran
+    # the edge embeddings are computed only for blocks that read them (the density blocks: MPA-0, MATPES)
+    assert bool(sh_calls) != acc.models[0].macetp_all_fused
+    assert acc.models[0].macetp_all_fused == (model in ('medium', 'large', 'off-medium', 'off-large'))
+    assert all(b.macetp.lin is not None for b in acc.models[0].interactions)   # with the block's Linear
     assert all(b.macetp.n_split == {'large': 2, 'off-large': 2}.get(model, 1) for b in acc.models[0].interactions)
     assert abs(e1 - e0) / len(atoms) < tol_e, (e0, e1)
     assert np.abs(f1 - f0).max() < tol_f
