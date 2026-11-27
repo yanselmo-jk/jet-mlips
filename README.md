@@ -6,7 +6,7 @@ JET-MLIPs accelerates MD simulation without re-training. It optimizes the whole 
 convolution as one fused kernel (JET) and the operations around it (skip connections, linears, gates, neighbour lists).
 
 ![Equivariant-MLIP MD on one GPU: official backend vs JET-MLIPs](docs/img/toc.png)
-(benchmark conducted when the convolution layer is solely accelerated)
+(benchmark was conducted when the convolution layer is solely accelerated)
 
 
 | family   | official package             | models                                                                                                                    |
