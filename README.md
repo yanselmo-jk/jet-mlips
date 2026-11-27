@@ -6,7 +6,7 @@ JET-MLIPs accelerates MD simulation without re-training. It optimizes the whole 
 convolution as one fused kernel (JET) and the operations around it (skip connections, linears, gates, neighbour lists).
 
 ![Equivariant-MLIP MD on one GPU: official backend vs JET-MLIPs](docs/img/toc.png)
-(when the convolution layer is solely accelerated)
+(benchmark conducted when the convolution layer is solely accelerated)
 
 
 | family   | official package             | models                                                                                                                    |
@@ -202,8 +202,7 @@ the style does not exist.
 lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in in.lammps
 ```
 
-Example inputs: `lammps/examples/` (`in.mliap_d3`: any deployed file + D3; `in.sevenn_d3`: SevenNet `jet/e3gnn` + D3;
-348-atom LiPF6 EC/EMC box).
+Example inputs: `lammps/examples/`
 
 **Several GPUs** (one node, one GPU per rank, the same deployed file):
 
