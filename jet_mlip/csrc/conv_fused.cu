@@ -182,15 +182,18 @@ at::Tensor conv_fused_autograd(const at::Tensor& x, const at::Tensor& vec, const
                             split_bwd, tabidx);
 }
 
-// fp32 path-group counts of a config: [fwd, bwd, fwd table, bwd table, SMEM_MAX bytes]. Introspection only
-// (docs, checking what a bigger shared-memory limit buys on another GPU).
+// fp32 path-group counts of a config: [fwd, bwd, fwd table, bwd table, SMEM_MAX bytes, blocks per SM of the fwd table
+// kernel, of the bwd table kernel (tab_kb)]. Introspection only (docs, tests, checking what a bigger shared-memory
+// limit buys on another GPU).
 std::vector<int64_t> config_groups(int64_t cfg_id) {
   switch (cfg_id) {
 #define JET_GROUPS(ID, CFG)                                                                    \
   case ID: {                                                                                       \
     constexpr int EF = EPL_OF<float, CFG, false>, EB = EPL_OF<float, CFG, true>;                   \
+    constexpr int TF = epl_tab<CFG, false>(), TB = epl_tab<CFG, true>();                           \
     return {Groups<float, CFG, EF, false>::NG, Groups<float, CFG, EB, true>::NG,                   \
-            Groups<float, CFG, epl_tab<CFG, false>(), false, true>::NG, Groups<float, CFG, epl_tab<CFG, true>(), true, true>::NG, SMEM_MAX}; \
+            Groups<float, CFG, TF, false, true>::NG, Groups<float, CFG, TB, true, true>::NG, SMEM_MAX, \
+            tab_kb<CFG, TF, false>(), tab_kb<CFG, TB, true>()};                                    \
   }
     JET_FOREACH_CONFIG(JET_GROUPS)
 #undef JET_GROUPS

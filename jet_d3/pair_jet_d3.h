@@ -129,7 +129,8 @@ namespace LAMMPS_NS {
 
         // per-atom device buffers (natoms: the local atoms on one rank, all atoms on several)
         int n_save = -1;
-        float *d_in = nullptr;             // x[3n] frac[3n] type[n] bounds[8 nblocks]
+        double *f_dev = nullptr;           // jet/d3/kk: the Kokkos device force view; update() adds there instead of atom->f
+        float *d_in = nullptr;             // x[3n] frac[3n] type[n] bounds[8 nblocks] dest[n]
         float *h_in = nullptr;             // pinned mirror of d_in
         std::vector<int> order;            // packed atom k is source atom order[k] (cell, then type)
         std::vector<int> h_key;            // per-atom sort key of the current step

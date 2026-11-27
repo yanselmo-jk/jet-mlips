@@ -187,7 +187,7 @@ template <class Cfg> bool launch_first(const Args<float>& a, bool bwd) {
     // kernel's single stream is the faster one (H200, Si 5 A, lmax 2, fwd / bwd ms generic vs here: 512 and 1000
     // atoms 0.025 / 0.041 vs 0.029 / 0.053, 1728 atoms 0.034 / 0.059 vs 0.032 / 0.056, 2744 atoms 0.043 / 0.075 vs
     // 0.033 / 0.057; 7net-nano Si 512 in LAMMPS ran 4-5 % slower through this kernel)
-    if (a.n_out <= 3 * WARPS * sms / 2) return false;
+    if (!many_nodes(a.n_out)) return false;
     const at::Tensor ctr = at::zeros({1}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));   // as launch_k
     Args<float> ad = a;
     ad.ctr = ctr.data_ptr<int>();

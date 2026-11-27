@@ -74,6 +74,8 @@ grep -q "PairJetMLIAPKokkos" src/KOKKOS/pair_mliap_kokkos.h || git apply -C1 "$H
 # one CMake block (once). `pair_style hybrid/overlay jet/mliap m.pt jet/d3 9000 1600 damp_bj custom s6 s8 a1 a2`.
 if [ "${D3:-1}" = 1 ]; then
   cp "$HERE/../jet_d3/pair_jet_d3.cu" "$HERE/../jet_d3/pair_jet_d3.h" "$HERE/../jet_d3/pair_jet_d3_pars.h" src/
+  # jet/d3/kk (what `jet/d3` becomes under -sf kk): CMake finds pair_jet_d3_kokkos.* in src/KOKKOS by the name of the plain style
+  cp "$HERE/../jet_d3/pair_jet_d3_kokkos.cpp" "$HERE/../jet_d3/pair_jet_d3_kokkos.h" src/KOKKOS/
   grep -q 'mlip-accel: pair_jet_d3' cmake/CMakeLists.txt || cat >> cmake/CMakeLists.txt <<'CM'
 
 # --- mlip-accel: pair_jet_d3 (CUDA) ---

@@ -7,10 +7,27 @@ the SevenNet list is literal, so envs without sevenn can build it; `python -m je
 `patches/sevenn-jet*.patch`: the SevenNet 0.13.0 jet patch (pointed at `jet_mlip`), applied by
 `python -m jet_mlip.patch_sevenn`. The sevenn D3 patch was dropped in v0.4.0: D3 is `jet/d3` for every family.
 
+Radial-table convolution kernels (v0.5.0 additions):
+- First layer (`conv_first.cu`): a scalar-only input of at most 32 channels, on graphs with more destination nodes than
+  1.5 x 8 warps x SMs, runs a dedicated kernel; `JET_FIRST_LAYER=0` takes the generic kernel.
+- Blocks per SM: each config gets 2 blocks/SM per direction when its register model fits (forward <= 141, backward <=
+  154 registers); the 2-block kernel is used only on graphs above the same node threshold (small graphs are faster with
+  1); `JET_TAB_KB=1` forces 1.
+- Pair-factored fiber loop: the backward combines the fibers of one (m1, m2) pair (`q = sum coef * gout`) before
+  multiplying by sh, x and W once per pair and unit; the forward computes `coef * (x * sh)`. Only the summation order
+  changes.
+
+`jet/d3` (GPU D3): C6 interpolated once per pair, BJ or zero damping; pair sums in fp64 by default (`JET_D3_FP64=0`:
+  float-float, for GPUs with slow fp64); energy and virial sums skipped on steps that need neither; atoms packed in
+  cell order. Cut-offs are the physical ones of the D3 parametrization. Under `-sf kk` it runs as `jet/d3/kk`
+  (`pair_jet_d3_kokkos.*`): reads positions from and adds forces to the KOKKOS device views, so a `hybrid/overlay` with
+  `jet/mliap` does no per-step host/device copies; packing and the MPI gather stay on the host (one local-x copy).
+  With `jet/e3gnn`, pair_e3gnn calls `jet/d3`'s `prelaunch()` so D3 runs on its own stream during the model.
+
 Repo layout:
 - `common/`: `patch_tool.py` (apply / check / reverse the shipped patches), `radial_table.py`.
 - `patches/`: one patch per upstream version (`patches/BASE`).
-- `lammps/`: `build_lammps.sh` (ML-IAP + Kokkos CUDA + PYTHON + KSPACE + D3, one build dir per env), example inputs (`examples/`).
+- `lammps/`: `build_lammps.sh` (ML-IAP + Kokkos CUDA + PYTHON + KSPACE + D3, one build dir per env), and the examples moved to `examples/lammps/` (notebook + inputs; ASE: `examples/ase/`).
 
 ## MACE (jet_mace)
 
@@ -31,7 +48,7 @@ swapped (fused JET convolution with a radial table). Static buckets + CUDA graph
 | option | patch added | pair styles |
 |---|---|---|
 | (always) | ML-IAP Kokkos: host comm fix, neighbour data, virial reduction (`lammps/*.patch`) | `jet/mliap` (= `mliap unified <file> 0`, KOKKOS only; MACE, NequIP, Nequix, EquFlash, SevenNet ML-IAP) |
-| `D3=1` (default) | `jet_d3/` (GPU D3, also `custom s6 s8 a1 a2` BJ parameters) | `jet/d3` |
+| `D3=1` (default) | `jet_d3/` (GPU D3, also `custom s6 s8 a1 a2` BJ parameters) | `jet/d3`, `jet/d3/kk` (under `-sf kk`) |
 | `SEVENN=1` | `sevenn patch_lammps --jet` (needs sevenn + jet_mlip in the env; own source tree) | `jet/e3gnn`, `jet/e3gnn/parallel` (= `e3gnn`, `e3gnn/parallel`) |
 
 A binary runs the models of its own env: MACE (e3nn 0.4.4) needs its own env and build; SevenNet and NequIP share one
@@ -74,6 +91,7 @@ family's test folder (graph vs eager, vs upstream, files deployed with v0.2.1).
 
 | version | changes |
 |---|---|
+| v0.5.0 | skip connections (self-connection, per-element linears) as single CUDA ops and the layers around the convolution optimized; first-layer kernel, 2 blocks/SM for small radial-table kernels on large graphs, pair-factored fiber loop (7net-omni electrolyte 66.9 -> 62.0 ms/step, EquFlash v1 -10 %); `jet/d3` about 2x faster and `jet/d3/kk`; pair styles `jet/mliap`, `jet/e3gnn`; ASE neighbour list on the GPU; examples in `examples/` (notebooks) |
 | v0.3.1 | shared ML-IAP wrapper: padded edges spread over the local rows (sorted last in the masked CSR), so scatters outside the JET convolution (upstream convolutions, MACE density, NequIP ZBL) no longer serialize on one row (Nequix `--no-jet` 348 atoms: 50.8 -> 32.9 ms/step); kernels as v0.3.0; one deploy command `python -m jet_mlip.deploy <family>` |
 | v0.3.0 | one LAMMPS ML-IAP CUDA-graph wrapper for every family (`jet_mlip/mliap.py`: ghost fold, padded edges masked out of the convolution, input preparation inside the graph, no energy sync when LAMMPS does not need the energy); SevenNet ML-IAP route `jet_mlip.sevenn_mliap` (e3gnn stays the default); EquFlash v1 on the CUDA graph; radial-table kernel: 1/h as a hi/lo pair (removes a systematic table-index rounding bias); EquFlash table grid has a node at the XPLOR onset r_on (re-deploy EquFlash models); files deployed with v0.2.1 still load |
 | v0.2.1 | SevenNet deploy options on one axis: `--radial_table N` (0 or `--no-radial_table` = exact MLP), `--exact_backward split` or `recompute` (exact only; replaces `--jet_memory`, `fastest` removed); pair_e3gnn frees the warm-up cache before the CUDA-graph capture (startup peak 7net-omni 6.1 -> 4.3 GB). Kernels as v0.2.0 |
@@ -95,3 +113,5 @@ Environment variables, set in front of `lmp` (e.g. `JET_MACE_CUDA_GRAPH=0 lmp ..
 - `JET_MLIAP_CHECK=N` (debug): every N-th step and after atoms migrate, compare the step with an eager rerun and check
 LAMMPS' element types; stops the run on a mismatch.
 - `JET_ASE_GPU_NL=0`: the ASE calculators use their package's CPU neighbour list instead of `jet_mlip.neighbors`.
+- `JET_FIRST_LAYER=0`: the generic convolution kernel for the first layer instead of the dedicated one.
+- `JET_TAB_KB=1`: one block per SM for every radial-table kernel (no 2-blocks/SM variant on large graphs).

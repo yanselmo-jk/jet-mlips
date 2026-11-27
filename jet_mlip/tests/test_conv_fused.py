@@ -337,6 +337,28 @@ def test_first_layer_kernel(cfg, ntab, monkeypatch):
         assert torch.allclose(a, b, atol=1e-6 * a.abs().max().item(), rtol=1e-5), (a - b).abs().max()
 
 
+KB2 = [c for c in CFGS if max(torch.ops.jet_mlip.config_groups(ops.config_id(c))[5:]) > 1]   # tab_kb: 2 blocks per SM
+
+
+@pytest.mark.parametrize('cfg', KB2, ids=[IDS[CFGS.index(c)] for c in KB2])
+def test_table_two_blocks_per_sm(cfg, monkeypatch):
+    """Radial-table kernels built for 2 blocks per SM (tab_kb; taken above 1.5 x 8 warps x SMs dst nodes, H200 1584) ==
+    the 1-block kernels (JET_TAB_KB=1) in out, grad x and grad edge_vec. JET_FIRST_LAYER=0: the generic kernel."""
+    (x, vec, src, dst, w1, w2, w3, coeffs), tabs, _, denom, n_out = _table_case(cfg, 21, n=4100, n_out=4000,
+                                                                                degrees=(0, 12))
+    gout = torch.randn(n_out, cfg.out_dim, generator=torch.Generator().manual_seed(22)).to(DEV)
+    monkeypatch.setenv('JET_FIRST_LAYER', '0')
+    res = []
+    for kb in ('1', '2'):
+        monkeypatch.setenv('JET_TAB_KB', kb)
+        xx, vv = x.detach().clone().requires_grad_(True), vec.detach().clone().requires_grad_(True)
+        out = ops.conv_fused(cfg, xx, vv, src, dst, w1, w2, w3, coeffs, denom, R_ON, R_CUT, CST, n_out=n_out,
+                             table=tabs[0])
+        res.append((out,) + torch.autograd.grad(out, (xx, vv), gout))
+    for a, b in zip(*res):
+        assert torch.allclose(a, b, atol=1e-6 * a.abs().max().item(), rtol=1e-5), (a - b).abs().max()
+
+
 # ---- full 7net-nano / 7net-0 models: per layer and whole-model forces -------------------
 @pytest.fixture(scope='module')
 def nano():

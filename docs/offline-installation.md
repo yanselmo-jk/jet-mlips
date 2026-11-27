@@ -24,6 +24,8 @@ machine with the same OS and CUDA driver generation, then build there (the kerne
    (SevenNet's pretrained checkpoints ship inside the `sevenn` package: their names work offline. A nequip.net id is
    a package file `<name>.nequip.zip`: download it from the model's nequip.net page, or take it from
    `~/.nequip/model_cache/` after one online deploy; the `.metadata.json` next to it names the model.)
+   Nequix: `nequix-mp-1.pt` / `nequix-oam-1.pt` from `~/.cache/nequix/models/` (downloaded by the nequix package).
+   EquFlash: `equflash_oam_30M.pt` / `equflashv2_oam.pt`.
 
 ## 2. On the offline machine
 
@@ -40,6 +42,7 @@ machine with the same OS and CUDA driver generation, then build there (the kerne
    cd jet-mlips
    JET_CONFIGS=all JET_CUDA_ARCH=90 MAX_JOBS=4 pip install -e jet_mlip --no-build-isolation --no-deps
    pip install -e . --no-deps --no-build-isolation
+   JET_CUDA_ARCH=90 pip install -e jet_d3/ase --no-build-isolation --no-deps   # only for D3 in ASE
    ```
 
 3. Build LAMMPS (KOKKOS with CUDA, as `jet/mliap` needs) from the extracted source folder (the one holding `src/`;
@@ -51,7 +54,8 @@ machine with the same OS and CUDA driver generation, then build there (the kerne
    LAMMPS_DIR=$PWD/lammps-stable_22Jul2025_update6 OFFLINE=1 bash lammps/build_lammps.sh
    ```
 
-   The ML-IAP patches it applies are `lammps/*.patch`; one of them adds `pair_style jet/mliap` (KOKKOS only).
+   The ML-IAP patches it applies are `lammps/*.patch`; one of them adds `pair_style jet/mliap` (KOKKOS only). It also
+   builds `pair_style jet/d3`, which runs as `jet/d3/kk` under `-sf kk`.
 
 4. Deploy with the model file instead of a name:
 
@@ -59,6 +63,8 @@ machine with the same OS and CUDA driver generation, then build there (the kerne
    python -m jet_mlip.deploy mace   /path/to/mace_checkpoint.model          medium_jet.pt
    python -m jet_mlip.deploy nequip /path/to/NequIP-OAM-L-0.1.nequip.zip    oam-l.nequip.lmp.pt
    ```
+
+   Every supported model with its deploy line: `examples/lammps/lammps_md.ipynb` (replace names by local files).
 
 5. Run (README "Run"):
 
@@ -70,6 +76,9 @@ machine with the same OS and CUDA driver generation, then build there (the kerne
    ```bash
    lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in in.lammps
    ```
+
+   Example inputs and notebooks: `examples/lammps/`, `examples/ase/`. D3 on a consumer GeForce card: `JET_D3_FP64=0 lmp ...`
+   (README, D3).
 
 ## 3. Updating an offline install
 

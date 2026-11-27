@@ -1244,6 +1244,17 @@ __global__ void k_d3_forces_dcn(
     if (EV) { add_ev(acc, I, J, 1, 6, Ev); }
 }
 
+// jet/d3/kk: add the packed forces to the Kokkos device force view, f[dest[k]] += conv * fd[k]
+// (dest < 0: another rank owns the atom; every destination appears once, so no atomics)
+__global__ void k_d3_add_forces(int n, const int *__restrict__ dest, const double *__restrict__ fd, double conv,
+                                double *__restrict__ f) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n) { return; }
+    const int i = dest[k];
+    if (i < 0) { return; }
+    for (int m = 0; m < 3; m++) { f[3 * i + m] += fd[3 * k + m] * conv; }
+}
+
 // The kernel instances of the run-time choices: [fp64 pair sums][energy and virial sums], k_d3_forces [damping] first
 static const decltype(&k_d3_cn<false>) cn_kernels[2] = { k_d3_cn<false>, k_d3_cn<true> };
 static const decltype(&k_d3_forces<0, false, false>) forces_kernels[2][2][2] = {
@@ -1266,7 +1277,7 @@ void PairJetD3::reallocate_arrays(int n) {
     }
     n_save = n;
     const int nblocks = (n + 31) / 32;
-    const size_t in = 7 * n + 8 * nblocks;   // x, frac, type, per-block bounds
+    const size_t in = 8 * n + 8 * nblocks;   // x, frac, type, per-block bounds, dest
     CHECK_CUDA(cudaMalloc(&d_in, in * sizeof(float)));
     CHECK_CUDA(cudaMallocHost(&h_in, in * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_cn, 2 * n * sizeof(double)));
@@ -1388,8 +1399,10 @@ void PairJetD3::load_atom_info(const double lat[3][3], const D3Cell &cell) {
     float *xh = h_in, *fh = h_in + 3 * n;
     int *th = reinterpret_cast<int*>(h_in + 6 * n);
     float *bh = h_in + 7 * n;
+    int *dest = reinterpret_cast<int*>(bh + 8 * ((n + 31) / 32));   // LAMMPS index of packed atom k2, -1 if not local
     for (int k2 = 0; k2 < n; k2++) {
         const int i = order[k2];
+        dest[k2] = multi ? locidx[i] : i;
         const double *s = &h_s[3 * i];
         for (int k = 0; k < 3; k++) { fh[3 * k2 + k] = s[k]; }
         for (int m = 0; m < 3; m++) {
@@ -1452,6 +1465,7 @@ void PairJetD3::load_atom_info(const double lat[3][3], const D3Cell &cell) {
 void PairJetD3::update(int eflag, int vflag) {
     const int n = n_save;                   // packed atoms: the local ones, or all N on several ranks
     const double *fd = h_out;
+    const size_t dest_off = 7 * n + 8 * ((n + 31) / 32);   // see load_atom_info
     double ev[7] = {};
     for (int s = 0; s < D3_SLOTS; s++) {
         for (int k = 0; k < 7; k++) { ev[k] += h_out[3 * n + 8 * s + k]; }
@@ -1461,14 +1475,21 @@ void PairJetD3::update(int eflag, int vflag) {
     // job (see launch_multi_async), so the LAMMPS rank sums give the one-rank values
     if (eflag) { eng_vdwl += ev[0] * AU_TO_EV; }
 
-    double **f = atom->f;
     const double conv = AU_TO_EV / AU_TO_ANG;
-    for (int k = 0; k < n; k++) {
-        const int i = multi ? locidx[order[k]] : order[k];
-        if (i < 0) { continue; }            // another rank owns it
-        f[i][0] += fd[3 * k] * conv;
-        f[i][1] += fd[3 * k + 1] * conv;
-        f[i][2] += fd[3 * k + 2] * conv;
+    if (f_dev) {   // jet/d3/kk: add on the device; on several ranks the rank-summed forces go back first
+        if (multi) { CHECK_CUDA(cudaMemcpyAsync(d_out, h_out, 3 * n * sizeof(double), cudaMemcpyHostToDevice, stream)); }
+        k_d3_add_forces<<<(n + 255) / 256, 256, 0, stream>>>(n, reinterpret_cast<const int*>(d_in + dest_off), d_out, conv, f_dev);
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+    } else {
+        const int *dest = reinterpret_cast<const int*>(h_in + dest_off);
+        double **f = atom->f;
+        for (int k = 0; k < n; k++) {
+            const int i = dest[k];
+            if (i < 0) { continue; }            // another rank owns it
+            f[i][0] += fd[3 * k] * conv;
+            f[i][1] += fd[3 * k + 1] * conv;
+            f[i][2] += fd[3 * k + 2] * conv;
+        }
     }
 
     if (vflag) {
@@ -1573,7 +1594,7 @@ void PairJetD3::launch(bool ev) {
     double *f = d_out, *acc = d_out + 3 * n;
 
     mark(0);
-    CHECK_CUDA(cudaMemcpyAsync(d_in, h_in, (7 * n + 8 * nblocks) * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(d_in, h_in, (8 * n + 8 * nblocks) * sizeof(float), cudaMemcpyHostToDevice, stream));
     CHECK_CUDA(cudaMemsetAsync(d_out, 0, (3 * n + 8 * D3_SLOTS) * sizeof(double), stream));
     CHECK_CUDA(cudaMemsetAsync(d_cn, 0, 2 * n * sizeof(double), stream));   // cn and dc6i
     mark(1);
@@ -1591,7 +1612,8 @@ void PairJetD3::launch(bool ev) {
                                                                d_dc6i, f, acc);
     mark(5);
 
-    CHECK_CUDA(cudaMemcpyAsync(h_out, d_out, (3 * n + 8 * D3_SLOTS) * sizeof(double), cudaMemcpyDeviceToHost, stream));
+    const size_t off = f_dev ? 3 * n : 0;   // jet/d3/kk adds the forces on the device: only the energy / virial slots come back
+    CHECK_CUDA(cudaMemcpyAsync(h_out + off, d_out + off, (3 * n + 8 * D3_SLOTS - off) * sizeof(double), cudaMemcpyDeviceToHost, stream));
     mark(6);
     pending = true;
     ev_launched = ev;
@@ -1662,7 +1684,7 @@ void PairJetD3::launch_multi_async(bool ev) {
     const dim3 tiles(ntiles / 2 + 1, std::max(1, (niblocks + D3_BLOCK / 32 - 1) / (D3_BLOCK / 32)));
 
     mark(0);
-    CHECK_CUDA(cudaMemcpyAsync(d_in, h_in, (7 * n + 8 * nblocks) * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(d_in, h_in, (8 * n + 8 * nblocks) * sizeof(float), cudaMemcpyHostToDevice, stream));
     CHECK_CUDA(cudaMemcpyAsync(d_iloc, h_iloc.data(), n, cudaMemcpyHostToDevice, stream));
     if (niblocks) {
         CHECK_CUDA(cudaMemcpyAsync(d_iblocks, h_iblocks.data(), niblocks * sizeof(int), cudaMemcpyHostToDevice, stream));

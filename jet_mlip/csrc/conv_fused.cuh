@@ -5,7 +5,8 @@
 //
 // Structure (see docs/kernel_design.md):
 //   block = 8 warps, 1 block/SM (dynamic smem <= 99 KB), grid = #SMs, warps claim dst nodes from a
-//   per-launch work counter (one per path group; atomicAdd by lane 0).
+//   per-launch work counter (one per path group; atomicAdd by lane 0). The radial-table kernels of the
+//   small shapes run 2 blocks/SM on graphs with more nodes than warps (tab_kb).
 //   warp = one dst node, lane = channel u. Channel *units* (path, 32-channel chunk; config.h) are the
 //   unit of all per-channel work: mul 64/128 paths span 2/4 units, a mul-8/16 path idles lanes >= mul.
 //   edges of a node stream in tiles of EPL edges (EPL = 4 fp32, 2 fp64):
@@ -140,6 +141,11 @@ template <class Cfg, int U0, int U1> struct GroupFibers {
   static constexpr int unit(int k) { return unit_of<Cfg>(Cfg::fibers[list.f[k]].p, list.ch[k]); }
   // last fiber of a run of one unit: per-unit partial sums are folded there (W / dW applied once per run)
   static constexpr bool run_end(int k) { return k + 1 == N || unit(k + 1) != unit(k); }
+  // last fiber of one (m1, m2) pair of a unit; a pair's fibers (its m3) are consecutive (tables.py: m1, m2, m3 order)
+  static constexpr bool pair_end(int k) {
+    return run_end(k) || Cfg::fibers[list.f[k + 1]].m1 != Cfg::fibers[list.f[k]].m1
+           || Cfg::fibers[list.f[k + 1]].m2 != Cfg::fibers[list.f[k]].m2;
+  }
 };
 // W3T tile columns of group [U0,U1) (live columns; the tile is padded to (U1-U0)*32 with zeros)
 template <class Cfg> constexpr int g_col0(int U0) { return u_col<Cfg>(U0); }
@@ -269,6 +275,28 @@ template <class T, class Cfg, int EPL, bool BWD, bool TABLE = false> struct Grou
   static constexpr int W3T_ELEMS = TABLE ? 0 : UPG * 32 * W3S<T>;
   static constexpr int SMEM = FIXED + UPG * PER_UNIT;
 };
+
+// Blocks per SM of a radial-table kernel on a graph with more nodes than warps (launch(), many_nodes): 2 where the
+// kernel fits the 128 registers per lane of two resident blocks, else 1. The kernels are latency bound, so the second
+// block pays unless its register cap spills. H200, 10,040-atom electrolyte, 6 A (803k edges), ms at 1 -> 2 blocks per
+// SM (bytes spilled at 2), fwd / bwd: 7net-nano L2 0.31 -> 0.26 (0) / 0.67 -> 0.52 (0); 7net-0 L1 2.13 -> 1.95 (8) /
+// 3.38 -> 4.72 (376); NequIP-OAM-M L1 1.74 -> 1.58 (0) / 2.66 -> 3.07 (224); NequIP-OAM-S L1 0.43 -> 0.41 (0) /
+// 0.67 -> 0.71 (24); 7net-0 L4 0.54 -> 0.56 (56) / 0.88 -> 0.98 (136); 7net-omni L2 8.3 -> 17.5 (440) / 20.3 -> 31.1
+// (672). 3 and 4 blocks gain a further 5-13 % only on the smallest kernels (about 100 registers at one block) and lose
+// elsewhere: not built.
+// The count is tab_maxu's model of the largest group, less the Hermite position (6 registers) of every edge a tile of
+// EPL < 4 does not hold. The limits are the last counts that ptxas fits into 128 registers on the 32 shapes of
+// configs.py: fwd 141 (8 B spilled; 143: 56 B, a 2 % gain; 153: 4 % slower), bwd 154 (0 B; 164: 24 B, 5 % slower).
+constexpr int KB2_FWD_REGS = 141, KB2_BWD_REGS = 154;
+template <class Cfg, int EPL, bool BWD> constexpr int tab_kb() {
+  using G = Groups<float, Cfg, EPL, BWD, true>;
+  int m = 0;
+  for (int u0 = 0; u0 < G::NU; u0 += G::UPG) {
+    const int u1 = cmin(G::NU, u0 + G::UPG), r = BWD ? tbwd_regs<Cfg, EPL>(u0, u1) : tfwd_regs<Cfg, EPL>(u0, u1);
+    m = r > m ? r : m;
+  }
+  return m - 6 * (4 - EPL) <= (BWD ? KB2_BWD_REGS : KB2_FWD_REGS) ? 2 : 1;
+}
 
 // edges per tile: the largest of 4/2/1 whose fwd and bwd tiles fit in smem and whose backward keeps at least 2 units
 // per group in the register budget (lmax 3, wide x: EPL 4 -> 2). fp64 (gradcheck only) stops at 2: where the
@@ -632,7 +660,7 @@ __device__ __forceinline__ void fwd_node(const Args<T>& a, int node, const T* w1
         constexpr auto fb = Cfg::fibers[GF::list.f[k]];
         constexpr int i = unit_of<Cfg>(fb.p, ch), xi = xr_off<Cfg>(U0, U1, xb_of<Cfg>(fb.p), ch) + fb.m1;
         constexpr int ai = acc_off<Cfg>(U0, i) + fb.m3, si = Cfg::paths[fb.p].off2 + fb.m2;
-        y[ai] += T(fb.coef) * xr[e][xi] * sh[si];
+        y[ai] += T(fb.coef) * (xr[e][xi] * sh[si]);   // x * sh: once per (m1, m2) pair
         if constexpr (GF::run_end(k)) {
           constexpr int a0 = acc_off<Cfg>(U0, i), D3 = 2 * Cfg::paths[fb.p].l3 + 1;
 #pragma unroll
@@ -695,8 +723,8 @@ __device__ __forceinline__ int next_node(int* ctr) {
   return __shfl_sync(0xffffffffu, n, 0);
 }
 
-template <class T, class Cfg, int EPL, bool TABLE>
-__global__ void __launch_bounds__(THREADS, 1) fwd_kernel(Args<T> a) {
+template <class T, class Cfg, int EPL, bool TABLE, int KB = 1>
+__global__ void __launch_bounds__(THREADS, KB) fwd_kernel(Args<T> a) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   using G = Groups<T, Cfg, EPL, false, TABLE>;
   T* w1s = reinterpret_cast<T*>(smem_raw);
@@ -781,25 +809,34 @@ __device__ __forceinline__ void bwd_tile(const Args<T>& a, int ne, const T* w1s,
 #pragma unroll
     for (int i = 0; i < NXR; ++i) gx[i] = T(0);
     using GF = GroupFibers<Cfg, U0, U1>;
-    constexpr int NY = TABLE ? acc_off<Cfg>(U0, U1) : 1;
-    T y[NY];   // table mode: W-free message of the current unit run, gr += dW * <gacc, y> at its end
+    // table mode, pair-factored: q = sum over the m3 of one (m1, m2) pair of coef * gacc, then the W-free sums of the
+    // current unit run pa[m1] += sh q, pb[m2] += x q (1 FMA per fiber + 2 per pair instead of 3 FMA + 2 mul per
+    // fiber); W / dW applied once at the run's end: grad_x += W pa, grad_sh += W pb, grad_r += dW <sh, pb>
+    constexpr int NPS = TABLE ? 2 * Cfg::LMAX + 1 : 1;
+    T q = T(0), pa[NPS], pb[NPS];
 #pragma unroll
-    for (int k = 0; k < NY; ++k) y[k] = T(0);
+    for (int m = 0; m < NPS; ++m) { pa[m] = T(0); pb[m] = T(0); }
     static_for<GF::N>([&](auto kk) {
       constexpr int k = decltype(kk)::value, ch = GF::list.ch[k];
       constexpr auto fb = Cfg::fibers[GF::list.f[k]];
       constexpr int i = unit_of<Cfg>(fb.p, ch), xi = xr_off<Cfg>(U0, U1, xb_of<Cfg>(fb.p), ch) + fb.m1;
       constexpr int ai = acc_off<Cfg>(U0, i) + fb.m3, si = Cfg::paths[fb.p].off2 + fb.m2;
       if constexpr (TABLE) {
-        const T cx = T(fb.coef) * xr[e][xi], g = gacc[ai] * W[e][i - U0];   // g: CSE'd per (unit, m3)
-        y[ai] += cx * sh[si];
-        gsh[si] += cx * g;
-        gx[xi] += T(fb.coef) * sh[si] * g;
+        q += T(fb.coef) * gacc[ai];
+        if constexpr (GF::pair_end(k)) {
+          pa[fb.m1] += sh[si] * q;
+          pb[fb.m2] += xr[e][xi] * q;
+          q = T(0);
+        }
         if constexpr (GF::run_end(k)) {
-          constexpr int a0 = acc_off<Cfg>(U0, i), D3 = 2 * Cfg::paths[fb.p].l3 + 1;
+          constexpr auto P = Cfg::paths[fb.p];
+          constexpr int x0 = xi - fb.m1, s0 = si - fb.m2;
+          const T w = W[e][i - U0];
           T s = T(0);
 #pragma unroll
-          for (int m = 0; m < D3; ++m) { s += gacc[a0 + m] * y[a0 + m]; y[a0 + m] = T(0); }
+          for (int m = 0; m < 2 * P.l1 + 1; ++m) { gx[x0 + m] += w * pa[m]; pa[m] = T(0); }
+#pragma unroll
+          for (int m = 0; m < 2 * P.l2 + 1; ++m) { gsh[s0 + m] += w * pb[m]; s += sh[s0 + m] * pb[m]; pb[m] = T(0); }
           gr[e] += dW[e][i - U0] * s;
         }
       } else {
@@ -1058,8 +1095,8 @@ __device__ __forceinline__ void bwd_node(const Args<T>& a, int node, const T* w1
 }
 
 
-template <class T, class Cfg, int EPL, bool TABLE>
-__global__ void __launch_bounds__(THREADS, 1) bwd_kernel(Args<T> a) {
+template <class T, class Cfg, int EPL, bool TABLE, int KB = 1>
+__global__ void __launch_bounds__(THREADS, KB) bwd_kernel(Args<T> a) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   using G = Groups<T, Cfg, EPL, true, TABLE>;
   using St = Stage<T, EPL, Cfg::SH_DIM, !TABLE>;
@@ -1168,15 +1205,25 @@ Args<T> make_args(const at::Tensor& x, const at::Tensor& vec, const at::Tensor& 
 }
 
 // One block per SM as soon as there is a node for each (nodes are handed out per warp): with fewer than 8 nodes per SM
-// the warps of ceil(n_out / 8) full blocks shared half of the SMs (512 atoms: 64 blocks on 132 SMs).
-inline int grid_for(int n_out) {
+// the warps of ceil(n_out / 8) full blocks shared half of the SMs (512 atoms: 64 blocks on 132 SMs). kb blocks per SM
+// for the kernels built to share one (tab_kb).
+inline int grid_for(int n_out, int kb = 1) {
   const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-  return std::max(1, std::min(sms, n_out));
+  return std::max(1, std::min(kb * sms, n_out));
+}
+// More dst nodes than 1.5 x the warps of one block per SM. Up to there every node has a warp of its own (or nearly) and
+// the kernels built for one block per SM are the faster ones: H200, Si 5 A, the 2-block kernels of tab_kb run 7-31 %
+// slower than the 1-block ones at 512 atoms, up to 19 % slower at 1000 and 6-18 % faster at 1728 (conv_first.cu: the
+// same crossover).
+inline bool many_nodes(int n_out) {
+  return n_out > 3 * WARPS * at::cuda::getCurrentDeviceProperties()->multiProcessorCount / 2;
 }
 
-template <class T, class Cfg, int EPL, bool BWD, bool TABLE>
+template <class T, class Cfg, int EPL, bool BWD, bool TABLE, int KB = 1>
 void launch_k(const Args<T>& a) {
-  auto kern = BWD ? bwd_kernel<T, Cfg, EPL, TABLE> : fwd_kernel<T, Cfg, EPL, TABLE>;
+  void (*kern)(Args<T>);   // if constexpr: a ?: would instantiate (and compile) the other direction's kernel too
+  if constexpr (BWD) kern = bwd_kernel<T, Cfg, EPL, TABLE, KB>;
+  else kern = fwd_kernel<T, Cfg, EPL, TABLE, KB>;
   constexpr int smem = Groups<T, Cfg, EPL, BWD, TABLE>::SMEM;
   static_assert(Groups<T, Cfg, EPL, BWD, TABLE>::FITS && smem <= SMEM_MAX,
                 "conv_fused: config not supported (no path group fits in shared memory)");
@@ -1195,7 +1242,7 @@ void launch_k(const Args<T>& a) {
   const at::Tensor ctr = at::zeros({Groups<T, Cfg, EPL, BWD, TABLE>::NG}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
   Args<T> ad = a;
   ad.ctr = ctr.data_ptr<int>();
-  kern<<<grid_for(a.n_out), THREADS, smem, stream>>>(ad);
+  kern<<<grid_for(a.n_out, KB), THREADS, smem, stream>>>(ad);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1234,7 +1281,15 @@ template <class T, class Cfg, int EPL, bool BWD>
 void launch(const Args<T>& a) {
   if constexpr (sizeof(T) == 4) {
     if (a.table != nullptr) {
-      launch_k<T, Cfg, epl_tab<Cfg, BWD>(), BWD, true>(a);
+      constexpr int ET = epl_tab<Cfg, BWD>(), KB = tab_kb<Cfg, ET, BWD>();
+      bool shared = false;   // KB blocks per SM
+      if constexpr (KB > 1) {
+        // JET_TAB_KB=1: one block per SM on every graph. Read per launch: a CUDA graph keeps what its capture saw.
+        const char* e = std::getenv("JET_TAB_KB");
+        shared = many_nodes(a.n_out) && !(e != nullptr && e[0] == '1');
+        if (shared) launch_k<T, Cfg, ET, BWD, true, KB>(a);
+      }
+      if (!shared) launch_k<T, Cfg, ET, BWD, true>(a);
       if constexpr (BWD) {
         const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
         tbwd_vec_kernel<T, Cfg::SH_DIM><<<std::max(1, std::min((a.n_edge + 255) / 256, 8 * sms)), 256, 0,
