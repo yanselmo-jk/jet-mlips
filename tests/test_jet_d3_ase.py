@@ -28,9 +28,10 @@ def energy(calc, atoms, i, k, d=0.0):
     return a.get_potential_energy()
 
 
-def test_forces_stress():
+@pytest.mark.parametrize('damping', ['bj', 'zero'])
+def test_forces_stress(damping):
     atoms = cubic(rattle=0.05)
-    calc = JetD3Calculator()
+    calc = JetD3Calculator(damping=damping)
     atoms.calc = calc
     f = atoms.get_forces()
     stress = atoms.get_stress()
@@ -55,6 +56,19 @@ def test_forces_stress():
             a.set_cell(atoms.cell.array @ deform.T, scale_atoms=True)
             es.append(a.get_potential_energy())
         assert abs((es[0] - es[1]) / (2 * eps * vol) - stress[voigt]) < 1e-5, voigt
+
+
+def test_prelaunch_without_sums():
+    """pair_e3gnn launches D3 before compute() knows eflag / vflag; a launch that left the energy and virial sums out
+    (here: no step marked) is repeated by compute(), so the result is the one of a plain compute()."""
+    from jet_d3_ase._C import D3
+    atoms = cubic(rattle=0.05)
+    d3 = D3(['9000', '1600', 'damp_bj', 'pbe'], ['Si'])
+    args = (atoms.positions, np.ones(len(atoms), dtype=np.int32), [*atoms.cell.lengths(), 0, 0, 0, 0, 0, 0], [1, 1, 1])
+    e0, f0, v0 = d3.compute(*args)
+    e1, f1, v1 = d3.compute(*args, prelaunch=True)
+    assert e0 < 0 and abs(e1 - e0) < 1e-12
+    assert np.abs(f1 - f0).max() < 1e-12 and np.abs(v1 - v0).max() < 1e-10
 
 
 def rotation(seed=1):

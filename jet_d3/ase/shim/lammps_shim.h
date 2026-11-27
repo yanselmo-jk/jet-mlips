@@ -91,6 +91,10 @@ public:
 };
 
 class Force {};
+class Update {
+public:
+    bigint ntimestep = 0, eflag_global = -1, vflag_global = -1;   // no integrator here: no step is marked
+};
 class Neighbor {};
 class NeighList {};
 
@@ -102,6 +106,7 @@ public:
     Domain *domain = nullptr;
     Comm *comm = nullptr;
     Force *force = nullptr;
+    Update *update = nullptr;
     Neighbor *neighbor = nullptr;
     MPI_Comm world = 0;
 };

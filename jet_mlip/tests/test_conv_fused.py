@@ -245,9 +245,9 @@ def test_backward_without_grad_x():
 
 
 # ---- 3-D (per element pair) tables: MACE MPA-0 / OMAT-0, NequIP per-edge-type tables ---------------
-def _table_case(cfg, seed, k=3):
+def _table_case(cfg, seed, k=3, n=40, n_out=35, **kw):
     """fp32 case with a (k, n, 4*NW) table of k distinct radial tables and a random per-edge table index."""
-    t, denom, n_out = random_case(cfg, n=40, seed=seed, n_out=35)
+    t, denom, n_out = random_case(cfg, n=n, seed=seed, n_out=n_out, **kw)
     x, vec, src, dst, w1, w2, w3, coeffs = [v.float() if v.is_floating_point() else v for v in t]
     g = torch.Generator().manual_seed(seed)
     tabs = torch.stack([ops.make_radial_table(cfg, w1, w2, torch.randn(w3.shape, generator=g).to(DEV), coeffs,
@@ -307,6 +307,34 @@ def test_table_rank_mismatch():
                        table=tabs[0], table_idx=ti)
     with pytest.raises(RuntimeError, match='3-D table needs table_idx'):
         ops.conv_fused(cfg, x, vec, src, dst, w1, w2, w3, coeffs, denom, R_ON, R_CUT, CST, n_out=n_out, table=tabs)
+
+
+SCALAR_IN = [c for c in CFGS if len(c.irreps_x) == 1 and c.irreps_x[0].ir.l == 0 and c.irreps_x[0].mul <= 32
+             and all(c.live_out)]   # the shapes conv_first.cu takes
+
+
+@pytest.mark.parametrize('cfg', SCALAR_IN, ids=[str(c.irreps_x) + '|lmax' + str(c.lmax) for c in SCALAR_IN])
+@pytest.mark.parametrize('ntab', [1, 3], ids=['2d', '3d'])
+def test_first_layer_kernel(cfg, ntab, monkeypatch):
+    """Scalar-only input of <= 32 channels on the radial table: the first-layer kernel (csrc/conv_first.cu) == the generic
+    kernel (JET_FIRST_LAYER=0) in out, grad x and grad edge_vec; ghost sources (n_out < N), isolated nodes, unsorted dst,
+    edges beyond the cutoff, with and without grad x. 4000 dst nodes: the kernel takes more than 1.5 x 8 warps x SMs
+    (H200 1584), smaller graphs stay on the generic kernel."""
+    (x, vec, src, dst, w1, w2, w3, coeffs), tabs, ti, denom, n_out = _table_case(cfg, 19, n=4100, n_out=4000,
+                                                                                 degrees=(0, 12))
+    tab, idx = (tabs, ti) if ntab == 3 else (tabs[0], None)
+    gout = torch.randn(n_out, cfg.out_dim, generator=torch.Generator().manual_seed(20)).to(DEV)
+    res = []
+    for first in ('0', '1'):
+        monkeypatch.setenv('JET_FIRST_LAYER', first)
+        xx, vv = x.detach().clone().requires_grad_(True), vec.detach().clone().requires_grad_(True)
+        out = ops.conv_fused(cfg, xx, vv, src, dst, w1, w2, w3, coeffs, denom, R_ON, R_CUT, CST, n_out=n_out,
+                             table=tab, table_idx=idx)
+        gv_only = torch.autograd.grad(out, vv, gout, retain_graph=True)   # the first layer of a model: no grad x
+        res.append((out,) + torch.autograd.grad(out, (xx, vv), gout) + gv_only)
+    assert not torch.equal(res[0][0], res[1][0]), 'bit-identical outputs: the first-layer kernel did not run'
+    for a, b in zip(*res):
+        assert torch.allclose(a, b, atol=1e-6 * a.abs().max().item(), rtol=1e-5), (a - b).abs().max()
 
 
 # ---- full 7net-nano / 7net-0 models: per layer and whole-model forces -------------------

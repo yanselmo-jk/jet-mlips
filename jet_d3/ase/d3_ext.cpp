@@ -5,7 +5,8 @@
    elements = the element of each LAMMPS type, in type order (pair_coeff * * <elements>).
    compute(x, type, box, periodic) with x (N, 3) in Angstrom in the LAMMPS frame (restricted triclinic),
    type (N,) 1-based, box = (xprd, yprd, zprd, xy, xz, yz, xlo, ylo, zlo), periodic = 3 flags
-   -> (energy eV, forces (N, 3) eV/A, virial (xx, yy, zz, xy, xz, yz) eV), as LAMMPS' eng_vdwl / f / virial. */
+   -> (energy eV, forces (N, 3) eV/A, virial (xx, yy, zz, xy, xz, yz) eV), as LAMMPS' eng_vdwl / f / virial.
+   prelaunch=True (tests): launch first the way pair_e3gnn does, before compute() and its energy / virial flags. */
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -21,7 +22,7 @@ class D3 {
 public:
     D3(const std::vector<std::string> &settings, const std::vector<std::string> &elements) {
         lmp.memory = &memory; lmp.error = &error; lmp.atom = &atom; lmp.domain = &domain; lmp.comm = &comm;
-        lmp.force = &force; lmp.neighbor = &neighbor;
+        lmp.force = &force; lmp.neighbor = &neighbor; lmp.update = &update;
         atom.ntypes = static_cast<int>(elements.size());
         pair = std::make_unique<PairJetD3>(&lmp);
         std::vector<std::string> s = settings;
@@ -34,7 +35,7 @@ public:
 
     py::tuple compute(py::array_t<double, py::array::c_style | py::array::forcecast> x,
                       py::array_t<int, py::array::c_style | py::array::forcecast> type, std::vector<double> box,
-                      std::vector<int> periodic) {
+                      std::vector<int> periodic, bool prelaunch) {
         if (x.ndim() != 2 || x.shape(1) != 3) throw std::invalid_argument("x must be (N, 3)");
         const int n = static_cast<int>(x.shape(0));
         if (type.ndim() != 1 || type.shape(0) != n) throw std::invalid_argument("type must be (N,)");
@@ -60,6 +61,7 @@ public:
         atom.x = xrows.data(); atom.f = frows.data(); atom.type = types.data(); atom.tag = tags.data();
         atom.nlocal = n; atom.natoms = n;
 
+        if (prelaunch) PairJetD3::prelaunch(pair.get());
         pair->compute(1, 1);
 
         py::array_t<double> f({n, 3});
@@ -77,7 +79,7 @@ private:
         f(static_cast<int>(a.size()), a.data());
     }
 
-    Memory memory; Error error; Atom atom; Domain domain; Comm comm; Force force; Neighbor neighbor;
+    Memory memory; Error error; Atom atom; Domain domain; Comm comm; Force force; Neighbor neighbor; Update update;
     LAMMPS lmp;
     std::unique_ptr<PairJetD3> pair;
     std::vector<double> xs, fs;
@@ -91,5 +93,6 @@ PYBIND11_MODULE(_C, m) {
     py::class_<D3>(m, "D3")
         .def(py::init<const std::vector<std::string> &, const std::vector<std::string> &>(), py::arg("settings"),
              py::arg("elements"))
-        .def("compute", &D3::compute, py::arg("x"), py::arg("type"), py::arg("box"), py::arg("periodic"));
+        .def("compute", &D3::compute, py::arg("x"), py::arg("type"), py::arg("box"), py::arg("periodic"),
+             py::arg("prelaunch") = false);
 }

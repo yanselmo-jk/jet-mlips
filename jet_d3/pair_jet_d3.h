@@ -101,11 +101,12 @@ namespace LAMMPS_NS {
         void gather_atoms();
         void set_cell(D3Cell&, double lat[3][3]);
         void load_atom_info(const double lat[3][3], const D3Cell &cell);
-        void launch();
-        void launch_multi_async();
+        void launch(bool ev);
+        void launch_multi_async(bool ev);
         void finish_multi(int, int);
         void update(int, int);
         bool pending = false;              // launch() / launch_multi_async() done for the current positions, compute() must still collect
+        bool ev_launched = false;          // the pending launch sums the energy and the virial
 
         static constexpr int MAXC = 5;                  // maximum C6 references per element
         static constexpr double AU_TO_ANG = 0.52917726; // atomic unit --> angstrom
@@ -124,6 +125,7 @@ namespace LAMMPS_NS {
         D3Tables tab;                      // device element tables
         cudaStream_t stream = nullptr;     // all D3 GPU work runs and is waited for on this stream
         bool multi = false;                // comm->nprocs > 1: all N atoms replicated, images (see launch_multi_async)
+        bool fp64_sums = false;            // pair sums in fp64 instead of float-float (see allocate())
 
         // per-atom device buffers (natoms: the local atoms on one rank, all atoms on several)
         int n_save = -1;

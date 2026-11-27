@@ -14,6 +14,9 @@ using namespace cf;
 }  // namespace
 namespace cf {
 JET_FOREACH_CONFIG(JET_EXTERN)
+// conv_first.cu: scalar-only input (first layer) on the radial table; false = not that case, take the generic kernel
+bool first_layer(int64_t cfg_id, const Args<float>& a, bool bwd);
+inline bool first_layer(int64_t, const Args<double>&, bool) { return false; }
 }  // namespace cf
 #undef JET_EXTERN
 namespace {
@@ -72,7 +75,7 @@ at::Tensor conv_fused_cuda(const at::Tensor& x, const at::Tensor& vec, const at:
     AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "conv_fused", [&] {                                \
       auto a = make_args<scalar_t>(x, vec, src, rowptr, perm, w1, w2, w3, coeffs, denom, r_on, r_cut, cst, tab, tabidx); \
       a.out = out.data_ptr<scalar_t>();                                                            \
-      launch<scalar_t, CFG, EPL_OF<scalar_t, CFG, false>, false>(a);                                           \
+      if (!first_layer(ID, a, false)) launch<scalar_t, CFG, EPL_OF<scalar_t, CFG, false>, false>(a); \
     });                                                                                            \
     break;                                                                                         \
   }
@@ -114,7 +117,7 @@ std::tuple<at::Tensor, at::Tensor> conv_fused_bwd_cuda(
       a.gh2 = gh2.defined() ? gh2.data_ptr<scalar_t>() : nullptr;                                 \
       if (tab.has_value()) gshb = at::zeros({vec.size(0), CFG::SH_DIM + 1}, x.options());          \
       a.gshb = gshb.defined() ? gshb.data_ptr<scalar_t>() : nullptr;                              \
-      launch<scalar_t, CFG, EPL_OF<scalar_t, CFG, true>, true>(a);                                            \
+      if (!first_layer(ID, a, true)) launch<scalar_t, CFG, EPL_OF<scalar_t, CFG, true>, true>(a); \
     });                                                                                            \
     break;                                                                                         \
   }

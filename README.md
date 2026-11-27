@@ -228,6 +228,8 @@ pair_coeff * * jet/d3 Li C H O N F S P B
 
 &lt;functional&gt;: functional name such as `pbe`, or `custom s6 s8 a1 a2` with `damp_bj`.
 
+Precision: `JET_D3_FP64=0` is recommended on consumer GeForce cards, `JET_D3_FP64=1` (default) on data-center GPUs.
+
 **SevenNet's own pair style** `jet/e3gnn` (= SevenNet's `e3gnn`, which still works; faster than ML-IAP for SevenNet
 models at every size measured; needs the `SEVENN=1` LAMMPS build):
 

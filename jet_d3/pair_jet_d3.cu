@@ -31,8 +31,9 @@
    two blocks' fractional-coordinate bounds are farther apart than the
    cut-off (blocks_near): the tile scan then only touches the blocks inside
    the cut-off instead of all N^2/2 of them. A small box (fewer than 3 cells
-   of half the cut-off per periodic direction) keeps the plain type order
-   and no prefilter, so its sums are the same as before.
+   of half the cut-off per periodic direction) has no prefilter (every block
+   pair has images inside the cut-off) but keeps the cell order, which keeps
+   the image loops of a warp coherent.
 
    On more than one MPI rank (see launch_multi_async) every rank holds all N
    atoms: one MPI_Allgatherv of the local (tag, x, type) per step, packed
@@ -62,6 +63,7 @@
 #include <cstring>
 
 #include "force.h"
+#include "update.h"
 
 using namespace LAMMPS_NS;
 
@@ -138,6 +140,10 @@ void PairJetD3::allocate() {
     allocated = 1;
     // own non-blocking stream: no implicit sync with the legacy stream 0 (torch streams of pair_e3gnn)
     CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    // Pair sums in plain fp64 (default); JET_D3_FP64=0: float-float sums, much faster where fp64 adds run at 1/32 of
+    // the fp32 rate or less (consumer GPUs). The user chooses: no automatic choice by architecture.
+    const char *e = std::getenv("JET_D3_FP64");
+    fp64_sums = !(e && std::strcmp(e, "0") == 0);
 
     int np1 = atom->ntypes + 1;
     memory->create(setflag, np1, np1, "pair:setflag");
@@ -845,10 +851,13 @@ __device__ __forceinline__ bool blocks_near(const float *bi, const float *bj, co
 // reduction for i, steps for j) are float-float (two_sum), so +F and -F of a pair reach the two
 // atoms with the same rounding. The partial sums are flushed every D3_CHUNK steps into Ai (atom
 // 32 I + lane), Aj (atom 32 J + lane) and Ev (warp total of component k on lane k, one fp64 add per flush).
+// F64 (default; JET_D3_FP64=0 selects float-float, see PairJetD3::allocate): the sums over pairs are plain fp64 instead,
+// the i side reduced over the lanes in fp64 and both sides added straight into Ai / Aj (exact sums of
+// the same fp32 pair values, so at least as accurate as float-float, with a fraction of the adds).
 // ilocal (several ranks): a step whose i atom this rank does not own is skipped, so a pair is
 // computed once in the whole job, by the rank of its lower-block atom; the j side of an
 // off-diagonal tile still counts (the owner of j sums it after the ranks are allreduced).
-template <int NI, int NEV, int U, class Body>
+template <int NI, int NEV, int U, bool F64, class Body>
 __device__ __forceinline__ void tile_pairs(int n, int I, int J, const unsigned char *ilocal,
                                            double (&Ai)[NI], double (&Aj)[NI], double &Ev, Body &&body) {
     const int lane = threadIdx.x & 31;
@@ -872,20 +881,28 @@ __device__ __forceinline__ void tile_pairs(int n, int I, int J, const unsigned c
             const bool self = diag && s + u == lane;
             if (i < n && j < n && (!ilocal || ilocal[i]) && (!diag || lane >= s + u)) { body(i, self, !self, ci[u], cj[u], self ? fs : fe); }
             #pragma unroll
-            for (int k = 0; k < NI; k++) { two_sum(fj[k], fjl[k], cj[u][k]); }
+            for (int k = 0; k < NI; k++) {
+                if (F64) { Aj[k] += static_cast<double>(cj[u][k]); } else { two_sum(fj[k], fjl[k], cj[u][k]); }
+            }
         }
         #pragma unroll
         for (int k = 0; k < NI; k++) {
             #pragma unroll
             for (int u = 0; u < U; u++) {
-                float t = ci[u][k], tl = 0.0f;
-                warp_sum2(t, tl);
-                if (lane == s + u) { two_sum(fi[k], fil[k], t); fil[k] = __fadd_rn(fil[k], tl); }
+                if (F64) {
+                    double t = static_cast<double>(ci[u][k]);
+                    for (int off = 16; off > 0; off >>= 1) { t += __shfl_xor_sync(D3_FULL, t, off); }
+                    if (lane == s + u) { Ai[k] += t; }
+                } else {
+                    float t = ci[u][k], tl = 0.0f;
+                    warp_sum2(t, tl);
+                    if (lane == s + u) { two_sum(fi[k], fil[k], t); fil[k] = __fadd_rn(fil[k], tl); }
+                }
             }
         }
         if (((s + U) & (D3_CHUNK - 1)) == 0) {
             #pragma unroll
-            for (int k = 0; k < NI; k++) {
+            for (int k = 0; k < NI && !F64; k++) {
                 Ai[k] += static_cast<double>(fi[k]) + static_cast<double>(fil[k]);
                 Aj[k] += static_cast<double>(fj[k]) + static_cast<double>(fjl[k]);
                 fi[k] = fj[k] = fil[k] = fjl[k] = 0.0f;
@@ -912,6 +929,7 @@ __device__ __forceinline__ void add_ev(double *acc, int I, int J, int first, int
    sides, see tile_of_warp; the partial arrays are summed by the caller)
 ------------------------------------------------------------------------- */
 
+template <bool F64>
 __global__ void k_d3_cn(
     int n, int niblocks, const int *__restrict__ iblocks, const unsigned char *__restrict__ ilocal,
     D3Cell cell, D3Tables tab, float cnthr, float K1,
@@ -930,7 +948,7 @@ __global__ void k_d3_cn(
     const float rcov_j = tab.rcov[type[jj]];
 
     double Ai[1], Aj[1], Ev;
-    tile_pairs<1, 0, 4>(n, I, J, ilocal, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *) {
+    tile_pairs<1, 0, 4, F64>(n, I, J, ilocal, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *) {
         const float rcov_sum = tab.rcov[type[i]] + rcov_j;
         const float d[3] = { xj[0] - x[3*i], xj[1] - x[3*i+1], xj[2] - x[3*i+2] };
         const float s[3] = { sj[0] - frac[3*i], sj[1] - frac[3*i+1], sj[2] - frac[3*i+2] };
@@ -1015,12 +1033,14 @@ __global__ void k_d3_weights(
    Two-body dispersion: forces, dE/dCN, energy and virial
 
    DAMP: 0 zero damping, 1 Becke-Johnson. The j side of a pair needs the
-   force -F and dC6_ij/dCN_j = wn_i . u_j^{ti}.
+   force -F and dC6_ij/dCN_j = wn_i . u_j^{ti}. EV = false leaves out the
+   energy and virial sums, for the steps on which LAMMPS asks for neither
+   (most MD steps without a barostat): forces and dE/dCN are the same.
 ------------------------------------------------------------------------- */
 
 // 8 blocks per SM: the extra warps hide the per-image dependency chains better
 // than the registers they cost (64 instead of ~100, a little spilling)
-template <int DAMP>
+template <int DAMP, bool F64, bool EV>
 __global__ void __launch_bounds__(D3_BLOCK, 8) k_d3_forces(
     int n, int niblocks, const int *__restrict__ iblocks, const unsigned char *__restrict__ ilocal,
     D3Cell cell, D3Tables tab, float rthr,
@@ -1050,7 +1070,7 @@ __global__ void __launch_bounds__(D3_BLOCK, 8) k_d3_forces(
 
     // ci / cj: f (3), dE/dCN; ev: energy, virial xx yy zz xy xz yz
     double Ai[4], Aj[4], Ev;
-    tile_pairs<4, 7, 1>(n, I, J, ilocal, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *ev) {
+    tile_pairs<4, EV ? 7 : 0, 1, F64>(n, I, J, ilocal, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *ev) {
         const int ti = type[i];
         const float d[3] = { xj[0] - x[3*i], xj[1] - x[3*i+1], xj[2] - x[3*i+2] };
         const float s[3] = { sj[0] - frac[3*i], sj[1] - frac[3*i+1], sj[2] - frac[3*i+2] };
@@ -1084,26 +1104,23 @@ __global__ void __launch_bounds__(D3_BLOCK, 8) k_d3_forces(
             if (jside) { dc6j = fmaf(wi[b], uj[b], dc6j); }
         }
 
+        // C6 is the same for every image of a pair, so the image loop sums the C6-free terms (fp32, one
+        // pair): G = sum g r with the pair force F = C6 g r, S = sum of the damped 1/r^6 and 1/r^8 terms
+        // (energy and dE/dCN) and P = sum g r r (virial). C6 and dC6/dCN scale them once per pair below.
+        float G[3] = { 0.0f, 0.0f, 0.0f }, S = 0.0f, P[6] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
         for_images(cell, cell.rch_vdw, d, s, self, [&](const float *rij, float r2) {
             if (r2 > rthr) { return; }
-            float vec[3], dc6_rest;
+            float g, dc6_rest;
             if (DAMP == 1) {
-                // one rsqrt and one reciprocal (of the product of the two damping denominators)
-                const float r_rc = rsqrtf(r2);
-                const float r = r2 * r_rc;
-                const float r5 = r2 * r2 * r;
-                const float r7 = r5 * r2;
-                const float d6 = fmaf(r5, r, R0_6);
-                const float d8 = fmaf(r7, r, R0_8);
+                // even powers of r only (no rsqrt) and one reciprocal (of the product of the two damping denominators)
+                const float r4 = r2 * r2;
+                const float r6 = r4 * r2;
+                const float d6 = r6 + R0_6;
+                const float d8 = fmaf(r4, r4, R0_8);
                 const float d68_rc = 1.0f / (d6 * d8);
                 const float t6_rc = d8 * d68_rc;
                 const float t8_rc = d6 * d68_rc;
-                const float t6_sqrc = t6_rc * t6_rc;
-                const float t8_sqrc = t8_rc * t8_rc;
-                const float x1 = -c6 * fmaf(8.0f * s8r42x3 * r7, t8_sqrc, 6.0f * s6 * r5 * t6_sqrc);
-                vec[0] = x1 * rij[0] * r_rc;
-                vec[1] = x1 * rij[1] * r_rc;
-                vec[2] = x1 * rij[2] * r_rc;
+                g = -fmaf(8.0f * s8r42x3 * r6, t8_rc * t8_rc, 6.0f * s6 * r4 * (t6_rc * t6_rc));
                 dc6_rest = fmaf(s8r42x3, t8_rc, s6 * t6_rc);
             } else {
                 const float r_rc = rsqrtf(r2);
@@ -1123,26 +1140,37 @@ __global__ void __launch_bounds__(D3_BLOCK, 8) k_d3_forces(
                 const float r2_rc = r_rc * r_rc;
                 const float r6_rc = r2_rc * r2_rc * r2_rc;
                 const float r8_rc = r6_rc * r2_rc;
-                const float x1 = 6.0f * c6 * r8_rc * fmaf(r2_rc, s8r42 * damp8 * fmaf(3.0f * alp8 * t8, damp8, -4.0f), s6 * damp6 * fmaf(alp6 * t6, damp6, -1.0f));
-                vec[0] = x1 * rij[0];
-                vec[1] = x1 * rij[1];
-                vec[2] = x1 * rij[2];
+                g = 6.0f * r8_rc * fmaf(r2_rc, s8r42 * damp8 * fmaf(3.0f * alp8 * t8, damp8, -4.0f), s6 * damp6 * fmaf(alp6 * t6, damp6, -1.0f));
                 dc6_rest = r6_rc * fmaf(3.0f * r2_rc, s8r42 * damp8, s6 * damp6);
             }
-            if (!self) {
-                ci[0] -= vec[0]; ci[1] -= vec[1]; ci[2] -= vec[2];
-                if (jside) { cj[0] += vec[0]; cj[1] += vec[1]; cj[2] += vec[2]; }
+            // explicit fma: the forces must not depend on EV through the compiler's choice of contraction
+            G[0] = fmaf(g, rij[0], G[0]); G[1] = fmaf(g, rij[1], G[1]); G[2] = fmaf(g, rij[2], G[2]);
+            S += dc6_rest;
+            if (EV) {
+                const float gr[3] = { g * rij[0], g * rij[1], g * rij[2] };
+                P[0] = fmaf(gr[0], rij[0], P[0]);
+                P[1] = fmaf(gr[1], rij[1], P[1]);
+                P[2] = fmaf(gr[2], rij[2], P[2]);
+                P[3] = fmaf(gr[0], rij[1], P[3]);
+                P[4] = fmaf(gr[0], rij[2], P[4]);
+                P[5] = fmaf(gr[1], rij[2], P[5]);
             }
-            ev[1] += vec[0] * rij[0];
-            ev[2] += vec[1] * rij[1];
-            ev[3] += vec[2] * rij[2];
-            ev[4] += vec[0] * rij[1];
-            ev[5] += vec[0] * rij[2];
-            ev[6] += vec[1] * rij[2];
-            ev[0] -= dc6_rest * c6;
-            ci[3] += dc6_rest * dc6;
-            if (jside) { cj[3] += dc6_rest * dc6j; }
         });
+        if (!self) {
+            #pragma unroll
+            for (int k = 0; k < 3; k++) {
+                const float fk = c6 * G[k];   // +F on j and -F on i: the same fp32 value
+                ci[k] -= fk;
+                if (jside) { cj[k] += fk; }
+            }
+        }
+        if (EV) {
+            #pragma unroll
+            for (int k = 0; k < 6; k++) { ev[1 + k] += c6 * P[k]; }
+            ev[0] -= S * c6;
+        }
+        ci[3] += S * dc6;
+        if (jside) { cj[3] += S * dc6j; }
     });
     const int i = 32 * I + lane;
     if (i < n && (!ilocal || ilocal[i])) {
@@ -1153,13 +1181,15 @@ __global__ void __launch_bounds__(D3_BLOCK, 8) k_d3_forces(
         atomicAdd(&f[3*j], Aj[0]); atomicAdd(&f[3*j+1], Aj[1]); atomicAdd(&f[3*j+2], Aj[2]);
         atomicAdd(&dc6i[j], Aj[3]);
     }
-    add_ev(acc, I, J, 0, 7, Ev);
+    if (EV) { add_ev(acc, I, J, 0, 7, Ev); }
 }
 
 /* ----------------------------------------------------------------------
    Force and virial from dE/dCN through the coordination number
+   (EV = false: no virial sums, see k_d3_forces)
 ------------------------------------------------------------------------- */
 
+template <bool F64, bool EV>
 __global__ void k_d3_forces_dcn(
     int n, int niblocks, const int *__restrict__ iblocks, const unsigned char *__restrict__ ilocal,
     D3Cell cell, D3Tables tab, float cnthr, float K1,
@@ -1180,7 +1210,7 @@ __global__ void k_d3_forces_dcn(
     const double dc6i_j = dc6i[jj];
 
     double Ai[3], Aj[3], Ev;
-    tile_pairs<3, 6, 1>(n, I, J, ilocal, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *ev) {
+    tile_pairs<3, EV ? 6 : 0, 1, F64>(n, I, J, ilocal, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *ev) {
         const float rcov_sum = tab.rcov[type[i]] + rcov_j;
         const float dc6i_sum = static_cast<float>(dc6i[i] + dc6i_j);
         const float d[3] = { xj[0] - x[3*i], xj[1] - x[3*i+1], xj[2] - x[3*i+2] };
@@ -1192,24 +1222,35 @@ __global__ void k_d3_forces_dcn(
             const float unit_rc = 1.0f / (r2 * (expterm + 1.0f) * (expterm + 1.0f));
             const float dcnn = -K1 * rcov_sum * expterm * unit_rc;
             const float x1 = dcnn * dc6i_sum;
-            const float vec[3] = { x1 * rij[0] * r_rc, x1 * rij[1] * r_rc, x1 * rij[2] * r_rc };
+            // rounded products (no contraction into the sums below): the forces must not depend on EV
+            const float vec[3] = { __fmul_rn(x1 * rij[0], r_rc), __fmul_rn(x1 * rij[1], r_rc), __fmul_rn(x1 * rij[2], r_rc) };
             if (!self) {
                 ci[0] -= vec[0]; ci[1] -= vec[1]; ci[2] -= vec[2];
                 if (jside) { cj[0] += vec[0]; cj[1] += vec[1]; cj[2] += vec[2]; }
             }
-            ev[0] += vec[0] * rij[0];
-            ev[1] += vec[1] * rij[1];
-            ev[2] += vec[2] * rij[2];
-            ev[3] += vec[0] * rij[1];
-            ev[4] += vec[0] * rij[2];
-            ev[5] += vec[1] * rij[2];
+            if (EV) {
+                ev[0] += vec[0] * rij[0];
+                ev[1] += vec[1] * rij[1];
+                ev[2] += vec[2] * rij[2];
+                ev[3] += vec[0] * rij[1];
+                ev[4] += vec[0] * rij[2];
+                ev[5] += vec[1] * rij[2];
+            }
         });
     });
     const int i = 32 * I + lane;
     if (i < n && (!ilocal || ilocal[i])) { atomicAdd(&f[3*i], Ai[0]); atomicAdd(&f[3*i+1], Ai[1]); atomicAdd(&f[3*i+2], Ai[2]); }
     if (j < n) { atomicAdd(&f[3*j], Aj[0]); atomicAdd(&f[3*j+1], Aj[1]); atomicAdd(&f[3*j+2], Aj[2]); }
-    add_ev(acc, I, J, 1, 6, Ev);
+    if (EV) { add_ev(acc, I, J, 1, 6, Ev); }
 }
+
+// The kernel instances of the run-time choices: [fp64 pair sums][energy and virial sums], k_d3_forces [damping] first
+static const decltype(&k_d3_cn<false>) cn_kernels[2] = { k_d3_cn<false>, k_d3_cn<true> };
+static const decltype(&k_d3_forces<0, false, false>) forces_kernels[2][2][2] = {
+    { { k_d3_forces<0, false, false>, k_d3_forces<0, false, true> }, { k_d3_forces<0, true, false>, k_d3_forces<0, true, true> } },
+    { { k_d3_forces<1, false, false>, k_d3_forces<1, false, true> }, { k_d3_forces<1, true, false>, k_d3_forces<1, true, true> } } };
+static const decltype(&k_d3_forces_dcn<false, false>) dcn_kernels[2][2] = {
+    { k_d3_forces_dcn<false, false>, k_d3_forces_dcn<false, true> }, { k_d3_forces_dcn<true, false>, k_d3_forces_dcn<true, true> } };
 
 /* ----------------------------------------------------------------------
    Per-atom buffers (host pinned + device), resized when the atom count changes
@@ -1282,7 +1323,10 @@ void PairJetD3::set_cell(D3Cell &cell, double lat[3][3]) {
    per-type C6 vectors a few times per tile instead of every step. The grid
    only sets that order (an ~8-atom-per-cell cap keeps its bucket array
    small); the bounds are exact for any order, so the grid never changes a
-   result. Without cells (!use_cells) the order is by type only, as before.
+   result. A small box (!use_cells: no prefilter, no bounds) is packed in
+   the same order: the lanes of a warp, whose atoms are then neighbours,
+   agree on which periodic images lie inside the cut-off, so fewer of them
+   idle in the image loops.
 
    On several ranks the source atoms are the gathered tag-ordered ones
    (gx / gtype, index tag - 1), so the packing is the one-rank packing;
@@ -1298,24 +1342,23 @@ void PairJetD3::load_atom_info(const double lat[3][3], const D3Cell &cell) {
     MathExtra::cross3(lat[2], lat[0], cp[1]);
     MathExtra::cross3(lat[0], lat[1], cp[2]);
     const double vol = MathExtra::dot3(lat[0], cp[0]);
+    // cp: rows of the inverse lattice per Angstrom, so the loop over the atoms has no division
+    for (int k = 0; k < 3; k++) { for (int m = 0; m < 3; m++) { cp[k][m] /= vol * AU_TO_ANG; } }
 
     int *type = atom->type;
     double **x = atom->x;
     const double *lo = domain->boxlo;
 
-    int bins[3] = { 1, 1, 1 };
-    long ncells = 1;
-    if (use_cells) {
-        // ~7 A cells: a 32-atom block then spans about one cell, so its sphere
-        // is as small as the density allows and the prefilter rejects most
-        // far-away tiles
-        for (int k = 0; k < 3; k++) { bins[k] = std::max(1, static_cast<int>(3.0 / cell.rch_cn[k])); }
-        ncells = static_cast<long>(bins[0]) * bins[1] * bins[2];
-        if (ncells > n / 8) {
-            const double f = std::cbrt(n / 8.0 / ncells);
-            ncells = 1;
-            for (int k = 0; k < 3; k++) { bins[k] = std::max(1, static_cast<int>(bins[k] * f)); ncells *= bins[k]; }
-        }
+    // ~7 A cells: a 32-atom block then spans about one cell, so its sphere
+    // is as small as the density allows and the prefilter rejects most
+    // far-away tiles (one cell when the box is smaller than two of them)
+    int bins[3];
+    for (int k = 0; k < 3; k++) { bins[k] = std::max(1, static_cast<int>(3.0 / cell.rch_cn[k])); }
+    long ncells = static_cast<long>(bins[0]) * bins[1] * bins[2];
+    if (ncells > n / 8) {
+        const double f = std::cbrt(n / 8.0 / ncells);
+        ncells = 1;
+        for (int k = 0; k < 3; k++) { bins[k] = std::max(1, static_cast<int>(bins[k] * f)); ncells *= bins[k]; }
     }
     const int nt = atom->ntypes + 1;                 // type 1..ntypes, one bucket per type
     h_s.resize(3 * n);
@@ -1324,19 +1367,18 @@ void PairJetD3::load_atom_info(const double lat[3][3], const D3Cell &cell) {
     for (int i = 0; i < n; i++) {
         const double *xi = multi ? gx.data() + 3 * i : x[i];
         const int ti = multi ? gtype[i] : type[i];
-        const double p[3] = { (xi[0] - lo[0]) / AU_TO_ANG, (xi[1] - lo[1]) / AU_TO_ANG,
-                              (xi[2] - lo[2]) / AU_TO_ANG };
+        const double p[3] = { xi[0] - lo[0], xi[1] - lo[1], xi[2] - lo[2] };
         double *s = &h_s[3 * i];
         int cellkey = 0;
         for (int k = 0; k < 3; k++) {
-            double sk = MathExtra::dot3(cp[k], p) / vol;
+            double sk = MathExtra::dot3(cp[k], p);
             if (domain->periodicity[k]) { sk -= std::floor(sk); }
             s[k] = sk;
-            int b = static_cast<int>(std::floor(sk * bins[k]));
+            int b = static_cast<int>(sk * bins[k]);   // truncated: the clamp covers sk < 0 (non-periodic)
             b = std::min(std::max(b, 0), bins[k] - 1);
             cellkey = cellkey * bins[k] + b;
         }
-        h_key[i] = use_cells ? cellkey * nt + ti : ti;
+        h_key[i] = cellkey * nt + ti;
         h_first[h_key[i] + 1]++;
     }
     for (long k = 1; k <= ncells * nt; k++) { h_first[k] += h_first[k - 1]; }
@@ -1486,14 +1528,20 @@ void PairJetD3::gather_atoms() {
    work; without an e3gnn prelaunch (d3 alone) compute() calls it itself.
    Each rank reaches this at the same point of the step, so the collectives
    below stay matched.
+   ev: also sum the energy and the virial (see k_d3_forces). compute() knows
+   it from eflag / vflag; a prelaunch comes before those, so it reads the
+   steps the integrator marked in Update for the global energy / virial, and
+   compute() launches again if it is asked for sums that were left out.
 ------------------------------------------------------------------------- */
 
 void PairJetD3::prelaunch(Pair *pair) {
     auto *d3 = static_cast<PairJetD3 *>(pair);
-    if (d3->multi) { d3->launch_multi_async(); } else { d3->launch(); }
+    const Update *up = d3->lmp->update;
+    const bool ev = up->eflag_global == up->ntimestep || up->vflag_global == up->ntimestep;
+    if (d3->multi) { d3->launch_multi_async(ev); } else { d3->launch(ev); }
 }
 
-void PairJetD3::launch() {
+void PairJetD3::launch(bool ev) {
     const int n = atom->nlocal;
     if (static_cast<bigint>(n) != atom->natoms) { error->one(FLERR, "pair_style d3: all atoms must be local (single rank, no lost atoms)"); }
     if (n == 0) { return; }
@@ -1507,10 +1555,10 @@ void PairJetD3::launch() {
     D3Cell cell;
     double lat[3][3];
     set_cell(cell, lat);
-    // Cell order + block prefilter (see load_atom_info): worth it only when a
-    // periodic direction holds more than ~3 cells of half the vdW cut-off.
-    // Below that a cut-off sphere spans the box (one or two images per
-    // direction) and the all-pairs path of the small boxes stays as it was.
+    // Block prefilter (see load_atom_info): worth it only when a periodic
+    // direction holds more than ~3 cells of half the vdW cut-off. Below that
+    // a cut-off sphere spans the box (one or two images per direction) and
+    // every block pair is computed.
     use_cells = true;
     for (int k = 0; k < 3; k++) {
         if (cell.per[k] && cell.rch_vdw[k] > 2.0 / 3.0) { use_cells = false; }
@@ -1532,25 +1580,21 @@ void PairJetD3::launch() {
 
     const int ntiles = (n + 31) / 32;
     const dim3 tiles(ntiles, (ntiles + D3_BLOCK / 32 - 1) / (D3_BLOCK / 32));
-    k_d3_cn<<<tiles, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, cnthr, K1, x, frac, type, bounds, d_cn);
+    cn_kernels[fp64_sums]<<<tiles, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, cnthr, K1, x, frac, type, bounds, d_cn);
     mark(2);
     k_d3_weights<<<(n + D3_BLOCK - 1) / D3_BLOCK, D3_BLOCK, 0, stream>>>(n, tab, K3, type, d_cn, d_w, d_vu);
     mark(3);
-    if (damping == 1) {
-        k_d3_forces<1><<<tiles, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, rthr, s6, s8, a1, a2, alp6, alp8,
-                                             x, frac, type, d_w, d_vu, bounds, d_dc6i, f, acc);
-    } else {
-        k_d3_forces<0><<<tiles, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, rthr, s6, s8, a1, a2, alp6, alp8,
-                                             x, frac, type, d_w, d_vu, bounds, d_dc6i, f, acc);
-    }
+    forces_kernels[damping][fp64_sums][ev]<<<tiles, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, rthr, s6, s8, a1, a2,
+                                                                           alp6, alp8, x, frac, type, d_w, d_vu, bounds, d_dc6i, f, acc);
     mark(4);
-    k_d3_forces_dcn<<<tiles, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, cnthr, K1, x, frac, type, bounds,
-                                                    d_dc6i, f, acc);
+    dcn_kernels[fp64_sums][ev]<<<tiles, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, cnthr, K1, x, frac, type, bounds,
+                                                               d_dc6i, f, acc);
     mark(5);
 
     CHECK_CUDA(cudaMemcpyAsync(h_out, d_out, (3 * n + 8 * D3_SLOTS) * sizeof(double), cudaMemcpyDeviceToHost, stream));
     mark(6);
     pending = true;
+    ev_launched = ev;
     if (timing) {
         const auto ms = [](clk::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
         tsum[0] += ms(t1 - t0);
@@ -1585,7 +1629,7 @@ void PairJetD3::launch() {
    compute(). All ranks reach this at the same point of the step.
 ------------------------------------------------------------------------- */
 
-void PairJetD3::launch_multi_async() {
+void PairJetD3::launch_multi_async(bool ev) {
     const int n = static_cast<int>(atom->natoms);
     pending = false;
     if (n == 0) { return; }
@@ -1628,7 +1672,7 @@ void PairJetD3::launch_multi_async() {
     mark(1);
 
     // CN of this rank's pairs, both sides; the weights and force kernels need the whole array
-    k_d3_cn<<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, cnthr, K1, x, frac, type, bounds, d_cn);
+    cn_kernels[fp64_sums]<<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, cnthr, K1, x, frac, type, bounds, d_cn);
     mark(2);
     const auto t1b = clk::now();
     CHECK_CUDA(cudaStreamSynchronize(stream));
@@ -1642,16 +1686,12 @@ void PairJetD3::launch_multi_async() {
 
     k_d3_weights<<<(n + D3_BLOCK - 1) / D3_BLOCK, D3_BLOCK, 0, stream>>>(n, tab, K3, type, d_cn, d_w, d_vu);
     mark(3);
-    if (damping == 1) {
-        k_d3_forces<1><<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, rthr, s6, s8, a1, a2,
-                                             alp6, alp8, x, frac, type, d_w, d_vu, bounds, d_dc6i, f, acc);
-    } else {
-        k_d3_forces<0><<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, rthr, s6, s8, a1, a2,
-                                             alp6, alp8, x, frac, type, d_w, d_vu, bounds, d_dc6i, f, acc);
-    }
+    forces_kernels[damping][fp64_sums][ev]<<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, rthr, s6, s8, a1, a2,
+                                                                           alp6, alp8, x, frac, type, d_w, d_vu, bounds, d_dc6i, f, acc);
     mark(4);
     const auto t1e = clk::now();
     pending = true;
+    ev_launched = ev;
 
     if (timing) {
         tsum[0] += ms(t1 - t0);
@@ -1694,8 +1734,8 @@ void PairJetD3::finish_multi(int eflag, int vflag) {
     const auto t2 = clk::now();
     mark(6);
 
-    k_d3_forces_dcn<<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, cnthr, K1, x, frac,
-                                                    type, bounds, d_dc6i, f, acc);
+    dcn_kernels[fp64_sums][ev_launched]<<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, cnthr, K1, x, frac,
+                                                                        type, bounds, d_dc6i, f, acc);
     mark(7);
     CHECK_CUDA(cudaMemcpyAsync(h_out, d_out, (3 * n + 8 * D3_SLOTS) * sizeof(double), cudaMemcpyDeviceToHost, stream));
     mark(8);
@@ -1733,13 +1773,18 @@ void PairJetD3::finish_multi(int eflag, int vflag) {
 void PairJetD3::compute(int eflag, int vflag) {
     ev_init(eflag, vflag);
     if (eflag_atom || vflag_atom) { error->all(FLERR, "pair_style d3 does not compute per-atom energy or virial"); }
+    const bool ev = eflag || vflag;
+    if (pending && ev && !ev_launched) {   // prelaunched without the sums that are wanted after all: once more with them
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        pending = false;
+    }
     if (multi) {
         // pair_e3gnn already ran the first half through prelaunch(); d3 alone runs it here
-        if (!pending) { launch_multi_async(); }
+        if (!pending) { launch_multi_async(ev); }
         if (pending) { finish_multi(eflag, vflag); }
         return;
     }
-    if (!pending) { launch(); }
+    if (!pending) { launch(ev); }
     if (atom->nlocal == 0) { return; }
 
     using clk = std::chrono::steady_clock;
