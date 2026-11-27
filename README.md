@@ -1,6 +1,6 @@
 # JET-MLIPs: Joint-Kernel Equivariant Convolution with Tabulated Radial Weights for accelerated MLIP simulation
 
-Faster MD simulation with equivariant interatomic potentials: up to ~6x faster.
+Faster MD simulation with equivariant interatomic potentials
 
 JET-MLIPs accelerates MD simulation without re-training. It optimizes the whole model computation on the GPU: the
 convolution as one fused kernel (JET) and the operations around it (skip connections, linears, gates, neighbour lists).
