@@ -5,11 +5,13 @@
 //     else:     out = coef * x[src] * cst * f(x[gcol])    (gated irrep component times its activated gate)
 //   backward, input column j, bwd_i[j] = (role, o, aux, act, d), bwd_f[j] = (cst, coef):
 //     role 0: unused (0); 1 scalar: g[o] cst f'(x[j]); 2 gated: g[o] coef cst f(x[aux]);
-//     3 gate: cst f'(x[j]) coef sum_{m<d} g[o+m] x[aux+m]
+//     3 gate: cst f'(x[j]) coef sum_{m<d} g[o+m*s] x[aux+m*s], d = bwd_i[4] & 255, s = bwd_i[4] >> 8 or 1: the stride of
+//       the gated irrep's components (1 in e3nn's mul_ir, its mul in cuEq's ir_mul: ops.gate_tables(ir_mul=...))
 //   act 0 identity, 1 silu, 2 tanh, 3 sigmoid. First-order autograd in x only. CUDA-graph capturable.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/autograd.h>
 #include <torch/library.h>
 
@@ -68,7 +70,8 @@ __global__ void gate_bwd(const float* __restrict__ g, int dout, const float* __r
       case 2: v = gr[t[1]] * f.y * f.x * act_f(t[3], xr[t[2]]); break;
       case 3: {
         float s = 0.f;
-        for (int m = 0; m < t[4]; m++) s += gr[t[1] + m] * xr[t[2] + m];
+        const int d = t[4] & 255, st = t[4] >> 8 ? t[4] >> 8 : 1;
+        for (int m = 0; m < d; m++) s += gr[t[1] + m * st] * xr[t[2] + m * st];
         v = f.x * act_df(t[3], xr[j]) * f.y * s;
         break;
       }
@@ -91,6 +94,9 @@ at::Tensor gate_cuda(const at::Tensor& x_, const at::Tensor& fi, const at::Tenso
               ff.scalar_type() == at::kFloat && ff.sizes() == at::IntArrayRef({fi.size(0), 2}) && ff.is_contiguous(),
               "gate: fwd tables (Dout, 4) int32, (Dout, 2) float32");
   TORCH_CHECK(bi.size(0) == x_.size(1), "gate: bwd tables have one row per input column");
+  TORCH_CHECK(fi.device() == x_.device() && ff.device() == x_.device() && bi.device() == x_.device() &&
+              bf.device() == x_.device(), "gate: tables must be on the device of x (", x_.device(), ")");
+  const c10::cuda::CUDAGuard guard(x_.device());   // the kernels below go to the current device's stream
   const auto x = x_.contiguous();
   const int64_t n = x.size(0), dout = fi.size(0), total = n * dout;
   auto out = at::empty({n, dout}, x.options());
@@ -117,6 +123,7 @@ struct GateFn : public torch::autograd::Function<GateFn> {
     at::Tensor gx;
     if (gouts[0].defined()) {
       at::NoGradGuard no_grad;   // no double backward
+      const c10::cuda::CUDAGuard guard(x.device());   // the kernels below go to the current device's stream
       const auto g = gouts[0].contiguous();
       gx = at::empty_like(x);
       const int64_t total = x.numel();

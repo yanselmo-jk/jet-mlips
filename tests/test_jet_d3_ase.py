@@ -160,3 +160,57 @@ def test_functionals():
         JetD3Calculator(cutoff=float('inf'))
     with pytest.raises(ValueError):
         JetD3Calculator(params={'s6': 1.0, 's8': 0.8, 'a1': 0.4, 'a2': 5.0}, damping='zero')
+
+
+def test_prelaunch_forces_only():
+    """An MD step that needs forces only (eflag = vflag = 0): the prelaunch leaves the energy and virial sums out and
+    compute() does not launch again; the forces are those of a full compute, with or without the prelaunch."""
+    from jet_d3_ase._C import D3
+    atoms = cubic(rattle=0.05)
+    d3 = D3(['9000', '1600', 'damp_bj', 'pbe'], ['Si'])
+    args = (atoms.positions, np.ones(len(atoms), dtype=np.int32), [*atoms.cell.lengths(), 0, 0, 0, 0, 0, 0], [1, 1, 1])
+    e0, f0, v0 = d3.compute(*args)
+    assert e0 < 0 and np.abs(f0).max() > 1e-3 and np.abs(v0).max() > 1e-3
+    for prelaunch in (True, False):
+        e1, f1, v1 = d3.compute(*args, prelaunch=prelaunch, ev=False)
+        assert e1 == 0 and not v1.any()   # not asked for
+        assert np.abs(f1 - f0).max() < 1e-12, prelaunch
+
+
+def test_float_float_sums(monkeypatch):
+    """JET_D3_FP64=0 (float-float pair sums, for GPUs with slow fp64) against the default plain fp64 sums; the switch is
+    read when the pair style is set up."""
+    res = []
+    for flag in ('1', '0'):
+        monkeypatch.setenv('JET_D3_FP64', flag)
+        atoms = cubic(rattle=0.05)
+        atoms.calc = JetD3Calculator()
+        res.append((atoms.get_potential_energy(), atoms.get_forces(), atoms.get_stress()))
+    (e0, f0, s0), (e1, f1, s1) = res
+    assert not np.array_equal(f0, f1), 'bit-identical forces: JET_D3_FP64=0 did not change the sums'
+    assert abs(e1 - e0) < 1e-9 * len(atoms) and np.abs(f1 - f0).max() < 1e-9 and np.abs(s1 - s0).max() < 1e-10
+
+
+@pytest.mark.parametrize('shape', ['cubic', 'triclinic', 'slab'])
+def test_tile_lists(monkeypatch, shape):
+    """A box large enough for the tile lists (every periodic direction beyond 1.5 vdW cut-offs, 75.3 A) against
+    JET_D3_SCAN=1, the scan over all block pairs that small boxes use: the same pair terms, so the results differ only
+    by the order of the fp64 sums. The switch is read when the pair style is set up."""
+    atoms = cubic(15, rattle=0.1)   # 81.45 A, 27,000 atoms
+    atoms.symbols[::3] = 'C'
+    atoms.symbols[::7] = 'H'
+    if shape == 'triclinic':
+        atoms.set_cell(atoms.cell.array + [[0, 0, 0], [9.0, 0, 0], [-7.0, 5.0, 0]], scale_atoms=True)
+    if shape == 'slab':   # vacuum above, not periodic along z (no stress)
+        del atoms[atoms.positions[:, 2] > 40.0]
+        atoms.pbc = (True, True, False)
+    res = []
+    for scan in ('0', '1'):
+        monkeypatch.setenv('JET_D3_SCAN', scan)
+        atoms.calc = JetD3Calculator()
+        res.append((atoms.get_potential_energy(), atoms.get_forces(), atoms.get_stress() if all(atoms.pbc) else np.zeros(6)))
+    (e0, f0, s0), (e1, f1, s1) = res
+    assert e0 < 0 and np.abs(f0).max() > 1e-3
+    assert abs(e1 - e0) < 1e-11 * abs(e0)
+    assert np.abs(f1 - f0).max() < 1e-12
+    assert np.abs(s1 - s0).max() <= 1e-10 * np.abs(s0).max()

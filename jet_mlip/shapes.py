@@ -87,6 +87,18 @@ def _sevenn(model):
 LOADERS = {'sevenn': _sevenn, 'mace': _mace, 'nequip': _nequip, 'nequix': _nequix, 'equflash': _equflash}
 
 
+def shape_state(key, compiled, user_keys, family_of):
+    """'compiled', or why a rebuild is needed; family_of(key) is the family list holding it, if any."""
+    if key in compiled:
+        return 'compiled'
+    if key in user_keys:
+        return 'in user_configs(), rebuild'
+    family = family_of(key)
+    if family:
+        return f'MISSING (in the {family} list: JET_CONFIGS including {family} also builds it)'
+    return 'MISSING'
+
+
 def emit_line(cfg, tag):
     """The `user_configs()` line that compiles `cfg` (self-contained: no family import at build time)."""
     live = ''
@@ -109,16 +121,17 @@ def main(argv=None):
     compiled = compiled_keys()
     if not compiled:
         print('(jet_mlip._C not built or not importable: every shape shows as MISSING)')
-    source = {c.key for c in configs.selected('all')}
+    user_keys = {c.key for c in configs.user_configs()}
+    families = {c.key: name for name, cfgs_of in configs.FAMILIES.items() for c in cfgs_of()}
     lines = []
     for i, cfg in enumerate(LOADERS[family](model)):
-        state = 'compiled' if cfg.key in compiled else 'in configs.py, rebuild' if cfg.key in source else 'MISSING'
+        state = shape_state(cfg.key, compiled, user_keys, families.get)
         print(f'L{i}: {cfg.key} ({cfg.n_paths} paths, NW {cfg.n_weight}): {state}')
         line = emit_line(cfg, f'{family} {os.path.basename(model.rstrip("/"))} L{i}')
-        if state == 'MISSING' and line.split('   #')[0] not in [x.split('   #')[0] for x in lines]:
+        if state.startswith('MISSING') and line.split('   #')[0] not in [x.split('   #')[0] for x in lines]:
             lines.append(line)
     if not lines:
-        print('all shapes compiled or already in configs.py')
+        print('all shapes compiled or in user_configs()')
         return 0
 
     print('\n# add to user_configs() in jet_mlip/configs.py, then rebuild:')
@@ -130,7 +143,7 @@ def main(argv=None):
         assert head in text, 'jet_mlip/configs.py has no user_configs()'
         anchor = '    cfgs = []\n'
         i = text.index(anchor, text.index(head)) + len(anchor)
-        new = [x for x in lines if x.split('   #')[0] not in text]
+        new = [x for x in lines if x.split('   #')[0] not in text[text.index(head):]]
         if new:
             open(p, 'w').write(text[:i] + ''.join(new) + text[i:])
         print(f'appended {len(new)} line(s) to user_configs() in {p}')

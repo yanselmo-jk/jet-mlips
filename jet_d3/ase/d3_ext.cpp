@@ -6,7 +6,8 @@
    compute(x, type, box, periodic) with x (N, 3) in Angstrom in the LAMMPS frame (restricted triclinic),
    type (N,) 1-based, box = (xprd, yprd, zprd, xy, xz, yz, xlo, ylo, zlo), periodic = 3 flags
    -> (energy eV, forces (N, 3) eV/A, virial (xx, yy, zz, xy, xz, yz) eV), as LAMMPS' eng_vdwl / f / virial.
-   prelaunch=True (tests): launch first the way pair_e3gnn does, before compute() and its energy / virial flags. */
+   prelaunch=True (tests): launch first the way pair_e3gnn does, before compute() and its energy / virial flags.
+   ev=False (tests): compute(eflag = 0, vflag = 0), an MD step that needs forces only (energy and virial are not summed). */
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -35,7 +36,7 @@ public:
 
     py::tuple compute(py::array_t<double, py::array::c_style | py::array::forcecast> x,
                       py::array_t<int, py::array::c_style | py::array::forcecast> type, std::vector<double> box,
-                      std::vector<int> periodic, bool prelaunch) {
+                      std::vector<int> periodic, bool prelaunch, bool ev) {
         if (x.ndim() != 2 || x.shape(1) != 3) throw std::invalid_argument("x must be (N, 3)");
         const int n = static_cast<int>(x.shape(0));
         if (type.ndim() != 1 || type.shape(0) != n) throw std::invalid_argument("type must be (N,)");
@@ -62,7 +63,7 @@ public:
         atom.nlocal = n; atom.natoms = n;
 
         if (prelaunch) PairJetD3::prelaunch(pair.get());
-        pair->compute(1, 1);
+        pair->compute(ev, ev);
 
         py::array_t<double> f({n, 3});
         std::memcpy(f.mutable_data(), fs.data(), fs.size() * sizeof(double));
@@ -94,5 +95,5 @@ PYBIND11_MODULE(_C, m) {
         .def(py::init<const std::vector<std::string> &, const std::vector<std::string> &>(), py::arg("settings"),
              py::arg("elements"))
         .def("compute", &D3::compute, py::arg("x"), py::arg("type"), py::arg("box"), py::arg("periodic"),
-             py::arg("prelaunch") = false);
+             py::arg("prelaunch") = false, py::arg("ev") = true);
 }

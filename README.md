@@ -1,9 +1,8 @@
 # JET-MLIPs: Joint-Kernel Equivariant Convolution with Tabulated Radial Weights for accelerated MLIP simulation
 
-JET-MLIPs now accelerates not only convolution layer but entire computation!
+JET-MLIPs accelerates MD simulation without re-training.
 
-JET-MLIPs accelerates MD simulation without re-training. It optimizes the whole model computation on the GPU: the
-convolution as one fused kernel (JET) and the operations around it (skip connections, linears, gates, neighbour lists).
+JET-MLIPs now accelerates the whole model computation on the GPU: the convolution as one fused kernel (JET) and the operations around it (skip connections, linears, gates, neighbour lists).
 
 | family                                               | official package             | models                                                                                                                          |
 | ---------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -13,8 +12,7 @@ convolution as one fused kernel (JET) and the operations around it (skip connect
 | [Nequix](https://github.com/atomicarchitects/nequix) | nequix 0.4.5 (torch backend) | nequix-mp-1, nequix-oam-1                                                                                                       |
 | [EquFlash](https://github.com/SamsungDS/GGNN)        | GGNN (SamsungDS)             | EquFlash-OAM-30M (v1), EquFlashV2-OAM                                                                                           |
 
-
-How it works: `docs/design.md`.
+How it works: [docs/design.md](docs/design.md).
 
 ## 1. Prerequisites
 
@@ -26,43 +24,39 @@ conda activate <env>
 ```
 
 - Linux with an NVIDIA GPU and its driver (tested: sm_75, sm_86, sm_89, sm_90).
-- In that env (SevenNet and NequIP can share one; MACE needs its own, it pins e3nn 0.4.4):
+- In that env (SevenNet and NequIP can share one; MACE needs its own, as it pins `e3nn==0.4.4`):
   - PyTorch with CUDA, and the CUDA toolkit (`nvcc`) of the same CUDA version;
   - g++ 12 and `ninja` (to build JET);
   - the official package:
 
-
-| family   | official package (pip install, into the env)                                                                                                                                         |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| SevenNet | `sevenn==0.13.0`                                                                                                                                                                     |
-| MACE     | `mace-torch==0.3.16` and cuEquivariance (`cuequivariance-torch`, `cuequivariance-ops-torch-cu12`; `-cu13` for CUDA 13 torch): 0.9.1 for torch &lt; 2.11, 0.13.0 for torch &gt;= 2.11 |
-| NequIP   | `nequip==0.19.1`                                                                                                                                                                     |
-| Nequix   | `"nequix[torch]==0.4.5"`                                                                                                                                                             |
-| EquFlash | GGNN from github.com/SamsungDS/GGNN                                                                                                                                                  |
-
+| family   | official package (`pip install`, into the env)                                                                                                                               |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SevenNet | `sevenn==0.13.0`                                                                                                                                                             |
+| MACE     | `mace-torch==0.3.16` and cuEquivariance (`cuequivariance-torch`, `cuequivariance-ops-torch-cu12`; `-cu13` for CUDA 13 torch): 0.9.1 for torch < 2.11, 0.13.0 for torch >= 2.11 |
+| NequIP   | `nequip==0.19.1`                                                                                                                                                             |
+| Nequix   | `"nequix[torch]==0.4.5"`                                                                                                                                                     |
+| EquFlash | GGNN from [github.com/SamsungDS/GGNN](https://github.com/SamsungDS/GGNN)                                                                                                     |
 
 Tested torch and CUDA (Python 3.12, g++ 12; each family's tests and forces against the official model; v0.5.0 re-checked on torch
 2.11 for SevenNet, NequIP and Nequix, 2.7.1 for MACE, 2.9.1 for EquFlash):
 
+| torch          | CUDA             | SevenNet | MACE             | NequIP | Nequix | EquFlash |
+| -------------- | ---------------- | -------- | ---------------- | ------ | ------ | -------- |
+| 2.7.1          | 12.6, 12.8       | yes      | yes              | yes    | yes    | yes      |
+| 2.8.0          | 12.6, 12.8       | yes      | yes (~2% slower) | yes    | yes    | yes      |
+| 2.9.1 - 2.11.0 | 12.6, 12.8, 13.0 | yes      | yes (~2% slower) | yes    | yes    | yes      |
 
-| torch          | CUDA             | SevenNet | MACE              | NequIP | Nequix | EquFlash |
-| -------------- | ---------------- | -------- | ----------------- | ------ | ------ | -------- |
-| 2.7.1          | 12.6, 12.8       | yes      | yes               | yes    | yes    | yes      |
-| 2.8.0          | 12.6, 12.8       | yes      | yes (\~2% slower) | yes    | yes    | yes      |
-| 2.9.1 - 2.11.0 | 12.6, 12.8, 13.0 | yes      | yes (\~2% slower) | yes    | yes    | yes      |
+MACE on torch >= 2.8: `torch.compile` does not run with `e3nn==0.4.4`.
 
-
-MACE on torch &gt;= 2.8: torch.compile does not run with e3nn 0.4.4.
-
-- LAMMPS (optional): cmake and, for several GPUs, an MPI (tested Open MPI 4.1 and 5.0). `lammps/build_lammps.sh`
-fetches the LAMMPS source and installs `cython==3.0.11` and `cupy` into the env.
+- LAMMPS (optional): `cmake` and, for several GPUs, an MPI (tested Open MPI 4.1 and 5.0). [lammps/build_lammps.sh](lammps/build_lammps.sh)
+  fetches the LAMMPS source and installs `cython==3.0.11` and `cupy-cuda12x` into the env (on CUDA 13, install `cython==3.0.11` and `cupy-cuda13x` first and run with `OFFLINE=1`).
 
 ## 2. Install
 
 Install the official package first (section 1), then build JET in the same env:
 
 ```bash
-conda activate <env>   # <env> which contains an official MLIP package (section 1)
+conda activate <env>   # <env> containing an official MLIP package (section 1)
 git clone https://github.com/yanselmo-jk/jet-mlips.git && cd jet-mlips
 JET_CONFIGS=all JET_CUDA_ARCH=90 MAX_JOBS=4 pip install -e jet_mlip --no-build-isolation
 pip install -e . --no-deps
@@ -71,16 +65,16 @@ python -m common.patch_tool mace     # MACE only
 ```
 
 - `JET_CONFIGS`: the model families whose kernels are compiled. `all` (default) builds every family; a comma list
-builds only those, e.g. `JET_CONFIGS=mace` or `JET_CONFIGS=sevenn,nequip` (names: `sevenn`, `mace`, `nequip`,
-`nequix`, `equflash`).
-- `JET_CUDA_ARCH`: your GPU's compute capability without the dot (8.9 -&gt; `89`); look it up at
-[https://developer.nvidia.com/cuda/gpus](https://developer.nvidia.com/cuda/gpus).
+  builds only those, e.g. `JET_CONFIGS=mace` or `JET_CONFIGS=sevenn,nequip` (names: `sevenn`, `mace`, `nequip`,
+  `nequix`, `equflash`).
+- `JET_CUDA_ARCH`: your GPU's compute capability without the dot (8.9 -> `89`); look it up at
+  [developer.nvidia.com/cuda/gpus](https://developer.nvidia.com/cuda/gpus).
 - The build belongs to the env's torch: use one checkout per env and run from it.
 
 ### Offline machines
 
 Nothing in JET needs the network: give local files instead of names and downloads. Step by step:
-`docs/offline-installation.md`.
+[docs/offline-installation.md](docs/offline-installation.md).
 
 ## 3. Use
 
@@ -106,10 +100,14 @@ atoms.calc = calc
 print(atoms.get_potential_energy(), atoms.get_forces().shape, atoms.get_stress())
 ```
 
-Every family, energy / forces / stress, a short MD and D3: `examples/ase/ase_md.ipynb`.
-`xc` is the functional of the model's training data (e.g. `'pbe'`, `'r2scan'`).
-`params={'s6': ..., 's8': ..., 'a1': ..., 'a2': ...}` sets custom BJ parameters instead of `xc`; `cutoff` / `cn_cutoff`
-in Å (defaults: those of `jet/d3 9000 1600`). Energy, forces and stress (stress for fully periodic cells); one GPU.
+Every family, energy / forces / stress, a short MD and D3: [examples/ase/ase_md.ipynb](examples/ase/ase_md.ipynb).
+From the second call on, each step replays from a CUDA graph (the first call, and the first call with a new atom count,
+run eagerly; GPU memory +130-400 MiB, EquFlash v1 about +1 GB). Switches: [docs/design.md](docs/design.md).
+
+`JetD3Calculator`: `xc` is the functional of the model's training data (e.g. `'pbe'`, `'r2scan'`; MACE-OFF23 already
+includes D3, add none). `params={'s6': ..., 's8': ..., 'a1': ..., 'a2': ...}` sets custom BJ parameters instead of `xc`;
+`cutoff` / `cn_cutoff` in Å (defaults: those of `jet/d3 9000 1600`). Energy, forces and stress (stress for fully periodic
+cells); one GPU.
 
 ### LAMMPS
 
@@ -133,17 +131,17 @@ python -m jet_mlip.deploy <family> <model> [<output>.pt]      # <family> --help:
 python -m jet_mlip.deploy mace medium medium_jet.pt   # MACE-MP-0 medium
 ```
 
-Without `<output>` the file is `jet_deployed_<model>.pt`; NequIP outputs must end with `.nequip.lmp.pt`. Every supported model of every family: `examples/lammps/lammps_md.ipynb`.
+Without `<output>` the file is `jet_deployed_<model>.pt`; NequIP outputs must end with `.nequip.lmp.pt`. Every supported model of every family: [examples/lammps/lammps_md.ipynb](examples/lammps/lammps_md.ipynb).
 
-`<model>` is what the official package accepts: a pretrained name (`7net-0`, `medium`, a nequip.net id) or a checkpoint file. MACE-OFF23 is `off-small` / `off-medium` / `off-large`.  
+`<model>` is what the official package accepts: a pretrained name (`7net-0`, `medium`, a nequip.net id) or a checkpoint file. MACE-OFF23 is `off-small` / `off-medium` / `off-large`.
 A fine-tuned checkpoint file works the same way. LAMMPS reads the deployed `.pt` file.
 
 Deploy options (add them to the `python -m jet_mlip.deploy` line):
 
 - `--radial_table N`: grid points of the tabulated radial weights (default: MACE 4096, others 2048). The defaults keep
-the table's force error well below the official fp32 error (`docs/design.md`). SevenNet: `0` = exact, no table.
+  the table's force error well below the official fp32 error ([docs/design.md](docs/design.md)). SevenNet: `0` = exact, no table.
 - SevenNet: `--modal NAME`, the modal of a multi-fidelity model (e.g. `7net-omni`).
-- MACE: `--head NAME`, which output head of a multi-head model to run (default: the last head. the official models have one).
+- MACE: `--head NAME`, which output head of a multi-head model to run (default: the last head; the official models have one).
 
 A model with a layer shape JET was not built for stops with `jet: config not compiled: <shape>`. Add its shapes
 and rebuild (any family):
@@ -155,7 +153,7 @@ JET_CONFIGS=all JET_CUDA_ARCH=90 MAX_JOBS=4 pip install -e jet_mlip --no-build-i
 
 **3. Run:**
 
-```
+```lammps
 # LAMMPS pair-style for every family
 pair_style jet/mliap medium_jet.pt              # any deployed file
 pair_coeff * * Li C H O N F S P B               # elements in LAMMPS type order
@@ -176,7 +174,7 @@ models at every size measured; needs the `SEVENN=1` LAMMPS build):
 sevenn get_model 7net-0 --enable_jet -o model.pt
 ```
 
-```
+```lammps
 pair_style jet/e3gnn
 pair_coeff * * model.pt Li C H O N F S P B
 ```
@@ -185,19 +183,22 @@ pair_coeff * * model.pt Li C H O N F S P B
 lmp -in in.lammps
 ```
 
-See examples lammps input pair style: `examples/lammps/`.
+Example LAMMPS inputs and notebook: [examples/lammps/](examples/lammps/).
 
 **D3 dispersion** (every family): `pair_style jet/d3` on the GPU, overlaid on the model.
 
-```
+```lammps
 pair_style hybrid/overlay jet/mliap medium_jet.pt jet/d3 9000 1600 damp_bj pbe
 pair_coeff * * jet/mliap Li C H O N F S P B
 pair_coeff * * jet/d3 Li C H O N F S P B
 ```
 
-`jet/d3 <r_cut²> <CN r_cut²> <damping> <functional>` (squared cut-offs in bohr²)
+`jet/d3 <r_cut²> <CN r_cut²> <damping> <functional>` (squared cut-offs in bohr²):
 
-&lt;damping&gt;:`damp_zero` or `damp_bj`. &lt;functional&gt;: functional name such as `pbe`, or `custom s6 s8 a1 a2` with `damp_bj`.
+- `<damping>`: `damp_zero` or `damp_bj`.
+- `<functional>`: functional name such as `pbe`, or `custom s6 s8 a1 a2` with `damp_bj`.
+  Use the functional of the model's training data: `r2scan` for the r2SCAN models (MACE-MATPES-r2SCAN-0, 7net-mf-0
+  with `--modal R2SCAN`), `pbe` for the PBE ones. MACE-OFF23 is trained on wB97M-D3(BJ) data: it includes D3, add none.
 
 With `-k on g 1 -sf kk`, `jet/d3` runs as `jet/d3/kk` and adds its forces on the GPU, so LAMMPS no longer copies
 positions and forces between host and device every step. No input change.
@@ -218,18 +219,29 @@ Worth it from ~50k atoms per GPU (3 H200: 360k atoms 1.9-2.2x faster).
 ## 4. Check and test
 
 ```bash
-python -m pytest tests/<family>_jet       # in that family's env, GPU
-python -m pytest jet_mlip/tests            # kernel and shared LAMMPS wrapper
+python -m pytest tests/<family>_jet              # in that family's env, GPU
+python -m pytest jet_mlip/tests                  # kernel and shared LAMMPS wrapper
+python -m pytest tests/test_jet_d3_ase.py        # ASE D3 calculator (if jet_d3/ase is built)
 ```
 
 ## 5. Update
 
-```bash
-python -m common.patch_tool mace --reverse; python -m jet_mlip.patch_sevenn --reverse
-git pull
-```
+1. Get the new version, in the same folder or as a new one:
 
-Then repeat sections 1-2 and deploy the models again.
+   ```bash
+   git pull                                                                                     # same folder
+   git clone https://github.com/yanselmo-jk/jet-mlips.git jet-mlips-new && cd jet-mlips-new     # or a new folder
+   ```
+
+2. In each env that uses SevenNet or MACE, undo the old package patch from that folder (each env keeps a copy of the patch it got):
+
+   ```bash
+   python -m jet_mlip.patch_sevenn --reverse      # SevenNet env only
+   python -m common.patch_tool mace --reverse     # MACE env only
+   ```
+
+3. Repeat section 2 (rebuild `jet_mlip`, reinstall `.`, re-apply the package patch, and rebuild `jet_d3/ase` if used),
+   rebuild LAMMPS (`bash lammps/build_lammps.sh`, section 3), and deploy your models again.
 
 ## Citation
 
@@ -237,14 +249,14 @@ If you use JET-MLIPs, please cite: [arXiv:2611.31865](https://arxiv.org/abs/2611
 
 ## Changes
 
-v0.5.0
+v0.5.1
 
 - Skip connections (self-connection, per-element linears) as single CUDA ops.
-- The layers around the convolution optimized.
+- The layers around the convolution optimized (including EquFlash v1 block linears and gates: about 17% faster).
 - Convolution: a dedicated first-layer kernel and a leaner radial-table backward.
-- D3: `jet/d3` about 2x faster; under `-sf kk` it runs as `jet/d3/kk` on the device data.
+- D3: `jet/d3` about 2x faster (O(N) on large boxes, up to 3.8x at 4.3M atoms), `jet/d3/kk` on the device data under `-sf kk`, and `JetD3Calculator` for ASE.
 - LAMMPS: `pair_style jet/mliap` (= `mliap unified <file> 0`) and `jet/e3gnn` (= SevenNet's `e3gnn`).
-- ASE: the neighbour list is built on the GPU (SevenNet, MACE, NequIP, Nequix).
+- ASE: the neighbour list is built on the GPU (SevenNet, MACE, NequIP, Nequix) and each step replays from a CUDA graph (MACE about 2.5x faster).
 
 ## Limits
 
@@ -253,9 +265,9 @@ v0.5.0
 - Not supported: MACE-OMOL, 7net-l3i5.
 - `jet/d3/kk` needs the default double-precision KOKKOS build with CUDA.
 - Training is not supported. The SevenNet / MACE train-mode path (tp3 kernels) is built only with
-`JET_TRAIN=1` and is not maintained here.
+  `JET_TRAIN=1` and is not maintained here.
 
 ## License
 
-CC BY-NC-SA 4.0 (`LICENSE`): non-commercial use; commercial use needs written permission. Files derived from LAMMPS (`lammps/*.patch`, `jet_d3/` with `jet_d3/ase/`, the SevenNet pair styles) are GPL-2.0.
+CC BY-NC-SA 4.0 ([LICENSE](LICENSE)): non-commercial use; commercial use needs written permission. Files derived from LAMMPS (`lammps/*.patch`, `jet_d3/` with `jet_d3/ase/`, the SevenNet pair styles) are GPL-2.0.
 GGNN (EquFlash) is CC BY-NC-SA 4.0: it is loaded, not copied. Model weights are not redistributed.

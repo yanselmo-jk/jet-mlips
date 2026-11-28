@@ -4,11 +4,15 @@
 //   with voigt = (r0 d0, r1 d1, r2 d2, r0 d1, r1 d2, r2 d0), the old torch order. Sums in double. out (3n + 8) float64:
 //   [0, 3n) force rows, [3n+1, 3n+7) virial; out[3n] (energy) and out[3n+7] (edge count) are left for the caller.
 //   Replaces zeros + 2 index_add + 4 mul/cat + sum + 2 cat + to(double) (nano-6.0, 11k atoms, H200: ~0.4 ms of 4.4).
-// CUDA-graph capturable: no sync, no allocation.
+// CUDA-graph capturable: no sync, no allocation. Contract: 0 <= nbr[e] < n for every CSR edge; no host check (it would
+//   sync), the kernel skips such an edge and makes the force of its centre NaN.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
+
+#include <cmath>
 
 namespace jet_mlip {
 namespace {
@@ -30,6 +34,10 @@ __global__ void force_reduce_kernel(int nrows, const int* __restrict__ rowptr, c
         const double d0 = dEdr[3 * e], d1 = dEdr[3 * e + 1], d2 = dEdr[3 * e + 2];
         const double r0 = vec[3 * e], r1 = vec[3 * e + 1], r2 = vec[3 * e + 2];
         const int j = nbr[e];
+        if ((unsigned)j >= (unsigned)nforce) {   // contract broken: no write outside out, the centre row turns NaN
+          f[0] = NAN;
+          continue;
+        }
         atomicAdd(out + 3 * j, -d0);
         atomicAdd(out + 3 * j + 1, -d1);
         atomicAdd(out + 3 * j + 2, -d2);
@@ -67,6 +75,7 @@ void force_reduce(const at::Tensor& dEdr, const at::Tensor& vec, const at::Tenso
   TORCH_CHECK(nbr.numel() >= dEdr.size(0) || rowptr.numel() == 1, "nbr: one entry per dEdr row");
   TORCH_CHECK(out.scalar_type() == at::kDouble && out.is_contiguous() && out.numel() >= 8 && (out.numel() - 8) % 3 == 0,
               "out: (3n + 8) float64");
+  const c10::cuda::CUDAGuard guard(dEdr.device());   // the kernels below go to the current device's stream
   const int64_t nforce = (out.numel() - 8) / 3, nrows = rowptr.numel() - 1;
   TORCH_CHECK(nrows <= nforce, "more CSR rows than force rows");
   out.zero_();

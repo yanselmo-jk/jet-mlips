@@ -66,3 +66,27 @@ def test_empty_and_graph():
     xd = x.detach().cpu().double().requires_grad_()
     gref, = torch.autograd.grad(gate.double()(xd), xd, g.cpu().double())
     assert (gx.cpu().double() - gref).abs().max() <= 1e-5 * gref.abs().max()
+
+
+def test_tables_on_another_device():
+    gate = sevenn_gate(CASES[0])
+    with pytest.raises(RuntimeError, match='tables must be on the device of x'):
+        ops.gate(torch.zeros(4, gate.irreps_in.dim, device='cuda'), list(ops.gate_tables(gate)))
+
+@pytest.mark.parametrize('irreps_x', CASES)
+def test_ir_mul(irreps_x):
+    """gate_tables(ir_mul=...): the same gate with x and the output in cuEq's ir_mul layout, values and grad x."""
+    from jet_mlip import reference as ref
+    gate = sevenn_gate(irreps_x)
+    t = [v.cuda() for v in ops.gate_tables(gate, (gate.irreps_in, gate.irreps_out))]
+    bi, bo = ([(mul, ir.dim) for mul, ir in irreps] for irreps in (gate.irreps_in, gate.irreps_out))
+    torch.manual_seed(1)
+    x, g = torch.randn(700, gate.irreps_in.dim).double() * 2, torch.randn(700, gate.irreps_out.dim).double()
+    xd = x.clone().requires_grad_()
+    out_ref = gate.double()(xd)
+    gref, = torch.autograd.grad(out_ref, xd, g)
+    xc = ref.to_ir_mul(x, bi).float().cuda().requires_grad_()
+    out = ops.gate(xc, t)
+    gx, = torch.autograd.grad(out, xc, ref.to_ir_mul(g, bo).float().cuda())
+    assert (out.detach().cpu().double() - ref.to_ir_mul(out_ref.detach(), bo)).abs().max() <= 1e-5 * out_ref.abs().max()
+    assert (gx.cpu().double() - ref.to_ir_mul(gref, bi)).abs().max() <= 1e-5 * gref.abs().max()

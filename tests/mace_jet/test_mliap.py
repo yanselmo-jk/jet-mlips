@@ -2,6 +2,8 @@
 buffers and gives the same energies / pair forces as the eager upstream wrapper, across edge-count changes
 (same bucket), a new bucket and a changed ghost count. MACE-MPA-0: per-element-pair radial tables must use the
 layer-0 species of the ghost rows LAMMPS no longer passes to the later interactions."""
+import os
+
 import mace  # noqa: F401  isort:skip
 import pytest
 import torch
@@ -24,6 +26,8 @@ class FakeData:   # module name must contain 'kokkos': upstream picks the GPU pa
         self.elems = torch.cat([self.elems, self.elems[:nghost]])
         self.rij = (batch['positions'][ei[1]] - batch['positions'][ei[0]] + batch['shifts']).double()
         self.pair_i, self.pair_j = ei[1].int(), ei[0].int()
+        # LAMMPS hands over a ghost j (>= nlocal) for a pair across the cell: the pairs whose j has a ghost read it
+        self.pair_j[(batch['shifts'] != 0).any(1) & (self.pair_j < nghost)] += nlocal
         self.eatoms = torch.zeros(nlocal, dtype=torch.float64, device='cuda')
         self.energy = 0.0
         self.pair_forces = None
@@ -53,7 +57,7 @@ def structures(name):
 
 
 @pytest.mark.parametrize('name', ['medium', 'medium-mpa-0'])   # mpa-0: one radial table per element pair
-def test_graph_wrapper_matches_eager(name):
+def test_graph_wrapper_matches_eager(name, capsys):
     from mace.calculators.lammps_mliap_mace import LAMMPS_MLIAP_MACE
     calc, structs = structures(name)
     model = convert.patch_model(calc.models[0], radial_table=1024, cueq=True)
@@ -67,9 +71,13 @@ def test_graph_wrapper_matches_eager(name):
         assert abs(d1.energy - d0.energy) < 1e-4 * n
         assert torch.allclose(d1.eatoms, d0.eatoms, atol=1e-4)
         assert torch.allclose(d1.pair_forces, d0.pair_forces, atol=2e-3)
+        assert bool((d1.pair_j >= n).any()) == bool(nghost)   # ghost-source edges, folded onto their owners
         assert graph.key[:2] == (n, n)   # one rank: no ghost and no padding row
     assert graph.n_captures >= 2 and graph.n_replays >= 1
-    assert hasattr(graph.model.model, '_orig_mod')   # compiled when LAMMPS runs (JET_MACE_COMPILE unset), not at deploy
+    # compiled when LAMMPS runs, not at deploy; not with JET_MACE_COMPILE=0, and not after the wrapper dropped a
+    # compilation Dynamo failed on (torch >= 2.8 with e3nn 0.4.4)
+    compiled = os.environ.get('JET_MACE_COMPILE', '1') != '0' and 'torch.compile failed' not in capsys.readouterr().out
+    assert hasattr(graph.model.model, '_orig_mod') == compiled
 
 
 def test_compile_switch_is_read_at_run_time(monkeypatch):

@@ -101,6 +101,28 @@ def test_old_mace_patch_keeps_skip_tp(monkeypatch):
     assert not model.interactions[0].macetp.skip
 
 
+def test_old_mace_patch_keeps_linear(monkeypatch):
+    """A mace patch without macetp_lin_done (v0.4.5) runs the block's linear itself: the convolution must not fold it,
+    and the model is still the upstream one."""
+    monkeypatch.setattr(convert, '_LIN_HOOK', None)
+    atoms, ref, acc = rattled(), calc('medium', 'float64', 'cpu'), calc('medium', 'float64', 'cpu')
+    acc.models[0] = convert.patch_model(acc.models[0], radial_table=1024)
+    assert all(b.macetp.lin is None and not b.macetp.skip for b in acc.models[0].interactions)
+    assert abs(acc.get_potential_energy(atoms) - ref.get_potential_energy(atoms)) / len(atoms) < 1e-7
+    assert np.abs(acc.get_forces(atoms) - ref.get_forces(atoms)).max() < 1e-4
+
+
+def test_folded_linear_needs_the_hook(monkeypatch):
+    """A model converted with the linear folded (a deployed pickle) under a mace patch without macetp_lin_done: the
+    block would apply its linear again, so the convolution raises."""
+    acc = calc('medium', 'float64', 'cpu')
+    acc.models[0] = convert.patch_model(acc.models[0], radial_table=64)
+    assert acc.models[0].interactions[0].macetp.lin is not None
+    monkeypatch.setattr(convert, '_LIN_HOOK', None)
+    with pytest.raises(RuntimeError, match='block linear in the convolution'):
+        acc.get_potential_energy(rattled())
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='no CUDA')
 @pytest.mark.parametrize('model', ['medium', 'medium-mpa-0', 'off-medium'])   # the last two: skip_tp folded into layer 0
 def test_cueq_hybrid_patch_matches_upstream(model):

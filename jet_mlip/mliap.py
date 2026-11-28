@@ -14,8 +14,9 @@ Once per step the model runs on static device buffers and is replayed from a CUD
   - one capture, then replay: no per-layer exchange, no launches from Python inside the model. Two graphs: the pair
     list (ghost fold, types, mask, a family's CSR: _prep) and the model (_step). One rank replays the first only when
     LAMMPS hands over another pair list than the step before (pairs cross r_cut nearly every step in a liquid, and in
-    a warm crystal), and probes the exchange only once per neighbour-list build when LAMMPS tells the build count
-    (lmp_data.nbuild, lammps/lammps_mliap_kokkos_nbuild.patch; without it: for every new pair list).
+    a warm crystal; the elements are loaded every step and read in the model graph: fix atom/swap), and probes the
+    exchange only once per neighbour-list build when LAMMPS tells the build count (lmp_data.nbuild,
+    lammps/lammps_mliap_kokkos_nbuild.patch; without it: for every new pair list).
 A family wrapper subclasses its upstream ML-IAP class and this mixin, sets self.device, self.r_cut, self.vec_dtype,
 self.index_dtype and implements _forward(vec) -> per-node energies (first nlocal rows used), reading self.s_ei
 (2, ecap: row 0 = pair_i, row 1 = owner of pair_j), self.s_types, self.nlg (nlocal, ncap - nlocal) and
@@ -117,6 +118,10 @@ class GraphMLIAP:
     def _forward(self, vec):
         raise NotImplementedError
 
+    def _multi(self):
+        """Several LAMMPS ranks share the atoms (jet_mlip.ase_graph: never, whatever launched the script)."""
+        return not single_rank()
+
     def _cap(self, name, n, bucket, headroom=None):
         """Static size for n: grows (headroom) only when exceeded, never shrinks (a heating MD keeps adding pairs)."""
         if self.caps is None:
@@ -139,6 +144,7 @@ class GraphMLIAP:
         # raw LAMMPS inputs, copied in eagerly (their device pointers change every step); _prep turns them into the
         # model buffers inside the graph
         self.r_elems = torch.zeros(nlocal, dtype=torch.int64, device=dev)
+        self.r_el = torch.zeros(nlocal, dtype=torch.int32, device=dev)   # the local elements of this step (LAMMPS' dtype)
         self.r_lmask = torch.ones(nlocal, dtype=torch.float64, device=dev)   # several ranks: real local rows (nlocal is a capacity)
         self.r_rtypes = torch.zeros(ncap, dtype=torch.int64, device=dev)   # remote rows' elements (several ranks)
         self.r_rij = torch.zeros(ecap, 3, dtype=torch.float64, device=dev)
@@ -178,9 +184,17 @@ class GraphMLIAP:
         self.s_ei[1].copy_(torch.where(real, self.r_owner[self.r_pj.long().clamp(0, self.r_owner.numel() - 1)], pad))   # ghost fold
         self.s_mask.copy_(real)
 
+    def _types(self):
+        """One rank: the local rows' elements, read again in every step's graph from the step's raw buffer (fix atom/swap
+        changes them without another pair list); a family's buffers that follow the elements belong here too. Several
+        ranks: every step is a new list, _prep has them."""
+        if not self.key[4]:
+            self.s_types[:self.key[0]].copy_(self.r_el)
+
     def _step(self):
         """The model graph: padded edges get vector (r_cut, 0, 0)."""
         nlocal = self.key[0]
+        self._types()
         self.s_vec.copy_(torch.where(self.s_mask.bool().unsqueeze(1), self.r_rij, self.r_pad))
         vec = self.s_vec.detach().requires_grad_(True)
         ops.EDGE_MASK = self.s_mask
@@ -243,7 +257,7 @@ class GraphMLIAP:
     def _check(self, npairs, nlocal, lmp_data):
         """The replayed step against the same step run eagerly (same buffers, no graph): pair forces and energies; then
         the maps against LAMMPS' elements."""
-        rank = _dist().get_rank() if not single_rank() else 0
+        rank = _dist().get_rank() if self._multi() else 0
         elems = torch.as_tensor(lmp_data.elems).to(self.device).long()
         pj = self.r_pj[:npairs].long()
         bad =(self.s_types[self.r_owner[pj]] != elems[pj]).sum().item()   # each edge's row = its LAMMPS atom j's element
@@ -262,13 +276,13 @@ class GraphMLIAP:
         self.n_checks += 1
         tol = 1e-4 * f.abs().max().item() + 1e-5
         fail = torch.tensor([bad, int(df > tol or de > 1e-4)], device=self.device)
-        if not single_rank():   # every rank stops together (one rank raising alone leaves the others in a collective)
+        if self._multi():   # every rank stops together (one rank raising alone leaves the others in a collective)
             _dist().all_reduce(fail, op=_dist().ReduceOp.MAX)
         if fail.any():
             msg = (f'{type(self).__name__}: JET_MLIAP_CHECK failed (rank {rank}, replay {self.n_replays}, nlocal {nlocal}): '
                    f'{bad} edge / remote rows with the wrong LAMMPS element here, graph vs eager max|dF| {df:.3e} eV/A, '
                    f'max|dE_atom| {de:.3e} eV (max over ranks: {fail.tolist()})')
-            if single_rank():
+            if not self._multi():
                 raise RuntimeError(msg)
             # several ranks: LAMMPS' error path and destroy_process_group both hang with the NCCL ops held by the CUDA
             # graphs, so every rank (all saw the same verdict) leaves at once and mpirun ends the job
@@ -279,7 +293,7 @@ class GraphMLIAP:
         """The whole step for a CUDA device; the caller checks npairs > 1. Several ranks: every rank takes the same
         capture decision (the warm-up steps and the replays both run collectives)."""
         nlocal, npairs = lmp_data.nlocal, lmp_data.npairs
-        multi = not single_rank()
+        multi = self._multi()
         # Kokkos writes the LAMMPS arrays on its own stream, created blocking: CUDA orders it with the default (NULL)
         # stream by itself, both ways (update_pair_forces reads our output the same way). Another torch stream: wait.
         if self._sync is None:
@@ -288,15 +302,17 @@ class GraphMLIAP:
             torch.cuda.synchronize()
         pi, pj = lmp_data.pair_i, lmp_data.pair_j
         # one rank, the pair list of the step before: ghost fold, types and CSR stand (a ghost that takes another row or
-        # starts to be read changes the list; a row no pair reads may be stale), only the vectors are new
-        new = (multi or self.graph is None or (nlocal, npairs) != self.last
-               or not (torch.equal(torch.as_tensor(pj), self.r_pj[:npairs])
-                       and torch.equal(torch.as_tensor(pi), self.r_pi[:npairs])))
+        # starts to be read changes the list; a row no pair reads may be stale), only the vectors are new. Another
+        # build count (nbuild, None without the patch) is another list: the ghost owners may differ with the same pairs.
+        # The local elements are not compared: they are loaded every step (_load) and read in the step's graph (_types)
+        nbuild = getattr(lmp_data, 'nbuild', None)
+        new = (multi or self.graph is None or (nlocal, npairs, nbuild) != self.last
+               or not ((torch.as_tensor(pj) == self.r_pj[:npairs]).all() & (torch.as_tensor(pi) == self.r_pi[:npairs]).all()))   # one host sync
         if new:
             self._new_list(lmp_data, pj, multi)
-            self.last = (nlocal, npairs)
+            self.last = (nlocal, npairs, nbuild)
             self.n_lists += 1
-        self._load(pi, pj, lmp_data.rij, npairs, new)
+        self._load(pi, pj, lmp_data.rij, npairs, new, lmp_data.elems, nlocal)
         if self.graph is None:
             try:
                 s = torch.cuda.Stream()
@@ -308,7 +324,7 @@ class GraphMLIAP:
                 torch.cuda.current_stream().wait_stream(s)
                 graphs = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
                 for g, part in zip(graphs, (self._prep, self._step)):
-                    with torch.cuda.graph(g):
+                    with torch.cuda.graph(g, stream=s):   # this device's stream (torch's default one is the first user's)
                         part()
                 self.graph = graphs
                 self.n_captures += 1
@@ -330,11 +346,16 @@ class GraphMLIAP:
             torch.as_tensor(lmp_data.eatoms).copy_(e_local)
         lmp_data.update_pair_forces_gpu(self.o_pair_f[:npairs])
 
-    def _load(self, pi, pj, rij, npairs, new):
-        """LAMMPS' arrays (cupy; torch in the tests) into the raw buffers: the vectors, and the pairs of a new list."""
+    def _load(self, pi, pj, rij, npairs, new, elems, nlocal):
+        """LAMMPS' arrays (cupy; torch in the tests) into the raw buffers: the vectors, the local elements, and the pairs
+        of a new list."""
+        raw = elems.dtype.itemsize == 4   # LAMMPS' int32: a device memcpy too (jet_mlip.ase_graph hands int64 over)
+        if not (raw and ops.has_op('mliap_load')):
+            self.r_el[:nlocal].copy_(torch.as_tensor(elems)[:nlocal])
         if ops.has_op('mliap_load'):   # device memcpys from the raw pointers: no tensor views, slices and copy_ calls
             assert pi.dtype.itemsize == pj.dtype.itemsize == 4 and rij.dtype.itemsize == 8
-            torch.ops.jet_mlip.mliap_load(_ptr(pi), _ptr(pj), _ptr(rij), npairs, new, self.r_pi, self.r_pj, self.r_rij, self.r_n)
+            torch.ops.jet_mlip.mliap_load(_ptr(pi), _ptr(pj), _ptr(rij), npairs, new, self.r_pi, self.r_pj, self.r_rij, self.r_n,
+                                          _ptr(elems) if raw else 0, nlocal, self.r_el if raw else None)
             return
         if new:
             self.r_pi[:npairs].copy_(torch.as_tensor(pi))
@@ -348,7 +369,8 @@ class GraphMLIAP:
         nlocal, ntotal, npairs = lmp_data.nlocal, lmp_data.ntotal, lmp_data.npairs
         # one rank, same neighbour build as the list before (nbuild: lammps_mliap_kokkos_nbuild.patch; None without it):
         # atoms and ghosts keep their rows between builds, so owners, elements and capacities stand; only pairs moved
-        # across r_cut. No exchange probe (13 Kokkos kernels with their fences).
+        # across r_cut. No exchange probe (13 Kokkos kernels with their fences). The elements are loaded
+        # every step (_load) and read in the step's graph (_types).
         built = (getattr(lmp_data, 'nbuild', None), nlocal, ntotal)
         if (not multi and built[0] is not None and built == self._built and self.graph is not None
                 and self._cap('pairs', npairs, EDGE_BUCKET) == self.key[2]):

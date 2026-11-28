@@ -2,7 +2,9 @@
 gradgradcheck wrt edge_vec and coeffs, and a force-style double backward vs the torch path."""
 import pytest
 import torch
-from sevenn.nn.edge_embedding import BesselBasis, EdgeEmbedding, SphericalEncoding, XPLORCutoff
+
+pytest.importorskip('sevenn')   # the reference; the other families' envs skip
+from sevenn.nn.edge_embedding import BesselBasis, EdgeEmbedding, SphericalEncoding, XPLORCutoff  # noqa: E402
 
 import jet_mlip
 from jet_mlip import ops, reference

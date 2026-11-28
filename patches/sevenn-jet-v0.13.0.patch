@@ -134,7 +134,7 @@ index 803ad77..9e07186 100644
          if self.compute_atomic_virial:
              force_output = self.model._modules.get('force_output')
              if force_output is None or not hasattr(
-@@ -221,9 +250,13 @@ class SevenNetCalculator(Calculator):
+@@ -221,9 +250,15 @@ class SevenNetCalculator(Calculator):
          Calculator.calculate(self, atoms, properties, system_changes)
          if atoms is None:
              raise ValueError('No atoms to evaluate')
@@ -143,15 +143,17 @@ index 803ad77..9e07186 100644
 -        )
 +        graph = None
 +        if self.enable_jet:
-+            from sevenn.nn.jet_helper import ase_graph
++            from sevenn.nn.jet_helper import ase_graph, ase_step
 +            graph = ase_graph(atoms, self.cutoff, self.device)
++            if graph is not None and ase_step(self, atoms, graph):
++                return  # replayed from a CUDA graph (jet_mlip.ase_graph)
 +        if graph is None:
 +            graph = unlabeled_atoms_to_graph(atoms, self.cutoff, with_shift=False)
 +        data = AtomGraphData.from_numpy_dict(graph)
          if self.modal:
              data[KEY.DATA_MODALITY] = self.modal
  
-@@ -243,6 +276,7 @@ class SevenNetD3Calculator(SumCalculator):
+@@ -243,6 +278,7 @@ class SevenNetD3Calculator(SumCalculator):
          enable_cueq: bool = False,
          enable_flash: bool = False,
          enable_oeq: bool = False,
@@ -159,7 +161,7 @@ index 803ad77..9e07186 100644
          sevennet_config: Optional[Any] = None,
          damping_type: str = 'damp_bj',
          functional_name: str = 'pbe',
-@@ -273,6 +307,8 @@ class SevenNetD3Calculator(SumCalculator):
+@@ -273,6 +309,8 @@ class SevenNetD3Calculator(SumCalculator):
              if True, use flashTP backend.
          enable_oeq: bool, default=False
              if True, use OpenEquivariance backend.
@@ -168,7 +170,7 @@ index 803ad77..9e07186 100644
          sevennet_config: dict | None, default=None
              hold meta information
          damping_type: str, default='damp_bj'
-@@ -307,6 +343,7 @@ class SevenNetD3Calculator(SumCalculator):
+@@ -307,6 +345,7 @@ class SevenNetD3Calculator(SumCalculator):
              enable_cueq=enable_cueq,
              enable_flash=enable_flash,
              enable_oeq=enable_oeq,
@@ -720,7 +722,7 @@ new file mode 100644
 index 0000000..14abc74
 --- /dev/null
 +++ b/sevenn/nn/jet_helper.py
-@@ -0,0 +1,625 @@
+@@ -0,0 +1,687 @@
 +"""jet backend: one fused CUDA kernel per convolution layer (Bessel * cutoff
 ++ radial MLP + spherical harmonics + uvu tensor product + scatter).
 +
@@ -812,6 +814,63 @@ index 0000000..14abc74
 +    }
 +
 +
++def ase_step(calc, atoms, graph) -> bool:
++    """SevenNetCalculator.calculate replayed from a CUDA graph (jet_mlip.ase_graph: the LAMMPS ML-IAP scheme)
++    on ase_graph()'s pair list and fp64 vectors, from the second call in a row with the same atom count on.
++    Sets calc.results as output_to_results does (the total energy summed in fp64) and returns True. False:
++    the caller's eager step (first call, JET_ASE_GRAPH=0, atomic virials, a jet_mlip without ase_graph, a
++    model that is not all jet, an element the model does not know)."""
++    g = getattr(calc, 'jet_graph', None)
++    if g is None:
++        g, mods = False, calc.model._modules
++        try:
++            from jet_mlip.ase_graph import AseGraph
++        except ImportError:
++            AseGraph = None
++        if AseGraph is not None and not calc.compute_atomic_virial and not calc.model.training \
++                and type(mods.get('force_output')).__name__ == 'ForceStressOutputFromEdge' \
++                and getattr(mods.get('reduce_total_enegy'), 'constant', None) == 1.0 \
++                and all(isinstance(m, JetConvolution) for k, m in mods.items() if k.endswith('_convolution')):
++            body = [m for k, m in mods.items() if k != 'force_output']
++            # _eval_modal_map's index, made here (a tensor made inside a capture is a host copy) and 1-D (python
++            # reads a 0-dim index on the host: ModalWiseRescale's shift[modal, types])
++            modal = None
++            if calc.modal:
++                modal = torch.full((1,), calc.model.modal_map[calc.modal], dtype=torch.int64, device=calc.device)
++
++            def forward(g, vec):   # the model body on the graph's static buffers; types = one-hot indices
++                data = {KEY.NODE_FEATURE: g.s_types, KEY.EDGE_IDX: g.s_ei, KEY.EDGE_VEC: vec,
++                        KEY.JET_ROWPTR: g.s_rowptr, KEY.JET_PERM: g.s_perm, KEY.JET_SRC: g.s_ei[1]}
++                if modal is not None:
++                    data[KEY.MODAL_TYPE] = modal
++                for m in body:
++                    data = m(data)
++                return data[KEY.ATOMIC_ENERGY].view(-1)
++            g = AseGraph(forward, calc.device, calc.cutoff, index_dtype=torch.int32)
++        calc.jet_graph = g
++    i, j = graph[KEY.EDGE_IDX]
++    if g is False or not g.due(len(atoms), i.numel()):
++        return False
++    z = graph[KEY.ATOMIC_NUMBERS]
++    if getattr(calc, 'jet_z', None) is None or not np.array_equal(calc.jet_z[0], z):
++        t = calc.model.z_to_onehot_tensor[torch.as_tensor(z)]
++        calc.jet_z = z, t.to(calc.device) if int(t.min()) >= 0 else None
++    if calc.jet_z[1] is None:
++        return False
++    e, f, w = g.compute(calc.jet_z[1], i, j, graph[KEY.EDGE_VEC], torch.as_tensor(graph[KEY.POS], device=calc.device))
++    energy = e.sum().item()
++    w = w / max(float(graph[KEY.CELL_VOLUME]), 1e-3)   # force_output's floor (no cell)
++    calc.results = {
++        'free_energy': energy,
++        'energy': energy,
++        'energies': e.float().cpu().numpy(),
++        'forces': f.float().cpu().numpy(),
++        'stress': w.reshape(9)[[0, 4, 8, 5, 6, 1]].float().cpu().numpy(),   # sum rij (x) fij / V in voigt order
++        'num_edges': i.numel(),
++    }
++    return True
++
++
 +@compile_mode('script')
 +class JetEdgeEmbedding(EdgeEmbedding):
 +    """EdgeEmbedding that skips Bessel / spherical harmonics in eval mode
@@ -882,6 +941,8 @@ index 0000000..14abc74
 +        # deployment. Buffers are non-persistent: derived, and absent from any checkpoint.
 +        self.radial_table: int = int(radial_table)
 +        self.register_buffer('radial_tab', torch.zeros(0), persistent=False)
++        # layer2's live weight columns, gathered once with the table (empty: gathered per call)
++        self.register_buffer('jet_w3', torch.zeros(0), persistent=False)
 +        # exact-MLP backward (radial_table = 0 only), fixed at deploy time: 'split' = two kernels (grad of
 +        # the hidden layer accumulated per edge in a transient E x 64 fp32 buffer), 'recompute' = one
 +        # kernel that redoes the MLP backward per path group, no buffer
@@ -903,9 +964,9 @@ index 0000000..14abc74
 +        w = self.weight_nn
 +        if w is None or w.layer0.weight.dtype != torch.float32:
 +            return
++        self.jet_w3 = w.layer2.weight[:, self.live_cols].detach()
 +        self.radial_tab = jet_ops.make_radial_table(
-+            self.cfg, w.layer0.weight, w.layer1.weight,
-+            w.layer2.weight[:, self.live_cols], coeffs,
++            self.cfg, w.layer0.weight, w.layer1.weight, self.jet_w3, coeffs,
 +            self.r_on, self.r_cut, self.act_cst, self.radial_table,
 +        )
 +
@@ -914,6 +975,7 @@ index 0000000..14abc74
 +        # it is rebuilt on the next eval-mode forward
 +        if mode:
 +            self.radial_tab = self.radial_tab[:0]
++            self.jet_w3 = self.jet_w3[:0]
 +        self.denom = 1.0 if mode else float(self.denominator.item())
 +        return super().train(mode)
 +
@@ -1019,7 +1081,9 @@ index 0000000..14abc74
 +            # that needs the weight / coefficient grads raises (use train mode)
 +            w1 = self.weight_nn.layer0.weight
 +            w2 = self.weight_nn.layer1.weight
-+            w3 = self.weight_nn.layer2.weight[:, self.live_cols]
++            w3 = self.jet_w3
++            if w3.numel() == 0:   # no table (yet)
++                w3 = self.weight_nn.layer2.weight[:, self.live_cols]
 +            if edge_src.numel() == 0:
 +                out = x.new_zeros(n_out, self._out_dim)
 +                out = out + (edge_vec.sum() + x.sum()) * 0  # keep in graph

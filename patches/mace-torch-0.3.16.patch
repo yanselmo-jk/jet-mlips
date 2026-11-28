@@ -88,11 +88,12 @@ diff --git a/mace/modules/blocks.py b/mace/modules/blocks.py
 index af60244..b5c2437 100644
 --- a/mace/modules/blocks.py
 +++ b/mace/modules/blocks.py
-@@ -13,6 +13,12 @@
+@@ -13,6 +13,13 @@
  from e3nn.util.jit import compile_mode
  
  from mace.modules.gate import GatedEquivariantBlock
 +from mace.modules.macetp_hook import (
++    macetp_avg_done,
 +    macetp_fused,
 +    macetp_lin_done,
 +    macetp_skip_done,
@@ -101,7 +102,7 @@ index af60244..b5c2437 100644
  from mace.modules.wrapper_ops import (
      CuEquivarianceConfig,
      FullyConnectedTensorProduct,
-@@ -668,6 +674,7 @@
+@@ -668,6 +675,7 @@
          lammps_natoms: Tuple[int, int] = (0, 0),
          lammps_class: Optional[Any] = None,
          first_layer: bool = False,
@@ -109,7 +110,7 @@ index af60244..b5c2437 100644
      ) -> Tuple[torch.Tensor, None]:
          n_real = lammps_natoms[0] if lammps_class is not None else None
          node_feats = self.linear_up(node_feats)
-@@ -677,12 +684,23 @@
+@@ -677,12 +685,23 @@
              lammps_natoms=lammps_natoms,
              first_layer=first_layer,
          )
@@ -139,7 +140,7 @@ index af60244..b5c2437 100644
              message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
          else:
              mji = self.conv_tp(
-@@ -693,8 +711,11 @@
+@@ -693,8 +712,11 @@
              )
          message = self.truncate_ghosts(message, n_real)
          node_attrs = self.truncate_ghosts(node_attrs, n_real)
@@ -153,7 +154,7 @@ index af60244..b5c2437 100644
          return (
              self.reshape(message),
              None,
-@@ -771,6 +792,7 @@
+@@ -771,6 +793,7 @@
          lammps_class: Optional[Any] = None,
          lammps_natoms: Tuple[int, int] = (0, 0),
          first_layer: bool = False,
@@ -161,7 +162,7 @@ index af60244..b5c2437 100644
      ) -> Tuple[torch.Tensor, torch.Tensor]:
          n_real = lammps_natoms[0] if lammps_class is not None else None
          sc = self.skip_tp(node_feats, node_attrs)
-@@ -781,11 +803,21 @@
+@@ -781,11 +804,23 @@
              lammps_natoms=lammps_natoms,
              first_layer=first_layer,
          )
@@ -172,9 +173,11 @@ index af60244..b5c2437 100644
 -        if hasattr(self, "conv_fusion"):
 +        message: Optional[torch.Tensor] = None
 +        lin_done = False   # macetp: the fused convolution may apply self.linear too
++        avg_done = False   # ... with 1/avg_num_neighbors in its weights
 +        if not torch.jit.is_scripting():   # macetp eval path: fused table convolution, no radial MLP
 +            message = macetp_fused(self, node_feats, edge_vectors, edge_index, node_attrs)
 +            lin_done = macetp_lin_done(self, message)
++            avg_done = macetp_avg_done(self, message)
 +        tp_weights = torch.zeros(0)
 +        if message is None:
 +            tp_weights = self.conv_tp_weights(edge_feats)
@@ -188,18 +191,19 @@ index af60244..b5c2437 100644
              message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
          else:
              mji = self.conv_tp(
-@@ -797,7 +829,9 @@
+@@ -797,7 +832,10 @@
          message = self.truncate_ghosts(message, n_real)
          node_attrs = self.truncate_ghosts(node_attrs, n_real)
          sc = self.truncate_ghosts(sc, n_real)
 -        message = self.linear(message) / self.avg_num_neighbors
 +        if not lin_done:
 +            message = self.linear(message)
-+        message = message / self.avg_num_neighbors
++        if not avg_done:   # macetp: else the fused linear divided already
++            message = message / self.avg_num_neighbors
          return (
              self.reshape(message),
              sc,
-@@ -884,6 +918,7 @@
+@@ -884,6 +922,7 @@
          lammps_class: Optional[Any] = None,
          lammps_natoms: Tuple[int, int] = (0, 0),
          first_layer: bool = False,
@@ -207,7 +211,7 @@ index af60244..b5c2437 100644
      ) -> Tuple[torch.Tensor, None]:
          receiver = edge_index[1]
          num_nodes = node_feats.shape[0]
-@@ -895,16 +930,29 @@
+@@ -895,16 +934,29 @@
              lammps_natoms=lammps_natoms,
              first_layer=first_layer,
          )
@@ -241,7 +245,7 @@ index af60244..b5c2437 100644
              message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
          else:
              mji = self.conv_tp(
-@@ -917,8 +965,11 @@
+@@ -917,8 +969,11 @@
          message = self.truncate_ghosts(message, n_real)
          node_attrs = self.truncate_ghosts(node_attrs, n_real)
          density = self.truncate_ghosts(density, n_real)
@@ -255,7 +259,7 @@ index af60244..b5c2437 100644
          return (
              self.reshape(message),
              None,
-@@ -1006,6 +1057,7 @@
+@@ -1006,6 +1061,7 @@
          lammps_class: Optional[Any] = None,
          lammps_natoms: Tuple[int, int] = (0, 0),
          first_layer: bool = False,
@@ -263,7 +267,7 @@ index af60244..b5c2437 100644
      ) -> Tuple[torch.Tensor, torch.Tensor]:
          receiver = edge_index[1]
          num_nodes = node_feats.shape[0]
-@@ -1018,17 +1070,27 @@
+@@ -1018,17 +1074,27 @@
              lammps_natoms=lammps_natoms,
              first_layer=first_layer,
          )
@@ -296,7 +300,7 @@ index af60244..b5c2437 100644
              message = self.conv_tp(node_feats, edge_attrs, tp_weights, edge_index)
          else:
              mji = self.conv_tp(
-@@ -1042,7 +1104,9 @@
+@@ -1042,7 +1108,9 @@
          node_attrs = self.truncate_ghosts(node_attrs, n_real)
          density = self.truncate_ghosts(density, n_real)
          sc = self.truncate_ghosts(sc, n_real)
@@ -307,7 +311,7 @@ index af60244..b5c2437 100644
          return (
              self.reshape(message),
              sc,
-@@ -1129,6 +1193,7 @@
+@@ -1129,6 +1197,7 @@
          lammps_class: Optional[Any] = None,
          lammps_natoms: Tuple[int, int] = (0, 0),
          first_layer: bool = False,
@@ -315,7 +319,7 @@ index af60244..b5c2437 100644
      ) -> Tuple[torch.Tensor, None]:
          sender = edge_index[0]
          receiver = edge_index[1]
-@@ -1303,6 +1368,7 @@
+@@ -1303,6 +1372,7 @@
          lammps_class: Optional[Any] = None,
          lammps_natoms: Tuple[int, int] = (0, 0),
          first_layer: bool = False,
@@ -345,7 +349,7 @@ new file mode 100644
 index 0000000..e1ca2d9
 --- /dev/null
 +++ b/mace/modules/macetp_hook.py
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,65 @@
 +"""mlip-accel hook: jet_mlip fused convolution (macetp) for InteractionBlocks.
 +`macetp.convert.patch_model` attaches a `macetp` module to each block. Eval: the whole radial MLP + tensor
 +product + scatter is one fused kernel (radial table). Train: the radial MLP stays in torch, the tensor product +
@@ -380,6 +384,12 @@ index 0000000..e1ca2d9
 +    """True if `message` is the fused convolution's of a first block and has the block's 1/avg_num_neighbors and
 +    `skip_tp` applied with its `linear`, as one map per element (MaceTPConv.skip)."""
 +    return message is not None and getattr(block.macetp, "skip", False)
++
++
++def macetp_avg_done(block, message: Optional[torch.Tensor]) -> bool:
++    """True if `message` is the fused convolution's of a residual block and its fused `linear` weights hold the
++    block's 1/avg_num_neighbors (MaceTPConv.avg)."""
++    return message is not None and getattr(block.macetp, "avg", False)
 +
 +
 +def macetp_all_fused(model) -> bool:

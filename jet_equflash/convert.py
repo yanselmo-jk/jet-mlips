@@ -19,10 +19,11 @@ node features in ir_mul (m*mul+u: its own Linear and RMSNorm are written that wa
 transposes), so JetTPScatter transposes x into mul_ir and the output back.
 """
 import copy
+import os
 
 import torch
 from e3nn import o3
-from jet_mlip import ops, reference, tables
+from jet_mlip import ase_graph, ops, reference, tables
 
 from common.radial_table import DEFAULT_N, interpolate, make_radial_table
 
@@ -128,16 +129,18 @@ class JetTPScatter(torch.nn.Module):
     in_idx / out_idx: the column maps that replace the slice/merge/transpose passes (built once here by pushing column
     ids through the old glue; they include the V2 ir_mul <-> mul_ir transpose)."""
 
-    def __init__(self, model, layer, radial_table: int = DEFAULT_N):
+    def __init__(self, model, layer, radial_table: int = DEFAULT_N, ir_mul: bool = False):
         super().__init__()
         kw = conv_kwargs(layer)
         self.cfg = config_from_layer(layer)
         self.blocks_x = [(mul, 2 * ir.l + 1) for mul, ir in o3.Irreps(kw['irreps_in1'])]
         self.blocks_out = [(mul, 2 * ir.l + 1) for mul, ir in o3.Irreps(kw['irreps_out'])]
-        self.ir_mul = _is_full(layer)   # V2 keeps node features ir_mul; its FullConv has no cue transposes
+        # V2 keeps node features ir_mul (its FullConv has no cue transposes); v1: patch_glue's ir_mul mode
+        self.ir_mul = _is_full(layer) or ir_mul
         if self.ir_mul:
             self.blocks_x_full = [(mul, ir.dim) for mul, ir in o3.Irreps(kw['irreps_in1'])]
-            self.blocks_out_full = [(mul, ir.dim) for mul, ir in o3.Irreps(layer.irreps_out)]
+            # the simplified mid irreps: V2's layer.irreps_out, v1's self_interaction_2 input
+            self.blocks_out_full = [(mul, ir.dim) for mul, ir in o3.Irreps(kw['irreps_out']).simplify()]
         self.r_max = float(model.edge_embedding.cutoff_function.r_cut)
         self.denominator = float(layer.denominator)   # upstream divides the summed messages by this
         # per-slice column maps: the old glue applied to column ids once, at build (V2 transposed first, as before)
@@ -280,6 +283,120 @@ def to_fp64(model):
     return model.double()
 
 
+class JetLinear(torch.nn.Module):
+    """A block's e3nn o3.Linear (sc, self_interaction_1 / 2) as one jet_mlip op on fp32 CUDA instead of e3nn's slice /
+    GEMM / layout copy / cat per irrep, each way (first-order grad in x; the weight is folded at patch time: inference).
+    mul_ir (e3nn's layout): species_linear, one tile-GEMM kernel. ir_mul (both sides in cuEq's layout, patch_glue):
+    linear_ir_mul, a copy-free cuBLAS sgemm per (irrep, m). Elsewhere (CPU, fp64) the e3nn module, kept as `lin`."""
+
+    def __init__(self, lin, w, paths, ir_mul=False):
+        super().__init__()
+        self.lin, self.paths, self.dim_out, self.ir_mul = lin, paths, lin.irreps_out.dim, ir_mul
+        self.blocks = [[(mul, ir.dim) for mul, ir in irreps] for irreps in (lin.irreps_in, lin.irreps_out)]
+        self.register_buffer('w', w, persistent=False)
+
+    def forward(self, x):
+        if x.is_cuda and x.dtype == torch.float32:
+            return self._jet(x)
+        if not self.ir_mul:
+            return self.lin(x)
+        return reference.to_ir_mul(self.lin(reference.to_mul_ir(x, self.blocks[0])), self.blocks[1])
+
+    @torch._dynamo.disable   # no fake-tensor rule: an opaque step for torch.compile
+    def _jet(self, x):
+        if self.ir_mul:
+            return torch.ops.jet_mlip.linear_ir_mul(x.contiguous(), self.w, self.paths, self.dim_out)
+        return torch.ops.jet_mlip.species_linear(x.contiguous(), None, self.w, self.paths, self.dim_out, None)
+
+
+class JetGate(torch.nn.Module):
+    """The e3nn nn.Gate of a block's EquivariantGate as one jet_mlip kernel per direction on fp32 CUDA, instead of the
+    Extract / activation / product / cat chain; elsewhere the e3nn module, kept as `gate`. ir_mul: x and the output in
+    cuEq's ir_mul layout (the tables carry it, ops.gate_tables)."""
+
+    def __init__(self, gate, tables, ir_mul=False):
+        super().__init__()
+        self.gate, self.irreps_in, self.irreps_out, self.ir_mul = gate, gate.irreps_in, gate.irreps_out, ir_mul
+        self.blocks = [[(mul, ir.dim) for mul, ir in irreps] for irreps in (gate.irreps_in, gate.irreps_out)]
+        for name, t in zip(('fi', 'ff', 'bi', 'bf'), tables):
+            self.register_buffer(name, t, persistent=False)
+
+    def forward(self, x):
+        if x.is_cuda and x.dtype == torch.float32:
+            return self._jet(x)
+        if not self.ir_mul:
+            return self.gate(x)
+        return reference.to_ir_mul(self.gate(reference.to_mul_ir(x, self.blocks[0])), self.blocks[1])
+
+    @torch._dynamo.disable
+    def _jet(self, x):
+        return torch.ops.jet_mlip.gate(x.contiguous(), self.fi, self.ff, self.bi, self.bf)
+
+
+def _fold(lin):
+    """(weight, paths) of the jet linear ops for a block's e3nn Linear, or None if they do not take it."""
+    r = ops.linear_weight(lin) if isinstance(lin, o3.Linear) and lin.weight.dtype == torch.float32 else None
+    return None if r is None or r[2] is not None else r[:2]
+
+
+def _blocks(model):
+    return [m for m in model.modules() if type(m).__name__ == 'InteractionBlock']
+
+
+def glue_ir_mul(model):
+    """The blocks' gate tables for patch_glue's ir_mul mode, or None if the node features of the model cannot stay in
+    cuEq's ir_mul layout from the first block to the last. That takes: the ops in the build, every block made of three
+    fp32 e3nn Linears the op takes, a fused convolution and an e3nn Gate the gate op takes (no feed_forward), their
+    irreps chained block to block, and scalars only into the first block and out of the last (both layouts coincide
+    there, so nothing outside the blocks sees the change)."""
+    blocks = _blocks(model)
+    if not (blocks and ops.has_op('linear_ir_mul') and ops.has_op('gate')):
+        return None
+    prev, tables = None, []
+    for b in blocks:
+        lins = [getattr(b, name, None) for name in ('sc', 'self_interaction_1', 'self_interaction_2')]
+        gate, conv = getattr(getattr(b, 'act', None), 'gate', None), getattr(b, 'conv', None)
+        if any(_fold(lin) is None for lin in lins) or type(gate).__name__ != 'Gate' or getattr(b, 'feed_forward', None) \
+                or type(conv).__name__ != 'IntegratedConv':
+            return None
+        (sc, s1, s2), kw = lins, conv_kwargs(conv)
+        if not (sc.irreps_in == s1.irreps_in and prev in (None, s1.irreps_in) and s1.irreps_out == o3.Irreps(kw['irreps_in1'])
+                and s2.irreps_in == o3.Irreps(kw['irreps_out']).simplify() and s2.irreps_out == sc.irreps_out == gate.irreps_in):
+            return None
+        tables.append(ops.gate_tables(copy.deepcopy(gate).cpu(), (gate.irreps_in, gate.irreps_out)))
+        prev = gate.irreps_out
+    if any(t is None for t in tables) or any(ir.l for irreps in (blocks[0].sc.irreps_in, prev) for _, ir in irreps):
+        return None
+    return tables
+
+
+def patch_glue(model, ir_mul=None):
+    """Swap the e3nn Linears and the Gate of every v1 InteractionBlock for jet_mlip ops (in place); returns the number of
+    modules swapped. ir_mul (glue_ir_mul(model)'s gate tables; the convolutions must be built for that layout too): the
+    node features stay in cuEq's ir_mul layout between the blocks' modules. The convolution's slice maps and the gate
+    tables take and give it for free, and every Linear becomes copy-free cuBLAS GEMMs. None: e3nn's mul_ir, where a
+    module the ops do not cover (ops.linear_weight / ops.gate_tables return None) keeps e3nn.
+    H200, eq5k 5632 atoms, one block: e3nn's three Linears and Gate 5.1 ms forward / 8.9 ms backward, 250 kernels."""
+    device = next(model.parameters()).device
+    n = 0
+    for k, block in enumerate(_blocks(model)):
+        for name in ('sc', 'self_interaction_1', 'self_interaction_2') if ops.has_op('species_linear') else ():
+            lin = getattr(block, name, None)
+            r = _fold(lin)
+            if r is not None:
+                setattr(block, name, JetLinear(lin, *r, ir_mul is not None).to(device))
+                n += 1
+        gate = getattr(getattr(block, 'act', None), 'gate', None)
+        if ir_mul is not None:
+            t = ir_mul[k]
+        else:
+            t = ops.gate_tables(copy.deepcopy(gate).cpu()) if type(gate).__name__ == 'Gate' and ops.has_op('gate') else None
+        if t is not None:
+            block.act.gate = JetGate(gate, t, ir_mul is not None).to(device)
+            n += 1
+    return n
+
+
 def _jet_forward(self, x, edge_index, edge_embedding, edge_attr, lmp_data=None):
     """The upstream layer minus its radial MLP / TP / scatter / denominator: one fused convolution on the layer's
     edge vectors (`patch_model` stashes them). edge_index is (dst, src), as upstream: out[dst] += TP(x[src], ...).
@@ -298,27 +415,84 @@ def _no_edge_embedding(data):
     return data
 
 
+def _ase_graph(model, run, device):
+    """The model's ASE graph step (jet_mlip.ase_graph): jet_equflash.mliap's _forward on the graph's static buffers,
+    with the pair list's CSR. The model runs in its ML-IAP mode there (atomic energies and no force_output: the graph
+    takes the gradient itself); the mode is switched only around this forward, which runs at a capture and never at a
+    replay, so an eager ASE call always finds upstream's mode. The ASE model's layers are built without
+    use_lammps_mliap: no exchange, as under `local_only`."""
+    def forward(g, vec):
+        global CSR
+        mode = model.lammps_mliap, model.regress_forces, model.regress_stress
+        model.lammps_mliap, model.regress_forces, model.regress_stress = True, False, False
+        CSR = (g.s_rowptr, g.s_perm)
+        try:
+            return run(dict(edge_vec=vec, atomic_numbers=g.s_types, edge_index=g.s_ei))['atomic_energy']
+        finally:
+            CSR = None
+            model.lammps_mliap, model.regress_forces, model.regress_stress = mode
+    for m in model.modules():   # the type map is a plain CPU tensor copied per call: a host copy in the capture
+        if torch.is_tensor(getattr(m, 'type_map', None)):
+            m.type_map = m.type_map.to(device)
+    return ase_graph.AseGraph(forward, device, float(model.edge_embedding.cutoff_function.r_cut))
+
+
+def _ase_step(g, batch):
+    """upstream's forward outputs (ForceStressOutputFromEdge's shapes and dtype) from the graph step: the pair list
+    and the fp32 edge vectors are the ones GGNN made for the eager call. The total energy is summed in fp64."""
+    ei, dt = batch['edge_index'], batch['edge_vec'].dtype
+    with torch.enable_grad():   # as upstream's forward does for itself: a capture under a caller's no_grad has no gradient
+        e, f, w = g.compute(batch['atomic_numbers'].long(), ei[0].long(), ei[1].long(), batch['edge_vec'].detach(),
+                            batch['pos'])
+    stress = (w + w.t()).view(1, 9) / (2 * torch.linalg.det(batch['cell']).double().unsqueeze(-1))
+    return {'energy': e.sum().to(dt).view(1), 'atomic_energy': e.to(dt).unsqueeze(1), 'forces': f.to(dt),
+            'stress': stress.to(dt)}
+
+
 def patch_model(model, radial_table: int = DEFAULT_N):
     """Attach fused convolutions to every IntegratedConv (v1) / FullConv (V2) of an EquFlash model (in place; returns
-    it). radial_table=0 keeps the exact W(r) on the torch reference path (fp64 checks; no parameter gradients)."""
+    it). radial_table=0 keeps the exact W(r) on the torch reference path (fp64 checks; no parameter gradients).
+    ASE (UCalculator), v1 on fp32 CUDA: from the second call in a row with the same atom count on, the step of one
+    structure is replayed from a CUDA graph (_ase_graph, _ase_step; JET_ASE_GRAPH=0: off). V2 stays eager (its capture
+    is invalid, jet_equflash.mliap). Normalizers and element refs are the trainer's, applied to either path's outputs."""
     device = next(model.parameters()).device
     layers = [m for m in model.modules() if type(m).__name__ in ('IntegratedConv', 'FullConv')]
     if not layers:
         raise ValueError('jet_equflash: no IntegratedConv / FullConv found in the model')
+    # the blocks' e3nn glue as jet ops (inference only). JET_EQUFLASH_GLUE: 0 = keep e3nn, mul_ir = jet ops on e3nn's
+    # layout; default: the features in ir_mul between the blocks' modules where the model allows it (glue_ir_mul)
+    glue = os.environ.get('JET_EQUFLASH_GLUE', 'ir_mul') if radial_table > 0 else '0'
+    ir_mul = glue_ir_mul(model) if glue == 'ir_mul' else None
     classes = {}
     for layer in layers:
-        layer.jet = JetTPScatter(model, layer, radial_table).to(device)
+        layer.jet = JetTPScatter(model, layer, radial_table, ir_mul is not None).to(device)
         layer.__class__ = classes.setdefault(type(layer), type('JetConvolution', (type(layer),),
                                                                {'forward': _jet_forward, 'local_only': False}))
     if radial_table > 0 and type(model).__name__ == 'EquFlash' and type(model.edge_embedding).__name__ == 'EdgeEmbedding':
         # every convolution is fused and makes its own radial / angular terms from the edge vectors: no block reads
         # the edge embedding or spherical harmonics (radial_table=0 keeps them for the exact-W reference path)
         model.edge_embedding.forward = _no_edge_embedding
+    if glue != '0':
+        patch_glue(model, ir_mul)
     orig = model.forward
+    graphs = radial_table > 0 and type(model).__name__ == 'EquFlash' and ops.has_op('conv_fused')
+    graph = []   # the ASE graph step, made at the first call that can take it
 
-    def forward(batch):
+    def run(batch):
         for layer in layers:   # the layers only get edge_embedding / edge_attr, not the vectors we need
             layer.edge_vec = batch['edge_vec']
         return orig(batch)
+
+    def forward(batch):
+        vec = batch['edge_vec']
+        # ASE, one structure, upstream's inference outputs (energy, forces and stress from the edge gradient)
+        if graphs and vec.is_cuda and vec.dtype == torch.float32 and not model.lammps_mliap and not model.training \
+                and model.regress_forces and model.regress_stress and 'batch' in batch.keys() \
+                and batch['natoms'].numel() == 1 and not torch.is_autocast_enabled():
+            if not graph:
+                graph.append(_ase_graph(model, run, vec.device))
+            if graph[0].due(batch['batch'].numel(), vec.shape[0]):
+                return _ase_step(graph[0], batch)
+        return run(batch)
     model.forward = forward
     return model

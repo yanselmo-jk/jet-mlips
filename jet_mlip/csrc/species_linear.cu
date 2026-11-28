@@ -10,10 +10,12 @@
 //   the columns the paths write (sevenn's modal one-hot input of a linear folded into a bias).
 //   out_ir_mul: the output in cuEq's ir_mul layout (out[n, oo + m*V + w]; grad out is read in it), for a consumer that takes
 //   ir_mul (MACE symmetric contraction): no layout copy of the output and of its gradient. LAY = 1 / 2 below.
-// CUDA-graph capturable: no sync, allocations depend on N and S only. species must lie in [0, S).
+// CUDA-graph capturable: no sync, allocations depend on N and S only. species must lie in [0, S): no host check (it
+//   would sync), a species outside makes the whole output (and grad x) NaN instead of leaving rows unwritten.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/autograd.h>
 #include <torch/library.h>
 
@@ -113,12 +115,18 @@ __device__ __forceinline__ void tile(const Args& a, const Path& p, int r0, int x
         if (t < nt) break;
         t -= nt;
       }
+      if (a.start[a.S] != a.n) s = -1;   // a species outside [0, S): its nodes are in no segment
       seg_s[0] = s;
       seg_s[1] = t;
     }
     __syncthreads();
     s = seg_s[0];
     t = seg_s[1];
+    if (s < 0) {   // block-uniform: nothing is computed, block 0 makes the whole output NaN
+      if (blockIdx.x == 0)
+        for (int64_t i = tid; i < (int64_t)a.n * a.ldo; i += kThreads) a.out[i] = __int_as_float(0x7fc00000);
+      return;
+    }
     if (s == a.S) return;   // block-uniform
     seg = a.start[s];
     nn = a.start[s + 1] - seg;
@@ -300,6 +308,7 @@ __global__ void __launch_bounds__(kThreads, SMALL ? 2 : 4) gemm_kernel(Args a, P
 at::Tensor run(const at::Tensor& in, const at::Tensor& perm, const at::Tensor& start, const at::Tensor& W,
                const std::vector<int64_t>& paths, int64_t dim_out, bool transpose, const at::Tensor& bias = {},
                bool ir_mul = false) {   // ir_mul: the op's output side (out, or in = grad out when transpose)
+  const c10::cuda::CUDAGuard guard(in.device());   // the kernels below go to the current device's stream
   const int np = (int)paths.size() / 5, S = (int)W.size(0);
   const int64_t n = in.size(0);
   Paths ps{};
@@ -363,6 +372,7 @@ at::Tensor run(const at::Tensor& in, const at::Tensor& perm, const at::Tensor& s
 // -> (perm int32 (N): node ids grouped by species, start int32 (S+1): species segment offsets); undefined without species
 std::tuple<at::Tensor, at::Tensor> bucket(const std::optional<at::Tensor>& sp, int64_t S, int64_t n) {
   if (!sp.has_value()) return {at::Tensor(), at::Tensor()};
+  const c10::cuda::CUDAGuard guard((*sp).device());   // the kernels below go to the current device's stream
   const auto species = sp->to(at::kLong).contiguous();
   const auto opt = species.options().dtype(at::kInt);
   auto perm = at::empty({n}, opt);
@@ -443,15 +453,93 @@ at::Tensor species_linear_autograd(const at::Tensor& x, const std::optional<at::
   return SpeciesLinearFn::apply(x, species, W, paths, dim_out, bias, out_ir_mul);
 }
 
+// linear_ir_mul: an e3nn Linear with both sides in cuEq's ir_mul layout, x[n, io + m*U + u] -> out[n, oo + m*V + w]. Every
+// (path, m) is then a plain GEMM between two column blocks of the storage as it is: cuBLAS sgemm on strided views, no
+// layout copy and no tile kernel (mul_ir interleaves m with u, which BLAS cannot stride over). weight (1, P) and paths as
+// species_linear with species None (ops.linear_weight). H200, 5632 nodes, EquFlash 1024x0e+1536x1o+1792x2e+1536x3o ->
+// 1024x0e+256x1o+256x2e+256x3o: 38 TFLOP/s against the tile kernel's 26 on mul_ir. First-order grad in x. CUDA-graph
+// capturable after one warm-up call (cuBLAS initializes lazily).
+at::Tensor lin_irm(const at::Tensor& in, const at::Tensor& W, const std::vector<int64_t>& paths, int64_t dim_out,
+                   bool transpose) {
+  TORCH_CHECK(in.is_cuda() && in.scalar_type() == at::kFloat && in.dim() == 2, "linear_ir_mul: x (N, D) float32 CUDA");
+  TORCH_CHECK(W.is_cuda() && W.scalar_type() == at::kFloat && W.dim() == 2 && W.size(0) == 1 && W.is_contiguous(),
+              "linear_ir_mul: weight (1, P) float32 contiguous CUDA");
+  TORCH_CHECK(paths.size() % 5 == 0, "linear_ir_mul: paths [io, oo, U, V, d] per path");
+  const int64_t n = in.size(0);
+  int64_t wn = 0, covered = 0;
+  for (size_t i = 0; i < paths.size(); i += 5) {
+    const int64_t io = paths[i], oo = paths[i + 1], U = paths[i + 2], V = paths[i + 3], d = paths[i + 4];
+    TORCH_CHECK(io >= 0 && oo >= 0 && io + U * d <= (transpose ? dim_out : in.size(1))
+                && oo + V * d <= (transpose ? in.size(1) : dim_out), "linear_ir_mul: path ", i / 5, " out of range");
+    wn += U * V;
+    covered += (transpose ? U : V) * d;
+  }
+  TORCH_CHECK(wn == W.size(1), "linear_ir_mul: weight has ", W.size(1), " columns, paths need ", wn);
+  auto out = covered == dim_out ? at::empty({n, dim_out}, in.options()) : at::zeros({n, dim_out}, in.options());
+  if (n == 0) return out;
+  const at::NoTF32Guard fp32;   // full fp32 whatever torch.backends.cuda.matmul.allow_tf32 says
+  const auto w = W.view({-1});
+  int64_t wo = 0;
+  for (size_t i = 0; i < paths.size(); i += 5) {
+    const int64_t io = paths[i], oo = paths[i + 1], U = paths[i + 2], V = paths[i + 3], d = paths[i + 4];
+    const auto M = w.narrow(0, wo, U * V).view({U, V});   // [u, w]
+    wo += U * V;
+    for (int64_t m = 0; m < d; m++) {
+      if (transpose) {
+        auto dst = out.narrow(1, io + m * U, U);
+        at::mm_out(dst, in.narrow(1, oo + m * V, V), M.t());
+      } else {
+        auto dst = out.narrow(1, oo + m * V, V);
+        at::mm_out(dst, in.narrow(1, io + m * U, U), M);
+      }
+    }
+  }
+  return out;
+}
+
+at::Tensor linear_ir_mul_cuda(const at::Tensor& x, const at::Tensor& W, std::vector<int64_t> paths, int64_t dim_out) {
+  return lin_irm(x.contiguous(), W, paths, dim_out, false);
+}
+
+struct LinearIrMulFn : public torch::autograd::Function<LinearIrMulFn> {
+  static at::Tensor forward(torch::autograd::AutogradContext* ctx, const at::Tensor& x, const at::Tensor& W,
+                            std::vector<int64_t> paths, int64_t dim_out) {
+    at::AutoDispatchBelowADInplaceOrView guard;
+    ctx->save_for_backward({W});
+    ctx->saved_data["paths"] = paths;
+    ctx->saved_data["din"] = x.size(1);
+    ctx->saved_data["wgrad"] = W.requires_grad();
+    return lin_irm(x.contiguous(), W, paths, dim_out, false);
+  }
+  static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
+                                                 torch::autograd::variable_list gouts) {
+    TORCH_CHECK(!ctx->saved_data["wgrad"].toBool(), "linear_ir_mul: no gradient for the weight (inference only)");
+    at::Tensor gx;
+    if (gouts[0].defined() && ctx->needs_input_grad(0)) {
+      at::NoGradGuard no_grad;   // no double backward
+      gx = lin_irm(gouts[0].contiguous(), ctx->get_saved_variables()[0], ctx->saved_data["paths"].toIntVector(),
+                   ctx->saved_data["din"].toInt(), true);
+    }
+    return {gx, at::Tensor(), at::Tensor(), at::Tensor()};
+  }
+};
+
+at::Tensor linear_ir_mul_autograd(const at::Tensor& x, const at::Tensor& W, std::vector<int64_t> paths, int64_t dim_out) {
+  return LinearIrMulFn::apply(x, W, paths, dim_out);
+}
+
 }  // namespace
 }  // namespace jet_mlip
 
 TORCH_LIBRARY_FRAGMENT(jet_mlip, m) {
   m.def("species_linear(Tensor x, Tensor? species, Tensor weight, int[] paths, int dim_out, Tensor? bias=None, bool out_ir_mul=False) -> Tensor");
+  m.def("linear_ir_mul(Tensor x, Tensor weight, int[] paths, int dim_out) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(jet_mlip, CUDA, m) {
   m.impl("species_linear", &jet_mlip::species_linear_cuda);
+  m.impl("linear_ir_mul", &jet_mlip::linear_ir_mul_cuda);
 }
 TORCH_LIBRARY_IMPL(jet_mlip, Autograd, m) {
   m.impl("species_linear", &jet_mlip::species_linear_autograd);
+  m.impl("linear_ir_mul", &jet_mlip::linear_ir_mul_autograd);
 }

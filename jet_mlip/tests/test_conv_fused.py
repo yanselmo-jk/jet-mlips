@@ -238,10 +238,13 @@ def test_backward_without_grad_x():
 
     gout = torch.randn(n_out, cfg.out_dim, generator=torch.Generator().manual_seed(9)).to(DEV)
     g_ref = torch.autograd.grad(f(x.clone().requires_grad_(True)), vec, gout)[0]
-    assert torch.equal(torch.autograd.grad(f(x), vec, gout)[0], g_ref)
+    # not bit-equal: a shape with several backward path groups adds into grad_vec with atomics, whose order (the last
+    # bits) changes from run to run, also between two identical calls
+    tol = dict(atol=1e-6 * g_ref.abs().max().item(), rtol=1e-5)
+    assert torch.allclose(torch.autograd.grad(f(x), vec, gout)[0], g_ref, **tol)
     gx, gv = torch.ops.jet_mlip.conv_fused_bwd(gout, x, vec, src.int(), rowptr, perm, w1, w2, w3, coeffs, denom,
                                               R_ON, R_CUT, CST, ops.config_id(cfg), None, False)
-    assert gx is None and torch.equal(gv, g_ref)
+    assert gx is None and torch.allclose(gv, g_ref, **tol)
 
 
 # ---- 3-D (per element pair) tables: MACE MPA-0 / OMAT-0, NequIP per-edge-type tables ---------------

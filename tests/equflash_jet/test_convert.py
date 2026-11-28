@@ -129,3 +129,23 @@ def test_configs_are_compiled(models):
         assert cfg.irreps_sh == kw['irreps_in2']
         assert cfg.key in compiled, f'{tag}: jet_mlip.configs.equflash_configs() misses {cfg.key}'
         assert compiled[cfg.key].instructions == cfg.instructions, f'{tag}: compiled fiber order differs'
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or 'v1' not in CKPTS, reason='needs CUDA and EQUFLASH_CKPT')
+def test_glue_layouts_agree(monkeypatch):
+    """v1 on fp32 CUDA: the blocks' Linears and Gate as jet ops, with the features in ir_mul (the default: cuBLAS
+    Linears) or in e3nn's mul_ir, give the e3nn glue's energy and forces."""
+    from GGNN.common.calculator import UCalculator
+    out = {}
+    for glue in ('0', 'mul_ir', 'ir_mul'):
+        monkeypatch.setenv('JET_EQUFLASH_GLUE', glue)
+        calc = UCalculator(checkpoint_path=CKPTS['v1'], cpu=False)   # a fresh load each: the model cannot be copied
+        m = convert.patch_model(getattr(calc.trainer.model, 'module', calc.trainer.model).eval())
+        jet = [x.ir_mul for x in m.modules() if isinstance(x, (convert.JetLinear, convert.JetGate))]
+        assert (len(jet) > 0) == (glue != '0') and (bool(jet) and all(jet)) == (glue == 'ir_mul')
+        d = graph(structures()['LiCHO box'], m.edge_embedding.cutoff_function.r_cut, torch.float32)
+        e, f = forward(m, {k: v.detach().cuda() for k, v in d.items()})
+        out[glue] = e.item(), f.detach().cpu()
+    for glue in ('mul_ir', 'ir_mul'):
+        assert abs(out[glue][0] - out['0'][0]) < 1e-5 * abs(out['0'][0]), (glue, out[glue][0], out['0'][0])
+        assert (out[glue][1] - out['0'][1]).abs().max() < 2e-5, glue

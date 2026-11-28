@@ -48,7 +48,7 @@ print(f'jet_mlip build: archs {archs or ["(local GPU)"]}, SMEM_MAX {smem_max()}'
 
 setup(
     name='jet-mlip',
-    version='0.5.0',
+    version='0.5.1',
     license='CC-BY-NC-SA-4.0 (LAMMPS-derived files: GPL-2.0)',
     packages=['jet_mlip'],
     package_dir={'jet_mlip': '.'},

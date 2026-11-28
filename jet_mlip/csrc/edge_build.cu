@@ -9,6 +9,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 
 namespace jet_mlip {
@@ -81,6 +82,7 @@ void edge_build(const at::Tensor& x, const at::Tensor& cand_ptr, const at::Tenso
     return;
   }
   const dim3 block(256), grid((nlocal * 32 + 255) / 256);
+  const c10::cuda::CUDAGuard guard(nbr.device());   // the kernels below go to the current device's stream
   auto stream = at::cuda::getCurrentCUDAStream();
   edge_build_kernel<false><<<grid, block, 0, stream>>>(
       nlocal, x.data_ptr<double>(), cand_ptr.data_ptr<int>(), cand_j.data_ptr<int>(), center.data_ptr<int>(),

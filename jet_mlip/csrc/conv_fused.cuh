@@ -1168,15 +1168,19 @@ __global__ void __launch_bounds__(THREADS) bwd_mlp_kernel(Args<T> a) {
 
 
 // Table backward epilogue: grad_vec of every CSR edge from its summed grad_sh / grad_r row (one thread per edge).
+// Rows past the CSR (masked padding, a capacity tail, the edges of pruned rows) get zero: perm is a permutation of
+// all E rows, so a.gvec needs no fill.
 template <class T, int SHD>
 __global__ void tbwd_vec_kernel(Args<T> a) {
   const int n_edge = a.rowptr[a.n_out];
-  for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n_edge; k += gridDim.x * blockDim.x) {
+  for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < a.n_edge; k += gridDim.x * blockDim.x) {
     const int e = a.perm ? a.perm[k] : k;
-    const T vx = a.vec[3 * e], vy = a.vec[3 * e + 1], vz = a.vec[3 * e + 2];
-    const T* g = a.gshb + (size_t)e * (SHD + 1);
-    T o[3];
-    vec_grad<T, SHD>(vx, vy, vz, sqrt(vx * vx + vy * vy + vz * vz), g, g[SHD], o);
+    T o[3] = {T(0), T(0), T(0)};
+    if (k < n_edge) {
+      const T vx = a.vec[3 * e], vy = a.vec[3 * e + 1], vz = a.vec[3 * e + 2];
+      const T* g = a.gshb + (size_t)e * (SHD + 1);
+      vec_grad<T, SHD>(vx, vy, vz, sqrt(vx * vx + vy * vy + vz * vz), g, g[SHD], o);
+    }
     a.gvec[3 * e] = o[0]; a.gvec[3 * e + 1] = o[1]; a.gvec[3 * e + 2] = o[2];   // table mode: the only writer
   }
 }

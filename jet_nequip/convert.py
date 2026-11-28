@@ -11,7 +11,7 @@ import sys
 import types
 
 import torch
-from jet_mlip import neighbors, ops, reference, tables
+from jet_mlip import ase_graph, neighbors, ops, reference, tables
 from nequip.data import AtomicDataDict
 from nequip.nn.utils import with_edge_vectors_
 
@@ -448,11 +448,52 @@ def _neighborlist(data, r_max):
     return data
 
 
+def _ase_graph(calc):
+    """The calculator's graph step (jet_mlip.ase_graph), made at its first call: the energy model inside the model's
+    ForceStressOutput (what the ML-IAP wrapper gets from disable_ForceStressOutput) on the graph's static buffers, as
+    jet_nequip.mliap runs it under LAMMPS (the pair list's CSR, every block as four jet ops). False: a model without
+    that wrapper, which stays eager."""
+    if getattr(calc, 'jet_graph', None) is None:
+        fso = getattr(calc.model, 'model', None)
+        if type(fso).__name__ != 'ForceStressOutput' or not fso.do_derivatives:
+            calc.jet_graph = False
+            return False
+
+        def step(energy):
+            def forward(g, vec):
+                global CSR, TYPES
+                CSR, TYPES = (g.s_rowptr, g.s_perm), g.s_types
+                try:
+                    return energy({AtomicDataDict.EDGE_VECTORS_KEY: vec, AtomicDataDict.EDGE_INDEX_KEY: g.s_ei,
+                                   AtomicDataDict.ATOM_TYPE_KEY: g.s_types,
+                                   AtomicDataDict.LMP_MLIAP_DATA_KEY: g.lmp_stand_in,
+                                   AtomicDataDict.NUM_LOCAL_GHOST_NODES_KEY: g.s_nlg})[AtomicDataDict.PER_ATOM_ENERGY_KEY]
+                finally:
+                    CSR = TYPES = None
+            return forward
+
+        def alloc(g):
+            if not getattr(calc.model, 'jet_local', False):   # once per model, at the first capture (its probes
+                # would add 30 ms to the eager first call). An eager call (TYPES unset) still takes upstream's forward
+                patch_block_forward(calc.model)
+                calc.model.jet_local = True
+            g.s_nlg = torch.tensor(g.nlg, dtype=torch.int64, device=g.device)
+        # compiled: inductor fuses the glue between the blocks (jet_nequip.mliap). H200, NequIP-OAM-M, 5632 atoms:
+        # 10.57 -> 10.20 ms per call for 6.8 s of compile (cold inductor cache; 2.3 s warm), after the adapter's 600 s
+        calc.jet_graph = ase_graph.AseGraph(step(fso.func), calc.device, _r_max(calc.model), vec_dtype=torch.float64,
+                                            alloc=alloc, compile=lambda: step(torch.compile(fso.func, dynamic=False)))
+    return calc.jet_graph
+
+
 def _hook_ase():
     """ASE: the NequIPCalculator of a patched model builds its neighbour list on the GPU. Registers `_neighborlist`
     with nequip and wraps NequIPCalculator.atoms_to_data once: a calculator on a CPU-only backend whose model is
     patched switches to 'jet' and moves its transforms to the model device (nequip's own handling of a CUDA
-    backend). No-op when nequip's ASE integration is not loaded (LAMMPS) or jet_mlip.neighbors is not available."""
+    backend). NequIPCalculator.call_model is wrapped too: from the second call in a row with the same atom count on, a
+    patched model on CUDA is replayed from a CUDA graph (_ase_graph; JET_ASE_GRAPH=0: off) on the eager path's fp64
+    edge vectors, and hands calculate() the energies, forces and stress in the eager model's shapes and dtype
+    (a subclass that reads other outputs in save_extra_outputs stays eager). No-op when nequip's ASE integration is
+    not loaded (LAMMPS) or jet_mlip.neighbors is not available."""
     ase = sys.modules.get('nequip.integrations.ase')
     if ase is None or getattr(ase.NequIPCalculator.atoms_to_data, 'jet', False):
         return
@@ -472,6 +513,23 @@ def _hook_ase():
         return orig(self, atoms)
     atoms_to_data.jet = True
     ase.NequIPCalculator.atoms_to_data = atoms_to_data
+    call, K = ase.NequIPCalculator.call_model, AtomicDataDict
+
+    def call_model(self, data):
+        ei = data.get(K.EDGE_INDEX_KEY)
+        g = (self.device.type == 'cuda' and getattr(self.model, 'jet_patched', False) and ei is not None
+             and K.CELL_KEY in data and type(self).save_extra_outputs is ase.NequIPCalculator.save_extra_outputs
+             and _ase_graph(self))
+        if not (g and g.due(data[K.ATOM_TYPE_KEY].numel(), ei.shape[1])):
+            return call(self, data)
+        pos, cell = data[K.POSITIONS_KEY], data[K.CELL_KEY].view(3, 3)
+        # with_edge_vectors_'s fp64 operations, in its order
+        rij = pos[ei[1]] - pos[ei[0]] + torch.sum(data[K.EDGE_CELL_SHIFT_KEY].view(-1, 3, 1) * cell, 1)
+        e, f, w = g.compute(data[K.ATOM_TYPE_KEY].view(-1), ei[0], ei[1], rij, pos)
+        vol = torch.linalg.det(cell).abs()   # no volume: NaN, as ForceStressOutput
+        return {K.TOTAL_ENERGY_KEY: e.sum().view(1, 1), K.PER_ATOM_ENERGY_KEY: e.unsqueeze(-1), K.FORCE_KEY: f,
+                K.STRESS_KEY: torch.where(vol > 0, (w + w.t()) / (2 * vol), float('nan'))}
+    ase.NequIPCalculator.call_model = call_model
 
 
 def patch_model(model, radial_table: int = DEFAULT_N):

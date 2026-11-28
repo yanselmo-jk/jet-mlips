@@ -27,13 +27,15 @@
    kernel from per-atom reference vectors.
 
    The atoms are packed in cell order (then by type), so the 32 atoms of a
-   block are neighbours in space and a tile is skipped as a whole when the
-   two blocks' fractional-coordinate bounds are farther apart than the
-   cut-off (blocks_near): the tile scan then only touches the blocks inside
-   the cut-off instead of all N^2/2 of them. A small box (fewer than 3 cells
-   of half the cut-off per periodic direction) has no prefilter (every block
-   pair has images inside the cut-off) but keeps the cell order, which keeps
-   the image loops of a warp coherent.
+   block are neighbours in space. In a large box only the tiles whose two
+   blocks can hold a pair inside the cut-off (blocks_near on their
+   fractional-coordinate bounds) are listed, from the cell grid, and the
+   pair kernels run one warp per listed tile (k_d3_tiles): O(N) tiles
+   instead of N^2/2. Inside a listed tile the steps whose i atom is out of
+   reach of block J are skipped (tile_imask). A small box (fewer than 3 cells
+   of half the cut-off per periodic direction) has no lists (every block
+   pair has images inside the cut-off, one warp per block pair) but keeps
+   the cell order, which keeps the image loops of a warp coherent.
 
    On more than one MPI rank (see launch_multi_async) every rank holds all N
    atoms: one MPI_Allgatherv of the local (tag, x, type) per step, packed
@@ -59,6 +61,7 @@
 #include "pair_jet_d3.h"
 
 #include <chrono>
+#include <numeric>
 #include <cstdlib>
 #include <cstring>
 
@@ -125,6 +128,7 @@ PairJetD3::~PairJetD3() {
         cudaFree(d_cn); cudaFree(d_w); cudaFree(d_vu);
         cudaFree(d_out); cudaFreeHost(h_out);
         if (multi) { cudaFree(d_iloc); cudaFree(d_iblocks); cudaFreeHost(h_cn); }
+        cudaFree(d_bstart); cudaFree(d_off); cudaFree(d_tl[0]); cudaFree(d_tl[1]);
     }
 }
 
@@ -144,6 +148,10 @@ void PairJetD3::allocate() {
     // the fp32 rate or less (consumer GPUs). The user chooses: no automatic choice by architecture.
     const char *e = std::getenv("JET_D3_FP64");
     fp64_sums = !(e && std::strcmp(e, "0") == 0);
+    // JET_D3_SCAN=1 (debugging): every box takes the path of the small boxes, one warp per block pair and no tile
+    // lists: the O(N^2) reference of the lists (tests/test_jet_d3_ase.py).
+    const char *sc = std::getenv("JET_D3_SCAN");
+    scan_all = sc && std::strcmp(sc, "0") != 0;
 
     int np1 = atom->ntypes + 1;
     memory->create(setflag, np1, np1, "pair:setflag");
@@ -781,7 +789,8 @@ __device__ __forceinline__ void warp_sum2(float &hi, float &lo) {
 ------------------------------------------------------------------------- */
 
 // Tile (I, J) of this warp; false when the warp has none (I > J or past the last tile).
-// One rank (iblocks == nullptr): the tile is (I = ib, J = blockIdx.x) with J >= I, as before.
+// LIST (large boxes): warp w of the launch takes a tile of the list tl[ntl] (see k_d3_tiles). Otherwise every block pair:
+// One rank (iblocks == nullptr): the tile is (I = ib, J = blockIdx.x) with J >= I.
 // Several ranks: iblocks is the compacted list of the i-role blocks (blocks that hold local
 // atoms) and blockIdx.x is a partner column, so the grid is (partner, 4 i-blocks per block).
 // Column p of i-role block K is the p-th partner block below K with K + J odd, then the p-th
@@ -789,7 +798,17 @@ __device__ __forceinline__ void warp_sum2(float &hi, float &lo) {
 // i-role of exactly one of its two owners (the pair's lower block when the sum is even, its
 // higher block when odd), so every pair is still computed exactly once in the whole job but
 // the cross-rank pairs split evenly over the ranks.
-__device__ __forceinline__ bool tile_of_warp(int ntiles, int niblocks, const int *iblocks, int &I, int &J) {
+template <bool LIST>
+__device__ __forceinline__ bool tile_of_warp(int ntiles, int niblocks, const int *iblocks, const int *tl, long long ntl, int tls, int &I, int &J) {
+    if (LIST) {
+        const long long w = static_cast<long long>(blockIdx.x) * (D3_BLOCK / 32) + (threadIdx.x >> 5);
+        if (w >= ntl) { return false; }
+        // tls > 1 (coprime to ntl): warp w takes tile (w tls) mod ntl, so the warps that run together work on different
+        // blocks; in list order they would all flush their fp64 sums into the atoms of one block at the same time
+        const long long t = tls > 1 ? static_cast<long long>((static_cast<unsigned long long>(w) * tls) % static_cast<unsigned long long>(ntl)) : w;
+        I = tl[2 * t]; J = tl[2 * t + 1];
+        return true;
+    }
     const int ib = blockIdx.y * (D3_BLOCK / 32) + (threadIdx.x >> 5);
     if (ib >= niblocks) { return false; }
     if (!iblocks) {
@@ -811,12 +830,12 @@ __device__ __forceinline__ bool tile_of_warp(int ntiles, int niblocks, const int
 // Prefilter of tile (I, J), b[k] = the 8 floats of block k (see load_atom_info):
 // fractional centre 0..2, cartesian radius 3, fractional half extents 4..6.
 // False when no pair of atoms of the two 32-atom blocks can have an image
-// inside the cut-off: the blocks are spheres (orthogonal cells) or boxes
-// (triclinic) around their centres, so a centre distance beyond rc + both
-// radii, or a per-direction distance beyond rch + both half extents (the same
-// per-direction bound for_images uses), leaves every image outside. Both tests
-// are conservative: a pair inside the cut-off always passes, so only tiles the
-// pair loop would drop are skipped.
+// inside the cut-off. Orthogonal cells: the blocks are spheres and boxes around
+// their centres, so a centre distance beyond rc + both radii, or a gap between
+// the two boxes beyond rc, leaves every image outside. Triclinic cells: a
+// per-direction distance beyond rch + both half extents (the same per-direction
+// bound for_images uses). The tests are conservative: a pair inside the cut-off
+// always passes, so only tiles that would add nothing are left out.
 __device__ __forceinline__ bool blocks_near(const float *bi, const float *bj, const D3Cell &c,
                                             float rc, const float *rch) {
     float d[3];
@@ -826,16 +845,54 @@ __device__ __forceinline__ bool blocks_near(const float *bi, const float *bj, co
         if (c.per[k]) { d[k] -= rint_f(d[k]); }   // nearest periodic image
     }
     if (c.ortho) {
-        const float lim = rc + bi[3] + bj[3];
-        const float d2 = fmaf(d[0] * c.h[0], d[0] * c.h[0],
-                              fmaf(d[1] * c.h[1], d[1] * c.h[1], d[2] * c.h[2] * d[2] * c.h[2]));
-        return d2 <= lim * lim;
+        const float lim = rc + bi[3] + bj[3], lim0 = rc + 1e-3f;
+        float d2 = 0.0f, q2 = 0.0f;   // centre distance (spheres) and gap between the two boxes
+        #pragma unroll
+        for (int k = 0; k < 3; k++) {
+            const float dk = d[k] * c.h[k], q = fmaxf(fabsf(d[k]) - bi[4 + k] - bj[4 + k], 0.0f) * c.h[k];
+            d2 = fmaf(dk, dk, d2); q2 = fmaf(q, q, q2);
+        }
+        return d2 <= lim * lim && q2 <= lim0 * lim0;
     }
     #pragma unroll
     for (int k = 0; k < 3; k++) {
         if (fabsf(d[k]) - bi[4 + k] - bj[4 + k] > rch[k]) { return false; }
     }
     return true;
+}
+
+// blocks_near for one atom (fractional s) and block bj: false when no image of the atom is within the cut-off of the block's
+// sphere / box, so none of its pairs with the block's atoms is inside the cut-off
+__device__ __forceinline__ bool atom_near(const float *s, const float *bj, const D3Cell &c, float rc, const float *rch) {
+    float d[3];
+    #pragma unroll
+    for (int k = 0; k < 3; k++) {
+        d[k] = bj[k] - s[k];
+        if (c.per[k]) { d[k] -= rint_f(d[k]); }
+    }
+    if (c.ortho) {
+        const float lim = rc + bj[3], lim0 = rc + 1e-3f;
+        float d2 = 0.0f, q2 = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 3; k++) {
+            const float dk = d[k] * c.h[k], q = fmaxf(fabsf(d[k]) - bj[4 + k], 0.0f) * c.h[k];
+            d2 = fmaf(dk, dk, d2); q2 = fmaf(q, q, q2);
+        }
+        return d2 <= lim * lim && q2 <= lim0 * lim0;
+    }
+    #pragma unroll
+    for (int k = 0; k < 3; k++) {
+        if (fabsf(d[k]) - bj[4 + k] > rch[k]) { return false; }
+    }
+    return true;
+}
+
+// Steps of tile (I, J) whose i atom is within reach of block J (bit s: atom 32 I + s); the other steps add nothing
+__device__ __forceinline__ unsigned tile_imask(int n, int I, int J, const float *frac, const float *bounds, const D3Cell &c,
+                                               float rc, const float *rch) {
+    if (I == J) { return D3_FULL; }
+    const int il = min(32 * I + static_cast<int>(threadIdx.x & 31), n - 1);
+    return __ballot_sync(D3_FULL, atom_near(frac + 3 * il, bounds + 8 * J, c, rc, rch));
 }
 
 // Runs body(i, self, jside, ci, cj, ev) for the 32 steps of tile (I, J): at step s the
@@ -858,7 +915,7 @@ __device__ __forceinline__ bool blocks_near(const float *bi, const float *bj, co
 // computed once in the whole job, by the rank of its lower-block atom; the j side of an
 // off-diagonal tile still counts (the owner of j sums it after the ranks are allreduced).
 template <int NI, int NEV, int U, bool F64, class Body>
-__device__ __forceinline__ void tile_pairs(int n, int I, int J, const unsigned char *ilocal,
+__device__ __forceinline__ void tile_pairs(int n, int I, int J, const unsigned char *ilocal, unsigned imask,
                                            double (&Ai)[NI], double (&Aj)[NI], double &Ev, Body &&body) {
     const int lane = threadIdx.x & 31;
     const bool diag = (I == J);
@@ -872,6 +929,7 @@ __device__ __forceinline__ void tile_pairs(int n, int I, int J, const unsigned c
     // U steps at a time: their i-side reductions overlap (the per-step dependency
     // chain, not the issue rate, limits the cheap kernels)
     for (int s = 0; s < 32; s += U) {
+        if ((imask >> s) & ((1u << U) - 1u)) {   // warp-uniform: steps whose i atoms are out of reach of block J add nothing
         float ci[U][NI], cj[U][NI];
         #pragma unroll
         for (int u = 0; u < U; u++) {
@@ -879,7 +937,7 @@ __device__ __forceinline__ void tile_pairs(int n, int I, int J, const unsigned c
             for (int k = 0; k < NI; k++) { ci[u][k] = cj[u][k] = 0.0f; }
             const int i = 32 * I + s + u;
             const bool self = diag && s + u == lane;
-            if (i < n && j < n && (!ilocal || ilocal[i]) && (!diag || lane >= s + u)) { body(i, self, !self, ci[u], cj[u], self ? fs : fe); }
+            if (i < n && j < n && (!ilocal || ilocal[i]) && (!diag || lane >= s + u) && ((imask >> (s + u)) & 1u)) { body(i, self, !self, ci[u], cj[u], self ? fs : fe); }
             #pragma unroll
             for (int k = 0; k < NI; k++) {
                 if (F64) { Aj[k] += static_cast<double>(cj[u][k]); } else { two_sum(fj[k], fjl[k], cj[u][k]); }
@@ -899,6 +957,7 @@ __device__ __forceinline__ void tile_pairs(int n, int I, int J, const unsigned c
                     if (lane == s + u) { two_sum(fi[k], fil[k], t); fil[k] = __fadd_rn(fil[k], tl); }
                 }
             }
+        }
         }
         if (((s + U) & (D3_CHUNK - 1)) == 0) {
             #pragma unroll
@@ -929,18 +988,18 @@ __device__ __forceinline__ void add_ev(double *acc, int I, int J, int first, int
    sides, see tile_of_warp; the partial arrays are summed by the caller)
 ------------------------------------------------------------------------- */
 
-template <bool F64>
+template <bool F64, bool LIST>
 __global__ void k_d3_cn(
     int n, int niblocks, const int *__restrict__ iblocks, const unsigned char *__restrict__ ilocal,
     D3Cell cell, D3Tables tab, float cnthr, float K1,
     const float *__restrict__ x, const float *__restrict__ frac, const int *__restrict__ type,
-    const float *__restrict__ bounds, double *__restrict__ cn
+    const float *__restrict__ bounds, double *__restrict__ cn,
+    const int *__restrict__ tl, long long ntl
 ) {
     int I, J;
     const int ntiles = (n + 31) / 32;
-    if (!tile_of_warp(ntiles, niblocks, iblocks, I, J)) { return; }
+    if (!tile_of_warp<LIST>(ntiles, niblocks, iblocks, tl, ntl, 1, I, J)) { return; }
     const float rcn = sqrtf(cnthr);
-    if (bounds && !blocks_near(bounds + 8 * I, bounds + 8 * J, cell, rcn, cell.rch_cn)) { return; }
     const int lane = threadIdx.x & 31;
     const int j = 32 * J + lane, jj = min(j, n - 1);
     const float xj[3] = { x[3*jj], x[3*jj+1], x[3*jj+2] };
@@ -948,7 +1007,7 @@ __global__ void k_d3_cn(
     const float rcov_j = tab.rcov[type[jj]];
 
     double Ai[1], Aj[1], Ev;
-    tile_pairs<1, 0, 4, F64>(n, I, J, ilocal, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *) {
+    tile_pairs<1, 0, 4, F64>(n, I, J, ilocal, LIST ? tile_imask(n, I, J, frac, bounds, cell, rcn, cell.rch_cn) : D3_FULL, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *) {
         const float rcov_sum = tab.rcov[type[i]] + rcov_j;
         const float d[3] = { xj[0] - x[3*i], xj[1] - x[3*i+1], xj[2] - x[3*i+2] };
         const float s[3] = { sj[0] - frac[3*i], sj[1] - frac[3*i+1], sj[2] - frac[3*i+2] };
@@ -1040,7 +1099,7 @@ __global__ void k_d3_weights(
 
 // 8 blocks per SM: the extra warps hide the per-image dependency chains better
 // than the registers they cost (64 instead of ~100, a little spilling)
-template <int DAMP, bool F64, bool EV>
+template <int DAMP, bool F64, bool EV, bool LIST>
 __global__ void __launch_bounds__(D3_BLOCK, 8) k_d3_forces(
     int n, int niblocks, const int *__restrict__ iblocks, const unsigned char *__restrict__ ilocal,
     D3Cell cell, D3Tables tab, float rthr,
@@ -1048,13 +1107,13 @@ __global__ void __launch_bounds__(D3_BLOCK, 8) k_d3_forces(
     const float *__restrict__ x, const float *__restrict__ frac, const int *__restrict__ type,
     const float *__restrict__ w, const float *__restrict__ vu,
     const float *__restrict__ bounds,
-    double *__restrict__ dc6i, double *__restrict__ f, double *__restrict__ acc
+    double *__restrict__ dc6i, double *__restrict__ f, double *__restrict__ acc,
+    const int *__restrict__ tl, long long ntl, int tls
 ) {
     int I, J;
     const int ntiles = (n + 31) / 32;
-    if (!tile_of_warp(ntiles, niblocks, iblocks, I, J)) { return; }
+    if (!tile_of_warp<LIST>(ntiles, niblocks, iblocks, tl, ntl, tls, I, J)) { return; }
     const float rvdw = sqrtf(rthr);
-    if (bounds && !blocks_near(bounds + 8 * I, bounds + 8 * J, cell, rvdw, cell.rch_vdw)) { return; }
     const int lane = threadIdx.x & 31;
     const int j = 32 * J + lane, jj = min(j, n - 1);
     const float xj[3] = { x[3*jj], x[3*jj+1], x[3*jj+2] };
@@ -1070,7 +1129,7 @@ __global__ void __launch_bounds__(D3_BLOCK, 8) k_d3_forces(
 
     // ci / cj: f (3), dE/dCN; ev: energy, virial xx yy zz xy xz yz
     double Ai[4], Aj[4], Ev;
-    tile_pairs<4, EV ? 7 : 0, 1, F64>(n, I, J, ilocal, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *ev) {
+    tile_pairs<4, EV ? 7 : 0, 1, F64>(n, I, J, ilocal, LIST ? tile_imask(n, I, J, frac, bounds, cell, rvdw, cell.rch_vdw) : D3_FULL, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *ev) {
         const int ti = type[i];
         const float d[3] = { xj[0] - x[3*i], xj[1] - x[3*i+1], xj[2] - x[3*i+2] };
         const float s[3] = { sj[0] - frac[3*i], sj[1] - frac[3*i+1], sj[2] - frac[3*i+2] };
@@ -1189,19 +1248,19 @@ __global__ void __launch_bounds__(D3_BLOCK, 8) k_d3_forces(
    (EV = false: no virial sums, see k_d3_forces)
 ------------------------------------------------------------------------- */
 
-template <bool F64, bool EV>
+template <bool F64, bool EV, bool LIST>
 __global__ void k_d3_forces_dcn(
     int n, int niblocks, const int *__restrict__ iblocks, const unsigned char *__restrict__ ilocal,
     D3Cell cell, D3Tables tab, float cnthr, float K1,
     const float *__restrict__ x, const float *__restrict__ frac, const int *__restrict__ type,
     const float *__restrict__ bounds,
-    const double *__restrict__ dc6i, double *__restrict__ f, double *__restrict__ acc
+    const double *__restrict__ dc6i, double *__restrict__ f, double *__restrict__ acc,
+    const int *__restrict__ tl, long long ntl
 ) {
     int I, J;
     const int ntiles = (n + 31) / 32;
-    if (!tile_of_warp(ntiles, niblocks, iblocks, I, J)) { return; }
+    if (!tile_of_warp<LIST>(ntiles, niblocks, iblocks, tl, ntl, 1, I, J)) { return; }
     const float rcn = sqrtf(cnthr);
-    if (bounds && !blocks_near(bounds + 8 * I, bounds + 8 * J, cell, rcn, cell.rch_cn)) { return; }
     const int lane = threadIdx.x & 31;
     const int j = 32 * J + lane, jj = min(j, n - 1);
     const float xj[3] = { x[3*jj], x[3*jj+1], x[3*jj+2] };
@@ -1210,7 +1269,7 @@ __global__ void k_d3_forces_dcn(
     const double dc6i_j = dc6i[jj];
 
     double Ai[3], Aj[3], Ev;
-    tile_pairs<3, EV ? 6 : 0, 1, F64>(n, I, J, ilocal, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *ev) {
+    tile_pairs<3, EV ? 6 : 0, 1, F64>(n, I, J, ilocal, LIST ? tile_imask(n, I, J, frac, bounds, cell, rcn, cell.rch_cn) : D3_FULL, Ai, Aj, Ev, [&](int i, bool self, bool jside, float *ci, float *cj, float *ev) {
         const float rcov_sum = tab.rcov[type[i]] + rcov_j;
         const float dc6i_sum = static_cast<float>(dc6i[i] + dc6i_j);
         const float d[3] = { xj[0] - x[3*i], xj[1] - x[3*i+1], xj[2] - x[3*i+2] };
@@ -1255,13 +1314,137 @@ __global__ void k_d3_add_forces(int n, const int *__restrict__ dest, const doubl
     for (int m = 0; m < 3; m++) { f[3 * i + m] += fd[3 * k + m] * conv; }
 }
 
-// The kernel instances of the run-time choices: [fp64 pair sums][energy and virial sums], k_d3_forces [damping] first
-static const decltype(&k_d3_cn<false>) cn_kernels[2] = { k_d3_cn<false>, k_d3_cn<true> };
-static const decltype(&k_d3_forces<0, false, false>) forces_kernels[2][2][2] = {
-    { { k_d3_forces<0, false, false>, k_d3_forces<0, false, true> }, { k_d3_forces<0, true, false>, k_d3_forces<0, true, true> } },
-    { { k_d3_forces<1, false, false>, k_d3_forces<1, false, true> }, { k_d3_forces<1, true, false>, k_d3_forces<1, true, true> } } };
-static const decltype(&k_d3_forces_dcn<false, false>) dcn_kernels[2][2] = {
-    { k_d3_forces_dcn<false, false>, k_d3_forces_dcn<false, true> }, { k_d3_forces_dcn<true, false>, k_d3_forces_dcn<true, true> } };
+/* ----------------------------------------------------------------------
+   Tile lists (large boxes, use_cells): the tiles of the pair kernels.
+
+   One warp per block pair is (N / 32)^2 warps per kernel, nearly all of
+   which only find that their two blocks are far apart: O(N^2). The near
+   tiles are listed instead, from the cell grid of the packing. The blocks
+   are in cell order (x, y, z with z fastest), block J is "at home" in the
+   cell of its first atom, and the blocks at home in a run of consecutive
+   cells are consecutive (bstart). An atom of block J within the cut-off of
+   an atom of block I has, per direction k (fractional, modulo 1),
+   |c_I - s_first(J)| <= rch + ext_I + 2 ext_J, so the candidates of I are
+   the blocks at home in a box of cells around its centre, and blocks_near
+   selects the tiles among them. One thread per i-role block counts them, the
+   host turns the counts into offsets (build_tiles), a second pass writes the
+   (I, J) pairs: O(N) work. Two lists, one per cut-off (vdW, CN).
+------------------------------------------------------------------------- */
+
+// i-role of tile (I, J): one rank J >= I; several ranks see tile_of_warp
+__device__ __forceinline__ bool tile_role(bool multi, int I, int J) {
+    if (!multi) { return J >= I; }
+    return J == I || ((J < I) == (((I + J) & 1) == 1));
+}
+
+template <bool FILL>
+__global__ void k_d3_tiles(
+    int nib, const int *__restrict__ iblocks, D3Cell cell, D3Grid g, float rvdw, float rcn,
+    const float *__restrict__ bounds, const int *__restrict__ bstart,
+    long long *__restrict__ off, int *__restrict__ tl_vdw, int *__restrict__ tl_cn
+) {
+    const int ib = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib >= nib) { return; }
+    const bool multi = iblocks != nullptr;
+    const int I = multi ? iblocks[ib] : ib;
+    const int jmin = multi ? 0 : I;
+    const float *bi = bounds + 8 * I;
+    long long nv = FILL ? off[2 * ib] : 0, nc = FILL ? off[2 * ib + 1] : 0;
+    auto body = [&](int J) {
+        if (!tile_role(multi, I, J)) { return; }
+        const float *bj = bounds + 8 * J;
+        if (blocks_near(bi, bj, cell, rvdw, cell.rch_vdw)) { if (FILL) { tl_vdw[2 * nv] = I; tl_vdw[2 * nv + 1] = J; } nv++; }
+        if (blocks_near(bi, bj, cell, rcn, cell.rch_cn)) { if (FILL) { tl_cn[2 * nc] = I; tl_cn[2 * nc + 1] = J; } nc++; }
+    };
+    int c0[3], ncell[3];
+    for (int k = 0; k < 3; k++) {
+        const float R = fmaxf(cell.rch_vdw[k], cell.rch_cn[k]) + bi[4 + k] + 2.0f * g.extmax[k] + 1e-4f;
+        const float nb = static_cast<float>(g.bins[k]);
+        int lo = static_cast<int>(floorf((bi[k] - R) * nb)), hi = static_cast<int>(floorf((bi[k] + R) * nb));
+        if (cell.per[k]) {
+            ncell[k] = min(hi - lo + 1, g.bins[k]);   // every cell at most once
+            c0[k] = (ncell[k] == g.bins[k]) ? 0 : ((lo % g.bins[k]) + g.bins[k]) % g.bins[k];
+        } else {   // atoms outside the box are in the edge cells (see load_atom_info)
+            lo = min(max(lo, 0), g.bins[k] - 1); hi = min(max(hi, 0), g.bins[k] - 1);
+            c0[k] = lo; ncell[k] = hi - lo + 1;
+        }
+    }
+    for (int a = 0; a < ncell[0]; a++) {
+        int ca = c0[0] + a; if (ca >= g.bins[0]) { ca -= g.bins[0]; }
+        for (int b = 0; b < ncell[1]; b++) {
+            int cb = c0[1] + b; if (cb >= g.bins[1]) { cb -= g.bins[1]; }
+            const int base = (ca * g.bins[1] + cb) * g.bins[2];
+            // z cells c0 .. c0 + ncell - 1, wrapped: one or two runs of consecutive cells = consecutive blocks
+            const int e = c0[2] + ncell[2];
+            const int j1 = bstart[base + min(e, g.bins[2])];
+            for (int J = max(bstart[base + c0[2]], jmin); J < j1; J++) { body(J); }
+            if (e > g.bins[2]) {
+                const int j2 = bstart[base + e - g.bins[2]];
+                for (int J = max(bstart[base], jmin); J < j2; J++) { body(J); }
+            }
+        }
+    }
+    if (!FILL) { off[2 * ib] = nv; off[2 * ib + 1] = nc; }
+}
+
+// Lists the tiles of the nib i-role blocks (d_ib: their list on several ranks, else every block) for the packed atoms
+// whose bounds are on their way to the device. The list sizes are needed for the allocation and the launch grids, so
+// this waits for the stream (input copy and counting pass) once per step.
+void PairJetD3::build_tiles(const D3Cell &cell, int nib, const int *d_ib, const float *bounds) {
+    ntl[0] = ntl[1] = 0;
+    if (nib == 0) { return; }
+    if (h_bstart.size() > bstart_cap) {
+        cudaFree(d_bstart);
+        bstart_cap = h_bstart.size() + h_bstart.size() / 4;
+        CHECK_CUDA(cudaMalloc(&d_bstart, bstart_cap * sizeof(int)));
+    }
+    if (static_cast<size_t>(2 * nib) > off_cap) {
+        cudaFree(d_off);
+        off_cap = 2 * nib + nib / 2;
+        CHECK_CUDA(cudaMalloc(&d_off, off_cap * sizeof(long long)));
+    }
+    h_off.resize(2 * nib);
+    const float rvdw = std::sqrt(rthr), rcn = std::sqrt(cnthr);
+    const int blocks = (nib + 127) / 128;
+    CHECK_CUDA(cudaMemcpyAsync(d_bstart, h_bstart.data(), h_bstart.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
+    k_d3_tiles<false><<<blocks, 128, 0, stream>>>(nib, d_ib, cell, grid, rvdw, rcn, bounds, d_bstart, d_off, nullptr, nullptr);
+    CHECK_CUDA(cudaMemcpyAsync(h_off.data(), d_off, 2 * nib * sizeof(long long), cudaMemcpyDeviceToHost, stream));
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    for (int ib = 0; ib < nib; ib++) {   // counts -> offsets
+        for (int k = 0; k < 2; k++) { const long long c = h_off[2 * ib + k]; h_off[2 * ib + k] = ntl[k]; ntl[k] += c; }
+    }
+    for (int k = 0; k < 2; k++) {
+        if (ntl[k] / (D3_BLOCK / 32) >= 0x7fffffffLL) { error->one(FLERR, "pair_style d3: too many pair tiles for one launch ({})", ntl[k]); }
+        if (ntl[k] > tl_cap[k]) {
+            cudaFree(d_tl[k]);
+            tl_cap[k] = ntl[k] + ntl[k] / 8 + 1024;
+            CHECK_CUDA(cudaMalloc(&d_tl[k], 2 * tl_cap[k] * sizeof(int)));
+        }
+    }
+    CHECK_CUDA(cudaMemcpyAsync(d_off, h_off.data(), 2 * nib * sizeof(long long), cudaMemcpyHostToDevice, stream));
+    k_d3_tiles<true><<<blocks, 128, 0, stream>>>(nib, d_ib, cell, grid, rvdw, rcn, bounds, d_bstart, d_off, d_tl[0], d_tl[1]);
+}
+
+// stride of the forces kernel over its list: a small odd number coprime to the list length (see tile_of_warp)
+static int tile_stride(long long ntl) {
+    if (ntl < 64) { return 1; }
+    long long s = 17;
+    while (std::gcd(s, ntl) != 1) { s += 2; }
+    return static_cast<int>(s);
+}
+
+// launch grid of a pair kernel over a tile list
+static dim3 list_grid(long long ntl) { return dim3(static_cast<unsigned>(std::max(1LL, (ntl + D3_BLOCK / 32 - 1) / (D3_BLOCK / 32)))); }
+
+// The kernel instances of the run-time choices: [fp64 pair sums][energy and virial sums][tile list], k_d3_forces [damping] first
+#define D3_L(k, ...) { k<__VA_ARGS__, false>, k<__VA_ARGS__, true> }
+static const decltype(&k_d3_cn<false, false>) cn_kernels[2][2] = { D3_L(k_d3_cn, false), D3_L(k_d3_cn, true) };
+static const decltype(&k_d3_forces<0, false, false, false>) forces_kernels[2][2][2][2] = {
+    { { D3_L(k_d3_forces, 0, false, false), D3_L(k_d3_forces, 0, false, true) }, { D3_L(k_d3_forces, 0, true, false), D3_L(k_d3_forces, 0, true, true) } },
+    { { D3_L(k_d3_forces, 1, false, false), D3_L(k_d3_forces, 1, false, true) }, { D3_L(k_d3_forces, 1, true, false), D3_L(k_d3_forces, 1, true, true) } } };
+static const decltype(&k_d3_forces_dcn<false, false, false>) dcn_kernels[2][2][2] = {
+    { D3_L(k_d3_forces_dcn, false, false), D3_L(k_d3_forces_dcn, false, true) }, { D3_L(k_d3_forces_dcn, true, false), D3_L(k_d3_forces_dcn, true, true) } };
+#undef D3_L
 
 /* ----------------------------------------------------------------------
    Per-atom buffers (host pinned + device), resized when the atom count changes
@@ -1395,6 +1578,11 @@ void PairJetD3::load_atom_info(const double lat[3][3], const D3Cell &cell) {
     for (long k = 1; k <= ncells * nt; k++) { h_first[k] += h_first[k - 1]; }
     order.resize(n);
     for (int i = 0; i < n; i++) { order[h_first[h_key[i]]++] = i; }
+    if (use_cells) {   // for the tile lists: the first block at home in each cell (h_first[key] is now the end of bucket key)
+        h_bstart.resize(ncells + 1);
+        for (long c = 0; c <= ncells; c++) { h_bstart[c] = ((c == 0 ? 0 : h_first[c * nt - 1]) + 31) / 32; }
+        for (int k = 0; k < 3; k++) { grid.bins[k] = bins[k]; grid.extmax[k] = 0.0f; }
+    }
 
     float *xh = h_in, *fh = h_in + 3 * n;
     int *th = reinterpret_cast<int*>(h_in + 6 * n);
@@ -1455,6 +1643,7 @@ void PairJetD3::load_atom_info(const double lat[3][3], const D3Cell &cell) {
         bh[8 * b] = c[0]; bh[8 * b + 1] = c[1]; bh[8 * b + 2] = c[2];
         bh[8 * b + 3] = std::sqrt(r2) + 1e-3f;
         for (int k = 0; k < 3; k++) { bh[8 * b + 4 + k] = ext[k] + 1e-5f; }
+        for (int k = 0; k < 3; k++) { grid.extmax[k] = std::max(grid.extmax[k], bh[8 * b + 4 + k]); }
     }
 }
 
@@ -1580,7 +1769,7 @@ void PairJetD3::launch(bool ev) {
     // direction holds more than ~3 cells of half the vdW cut-off. Below that
     // a cut-off sphere spans the box (one or two images per direction) and
     // every block pair is computed.
-    use_cells = true;
+    use_cells = !scan_all;
     for (int k = 0; k < 3; k++) {
         if (cell.per[k] && cell.rch_vdw[k] > 2.0 / 3.0) { use_cells = false; }
     }
@@ -1597,19 +1786,25 @@ void PairJetD3::launch(bool ev) {
     CHECK_CUDA(cudaMemcpyAsync(d_in, h_in, (8 * n + 8 * nblocks) * sizeof(float), cudaMemcpyHostToDevice, stream));
     CHECK_CUDA(cudaMemsetAsync(d_out, 0, (3 * n + 8 * D3_SLOTS) * sizeof(double), stream));
     CHECK_CUDA(cudaMemsetAsync(d_cn, 0, 2 * n * sizeof(double), stream));   // cn and dc6i
-    mark(1);
 
+    // Large boxes: the pair kernels run over the tile lists (their build is in the h2d column of the timing).
+    // Small boxes: one warp per block pair, every pair has images inside the cut-off.
     const int ntiles = (n + 31) / 32;
-    const dim3 tiles(ntiles, (ntiles + D3_BLOCK / 32 - 1) / (D3_BLOCK / 32));
-    cn_kernels[fp64_sums]<<<tiles, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, cnthr, K1, x, frac, type, bounds, d_cn);
+    if (use_cells) { build_tiles(cell, nblocks, nullptr, bounds); }
+    mark(1);
+    const dim3 scan(ntiles, (ntiles + D3_BLOCK / 32 - 1) / (D3_BLOCK / 32));
+    const dim3 tiles_v = use_cells ? list_grid(ntl[0]) : scan, tiles_c = use_cells ? list_grid(ntl[1]) : scan;
+    cn_kernels[fp64_sums][use_cells]<<<tiles_c, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, cnthr, K1, x, frac, type, bounds,
+                                                                     d_cn, d_tl[1], ntl[1]);
     mark(2);
     k_d3_weights<<<(n + D3_BLOCK - 1) / D3_BLOCK, D3_BLOCK, 0, stream>>>(n, tab, K3, type, d_cn, d_w, d_vu);
     mark(3);
-    forces_kernels[damping][fp64_sums][ev]<<<tiles, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, rthr, s6, s8, a1, a2,
-                                                                           alp6, alp8, x, frac, type, d_w, d_vu, bounds, d_dc6i, f, acc);
+    forces_kernels[damping][fp64_sums][ev][use_cells]<<<tiles_v, D3_BLOCK, 0, stream>>>(
+        n, ntiles, nullptr, nullptr, cell, tab, rthr, s6, s8, a1, a2, alp6, alp8, x, frac, type, d_w, d_vu, bounds, d_dc6i, f, acc,
+        d_tl[0], ntl[0], tile_stride(ntl[0]));
     mark(4);
-    dcn_kernels[fp64_sums][ev]<<<tiles, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, cnthr, K1, x, frac, type, bounds,
-                                                               d_dc6i, f, acc);
+    dcn_kernels[fp64_sums][ev][use_cells]<<<tiles_c, D3_BLOCK, 0, stream>>>(n, ntiles, nullptr, nullptr, cell, tab, cnthr, K1, x, frac, type, bounds,
+                                                                          d_dc6i, f, acc, d_tl[1], ntl[1]);
     mark(5);
 
     const size_t off = f_dev ? 3 * n : 0;   // jet/d3/kk adds the forces on the device: only the energy / virial slots come back
@@ -1667,7 +1862,7 @@ void PairJetD3::launch_multi_async(bool ev) {
     D3Cell cell;
     double lat[3][3];
     set_cell(cell, lat);
-    use_cells = true;
+    use_cells = !scan_all;
     for (int k = 0; k < 3; k++) {
         if (cell.per[k] && cell.rch_vdw[k] > 2.0 / 3.0) { use_cells = false; }
     }
@@ -1679,9 +1874,9 @@ void PairJetD3::launch_multi_async(bool ev) {
     const int *type = reinterpret_cast<const int*>(d_in + 6 * n);
     const float *bounds = use_cells ? d_in + 7 * n : nullptr;
     double *f = d_out, *acc = d_out + 3 * n;
-    // one warp per (i-role block of this rank, partner block) tile, see tile_of_warp; a rank
-    // whose subdomain holds no atom launches nothing (niblocks == 0)
-    const dim3 tiles(ntiles / 2 + 1, std::max(1, (niblocks + D3_BLOCK / 32 - 1) / (D3_BLOCK / 32)));
+    // small boxes: one warp per (i-role block of this rank, partner block) tile, see tile_of_warp; a rank
+    // whose subdomain holds no atom launches nothing (niblocks == 0). Large boxes: the tile lists of the i-role blocks.
+    const dim3 scan(ntiles / 2 + 1, std::max(1, (niblocks + D3_BLOCK / 32 - 1) / (D3_BLOCK / 32)));
 
     mark(0);
     CHECK_CUDA(cudaMemcpyAsync(d_in, h_in, (8 * n + 8 * nblocks) * sizeof(float), cudaMemcpyHostToDevice, stream));
@@ -1691,10 +1886,13 @@ void PairJetD3::launch_multi_async(bool ev) {
     }
     CHECK_CUDA(cudaMemsetAsync(d_out, 0, (3 * n + 8 * D3_SLOTS) * sizeof(double), stream));
     CHECK_CUDA(cudaMemsetAsync(d_cn, 0, 2 * n * sizeof(double), stream));   // cn and dc6i
+    if (use_cells) { build_tiles(cell, niblocks, d_iblocks, bounds); }
     mark(1);
 
     // CN of this rank's pairs, both sides; the weights and force kernels need the whole array
-    cn_kernels[fp64_sums]<<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, cnthr, K1, x, frac, type, bounds, d_cn);
+    const dim3 tiles_v = use_cells ? list_grid(ntl[0]) : scan, tiles_c = use_cells ? list_grid(ntl[1]) : scan;
+    cn_kernels[fp64_sums][use_cells]<<<tiles_c, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, cnthr, K1, x, frac, type, bounds,
+                                                                     d_cn, d_tl[1], ntl[1]);
     mark(2);
     const auto t1b = clk::now();
     CHECK_CUDA(cudaStreamSynchronize(stream));
@@ -1708,8 +1906,9 @@ void PairJetD3::launch_multi_async(bool ev) {
 
     k_d3_weights<<<(n + D3_BLOCK - 1) / D3_BLOCK, D3_BLOCK, 0, stream>>>(n, tab, K3, type, d_cn, d_w, d_vu);
     mark(3);
-    forces_kernels[damping][fp64_sums][ev]<<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, rthr, s6, s8, a1, a2,
-                                                                           alp6, alp8, x, frac, type, d_w, d_vu, bounds, d_dc6i, f, acc);
+    forces_kernels[damping][fp64_sums][ev][use_cells]<<<tiles_v, D3_BLOCK, 0, stream>>>(
+        n, niblocks, d_iblocks, d_iloc, cell, tab, rthr, s6, s8, a1, a2, alp6, alp8, x, frac, type, d_w, d_vu, bounds, d_dc6i, f, acc,
+        d_tl[0], ntl[0], tile_stride(ntl[0]));
     mark(4);
     const auto t1e = clk::now();
     pending = true;
@@ -1743,7 +1942,7 @@ void PairJetD3::finish_multi(int eflag, int vflag) {
     const int *type = reinterpret_cast<const int*>(d_in + 6 * n);
     const float *bounds = use_cells ? d_in + 7 * n : nullptr;
     double *f = d_out, *acc = d_out + 3 * n;
-    const dim3 tiles(ntiles / 2 + 1, std::max(1, (niblocks + D3_BLOCK / 32 - 1) / (D3_BLOCK / 32)));
+    const dim3 tiles = use_cells ? list_grid(ntl[1]) : dim3(ntiles / 2 + 1, std::max(1, (niblocks + D3_BLOCK / 32 - 1) / (D3_BLOCK / 32)));
 
     CHECK_CUDA(cudaStreamSynchronize(stream));
     const auto t1 = clk::now();
@@ -1756,8 +1955,8 @@ void PairJetD3::finish_multi(int eflag, int vflag) {
     const auto t2 = clk::now();
     mark(6);
 
-    dcn_kernels[fp64_sums][ev_launched]<<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, cnthr, K1, x, frac,
-                                                                        type, bounds, d_dc6i, f, acc);
+    dcn_kernels[fp64_sums][ev_launched][use_cells]<<<tiles, D3_BLOCK, 0, stream>>>(n, niblocks, d_iblocks, d_iloc, cell, tab, cnthr, K1, x, frac,
+                                                                                 type, bounds, d_dc6i, f, acc, d_tl[1], ntl[1]);
     mark(7);
     CHECK_CUDA(cudaMemcpyAsync(h_out, d_out, (3 * n + 8 * D3_SLOTS) * sizeof(double), cudaMemcpyDeviceToHost, stream));
     mark(8);

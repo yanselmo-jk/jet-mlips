@@ -34,7 +34,7 @@ class LAMMPS_MLIAP_MACE_Graph(GraphMLIAP, LAMMPS_MLIAP_MACE):
         self.s_one = torch.ones(key[1], dtype=self.dtype, device=self.device)
 
     def _prep(self):
-        """Per pair list, not per step and layer: the conv CSR and the species order of the skip connections."""
+        """Per pair list, not per step and layer: the conv CSR."""
         super()._prep()
         ops.EDGE_MASK = self.s_mask
         try:
@@ -43,6 +43,10 @@ class LAMMPS_MLIAP_MACE_Graph(GraphMLIAP, LAMMPS_MLIAP_MACE):
             ops.EDGE_MASK = None
         self.s_rowptr.copy_(rowptr)
         self.s_perm.copy_(perm)
+
+    def _types(self):
+        """The species order of the skip connections follows the elements: every step, with them."""
+        super()._types()
         self.s_z.copy_(self.s_types)
         self.s_zperm.copy_(torch.argsort(self.s_z, stable=True))   # int32 keys: half the radix passes of int64
 

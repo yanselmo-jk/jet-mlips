@@ -161,11 +161,14 @@ def _act(a):
     return code, 1.0 if a._is_id else float(a.cst)
 
 
-def gate_tables(gate):
+def gate_tables(gate, ir_mul=None):
     """Per-column tables of the gate op (fwd_i (Dout, 4) int32, fwd_f (Dout, 2), bwd_i (Din, 5) int32, bwd_f (Din, 2))
     for an e3nn nn.Gate: the Extract order (sorted input irreps), the activations with their normalize2mom constants
     and the ElementwiseTensorProduct coefficient (probed) folded in. None if an activation is not silu / tanh /
-    sigmoid / identity. See csrc/gate.cu for the table layout."""
+    sigmoid / identity. See csrc/gate.cu for the table layout.
+    ir_mul = (irreps_in, irreps_out): x and the output in cuEq's ir_mul layout of these irreps (the same columns as the
+    gate's own, block by block) instead of e3nn's mul_ir: every row and column reference moves, nothing is copied.
+    None too if a gated irrep's components are not equally strided on both sides (blocks merged on one side only)."""
     from e3nn.nn._gate import _Sortcut   # gate.sc may already be jet's _Split view: rebuild e3nn's own column order
     try:
         acts_s = [_act(a) for (mul, _), a in zip(gate.act_scalars.irreps_in, gate.act_scalars.acts) for _ in range(mul)]
@@ -200,8 +203,36 @@ def gate_tables(gate):
                 u += 1
     assert len(fi) == gate.irreps_out.dim
     i32 = dict(dtype=torch.int32)
-    return (torch.tensor(fi, **i32), torch.tensor(ff, dtype=torch.float32), torch.tensor(bi, **i32),
-            torch.tensor(bf, dtype=torch.float32))
+    fi, ff, bi, bf = (torch.tensor(fi, **i32), torch.tensor(ff, dtype=torch.float32), torch.tensor(bi, **i32),
+                      torch.tensor(bf, dtype=torch.float32))
+    if ir_mul is None:
+        return fi, ff, bi, bf
+    from . import reference
+
+    def moved(irreps, dim):   # mul_ir column -> its ir_mul column
+        q = reference.to_ir_mul(torch.arange(dim, dtype=torch.float64)[None], [(mul, ir.dim) for mul, ir in irreps])[0].long()
+        assert q.numel() == dim
+        return torch.empty_like(q).scatter_(0, q, torch.arange(dim))
+    pi, po = moved(ir_mul[0], bi.shape[0]), moved(ir_mul[1], fi.shape[0])
+    fi2, bi2 = fi.clone(), bi.clone()
+    fi2[:, 0] = pi[fi[:, 0].long()]
+    fi2[:, 1] = torch.where(fi[:, 1] >= 0, pi[fi[:, 1].clamp(min=0).long()].int(), fi[:, 1])
+    used = bi[:, 0] > 0
+    bi2[:, 1] = torch.where(used, po[bi[:, 1].long()].int(), bi[:, 1])
+    aux = bi[:, 0] >= 2   # gated: its gate column; gate: its first gated component
+    bi2[:, 2] = torch.where(aux, pi[bi[:, 2].long()].int(), bi[:, 2])
+    g = (bi[:, 0] == 3).nonzero().flatten()   # gates: the kernel walks a gate's d gated components with one stride
+    if g.numel():
+        o, src, d = (bi[g, c].long()[:, None] for c in (1, 2, 4))
+        m = torch.arange(int(d.max()))[None]
+        xi, oi = pi[(src + m).clamp(max=pi.numel() - 1)], po[(o + m).clamp(max=po.numel() - 1)]   # (gates, m) columns
+        st = torch.where(d > 1, xi[:, 1:2] - xi[:, :1], torch.ones_like(d)) if m.shape[1] > 1 else torch.ones_like(d)
+        if int(d.max()) > 255 or not bool(((m >= d) | ((xi == xi[:, :1] + m * st) & (oi == oi[:, :1] + m * st))).all()):
+            return None
+        bi2[g, 4] = (d | st << 8).int()[:, 0]
+    out_f, out_b = (torch.empty_like(t) for t in (fi2, bi2))
+    out_f[po], out_b[pi] = fi2, bi2
+    return out_f, torch.empty_like(ff).index_copy_(0, po, ff), out_b, torch.empty_like(bf).index_copy_(0, pi, bf)
 
 
 def gate(x, tables):

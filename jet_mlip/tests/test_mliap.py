@@ -211,3 +211,27 @@ def test_same_build_skips_probe(monkeypatch):
     d.pair_i, d.pair_j, d.rij = d.pair_i.flip(0), d.pair_j.flip(0), d.rij.flip(0)
     check(w, d)
     assert w.n_lists == 3
+
+
+@pytest.mark.parametrize('nbuild', [None, 7])
+def test_same_pairs_other_elements(nbuild, monkeypatch):
+    """fix atom/swap changes types with the same pairs and no neighbour build (same nbuild; None: no nbuild patch):
+    the elements are loaded every step and read in the step's graph, so the list stands and nothing is probed. Another
+    build with the same pairs is another list (ghost owners)."""
+    w = Toy()
+    d = stub(structures()['LiF rocksalt'])
+    if nbuild is not None:
+        d.nbuild = nbuild
+    check(w, d)
+    assert (w.s_types[:d.nlocal] == 0).all()
+    d.elems = torch.ones_like(d.elems)
+    probes = []
+    if nbuild is not None:
+        monkeypatch.setattr(type(d), 'forward_exchange', lambda self, *a: probes.append(1))   # must not be called
+    check(w, d)
+    monkeypatch.undo()
+    assert not probes and (w.s_types[:d.nlocal] == 1).all() and (w.n_lists, w.n_captures) == (1, 1)
+    if nbuild is not None:
+        d.nbuild = nbuild + 1
+        check(w, d)
+        assert w.n_lists == 2

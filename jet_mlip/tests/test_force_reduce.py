@@ -70,3 +70,17 @@ def test_empty_and_graph():
     f, vir = reference(rowptr, nbr, dEdr * 2, vec, nforce, E)
     assert torch.allclose(out.cpu()[:3 * nforce], f, atol=1e-9)
     assert torch.allclose(out.cpu()[3 * nforce + 1:3 * nforce + 7], vir, atol=1e-8)
+
+
+@pytest.mark.parametrize('bad', [-1, 900])
+def test_neighbour_out_of_range(bad):
+    """nbr outside the force rows (contract broken): nothing is written outside out, the edge's centre row is NaN."""
+    rowptr, nbr, dEdr, vec, nforce, E = case()
+    e = int(rowptr[5])   # first edge of row 5 (not empty)
+    assert rowptr[6] > rowptr[5]
+    nbr[e] = bad
+    out = torch.full((3 * nforce + 8 + 3,), 7.0, dtype=torch.float64, device='cuda')   # 3 spare slots after the op's buffer
+    ops.force_reduce(dEdr.cuda(), vec.cuda(), rowptr.cuda(), nbr.cuda(), out[:3 * nforce + 8])
+    out = out.cpu()
+    assert out[15].isnan() and (out[3 * nforce + 8:] == 7.0).all()
+    assert out[:3 * nforce].isnan().sum() == 1

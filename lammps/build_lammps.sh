@@ -91,6 +91,18 @@ fi
 # `custom s6 s8 a1 a2` functional (sevenn's own d3 is not needed).
 # After the D3 block: torch's cuda.cmake (find_package(Torch)) resets CMAKE_CUDA_ARCHITECTURES for later CUDA sources
 if [ "${SEVENN:-0}" = 1 ] && [ ! -f src/pair_e3gnn.cpp ]; then sevenn patch_lammps . --jet; fi
+# patch_lammps runs once per tree (it appends CMake blocks, a second run would append them again), so a tree patched by an
+# older jet-mlips keeps its old pair_e3gnn sources (v0.4.5: no pair_style jet/e3gnn, no jet/d3 prelaunch hook): copy the
+# installed sevenn's again when they differ. The sources only need the libtorch + jet .so blocks that --jet appended.
+if [ "${SEVENN:-0}" = 1 ]; then
+  PE=$(python -c 'import sevenn,os;print(os.path.join(os.path.dirname(sevenn.__file__),"pair_e3gnn"))')
+  for f in "$PE"/pair_e3gnn*; do
+    cmp -s "$f" "src/${f##*/}" && continue
+    grep -q 'jet_mlip/libjet_mlip.so' cmake/CMakeLists.txt || {
+      echo "ERROR: $PWD/src/${f##*/} differs from the installed sevenn's, and this tree was not patched with 'sevenn patch_lammps --jet' (no jet_mlip block in cmake/CMakeLists.txt), so it cannot be updated in place. Start from a fresh LAMMPS folder (remove $PWD or set LAMMPS_DIR to a new one)."; exit 1; }
+    cp "$f" src/ && echo "updated src/${f##*/} from the installed sevenn"
+  done
+fi
 # re-point the jet .so link at this env's build (patch_lammps runs once per tree; the env may use another checkout now)
 [ "${SEVENN:-0}" = 1 ] && ln -sf "$(python -c 'import jet_mlip;print(jet_mlip.library_path())')" cmake/jet_mlip/libjet_mlip.so
 

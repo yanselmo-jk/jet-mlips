@@ -118,6 +118,25 @@ def test_conv_fused_table_vs_exact(n):
     assert rel[0] < 1e-5 and rel[1] < 1e-4 and rel[2] < 1e-4
 
 
+def test_table_grad_vec_past_csr():
+    """Table mode writes grad_vec of every row itself (no zero fill): the rows a masked CSR leaves out get exactly 0."""
+    cfg = NANO_L1
+    (x, vec, src, dst, w1, w2, w3, coeffs), denom, n_out = random_case(cfg, n=40, seed=5, n_out=35, extremes=False)
+    w = [v.float() for v in (w1, w2, w3, coeffs)]
+    table = ops.make_radial_table(cfg, *w, R_ON, R_CUT, CST, NS[0])
+    mask = (torch.arange(dst.numel(), device=DEV) % 3 != 0).int()
+    ops.EDGE_MASK = mask
+    try:
+        csr = ops.build_csr(dst, n_out)
+    finally:
+        ops.EDGE_MASK = None
+    vf = vec.float().requires_grad_(True)
+    o = ops.conv_fused(cfg, x.float(), vf, src, dst, *w, denom, R_ON, R_CUT, CST, n_out=n_out, csr=csr, table=table)
+    torch.full_like(vf, float('nan'))   # freed at once: the backward's uninitialized grad_vec block starts as NaN
+    gv = torch.autograd.grad(o.sum(), vf)[0]
+    assert (gv[mask == 0] == 0).all() and gv[mask == 1].abs().sum() > 0
+
+
 # ---- whole models on the 5568-atom box ---------------------------------------------------
 @pytest.fixture(scope='module')
 def box():

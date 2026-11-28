@@ -153,3 +153,36 @@ def test_linear_matches_e3nn(irreps_in, irreps_out, modal):
     gx, = torch.autograd.grad(out, xc, g.cuda())
     assert (out.detach().cpu().double() - ref.detach()).abs().max() <= 1e-5 * ref.abs().max()
     assert (gx.cpu().double() - gref).abs().max() <= 1e-5 * gref.abs().max()
+
+
+@pytest.mark.parametrize('n', [300, 16385])   # both bucket kernels
+@pytest.mark.parametrize('bad', [-1, 5])
+def test_species_out_of_range(n, bad):
+    """A species outside [0, S) (no host check: the op must stay capturable): output and grad x are all NaN, not rows
+    of uninitialised memory."""
+    tp, x, species = make('8x0e+4x1o', '4x0e+8x1o', 5, n, seed=5)
+    species[n // 2] = bad
+    out, gx = run(tp, x, species, torch.randn(n, tp.irreps_out.dim))
+    assert out.isnan().all() and gx.isnan().all()
+
+@pytest.mark.parametrize('irreps_in,irreps_out', [(OMNI, OMNI), ('37x0e+19x1o+70x2e', '20x0e+33x1o+5x2e+3x3o'),
+                                                  ('64x0e', '40x0e+8x1o')])
+def test_linear_ir_mul_matches_e3nn(irreps_in, irreps_out):
+    """linear_ir_mul: the e3nn Linear with x and the output in ir_mul (reference.to_ir_mul), values and grad x."""
+    if not ops.has_op('linear_ir_mul'):
+        pytest.skip('linear_ir_mul not in this build')
+    from jet_mlip import reference as ref
+    torch.manual_seed(3)
+    lin = o3.Linear(irreps_in, irreps_out).double()
+    torch.nn.init.normal_(lin.weight)
+    W, paths, _ = ops.linear_weight(lin)
+    bi, bo = ([(mul, ir.dim) for mul, ir in irreps] for irreps in (lin.irreps_in, lin.irreps_out))
+    x, g = torch.randn(300, lin.irreps_in.dim).double(), torch.randn(300, lin.irreps_out.dim).double()
+    xd = x.clone().requires_grad_()
+    out_ref = lin(xd)
+    gref, = torch.autograd.grad(out_ref, xd, g)
+    xc = ref.to_ir_mul(x, bi).float().cuda().requires_grad_()
+    out = torch.ops.jet_mlip.linear_ir_mul(xc, W.float().cuda(), paths, lin.irreps_out.dim)
+    gx, = torch.autograd.grad(out, xc, ref.to_ir_mul(g, bo).float().cuda())
+    assert (out.detach().cpu().double() - ref.to_ir_mul(out_ref.detach(), bo)).abs().max() <= 1e-5 * out_ref.abs().max()
+    assert (gx.cpu().double() - ref.to_ir_mul(gref, bi)).abs().max() <= 1e-5 * gref.abs().max()

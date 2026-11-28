@@ -94,7 +94,8 @@ std::tuple<at::Tensor, at::Tensor> conv_fused_bwd_cuda(
     const std::optional<at::Tensor>& tabidx) {
   const c10::cuda::CUDAGuard guard(x.device());
   auto gx = need_grad_x ? at::zeros_like(x) : at::Tensor();   // undefined when the caller does not need it
-  auto gvec = at::zeros_like(vec);
+  // table mode: tbwd_vec_kernel writes every row (zero past the CSR), so no fill
+  auto gvec = table.has_value() && gout.numel() > 0 ? at::empty_like(vec) : at::zeros_like(vec);
   auto g = gout.contiguous();
   const auto& tab = table;
   // split backward (exact MLP only; the table has no MLP): grad_H2 per edge, E x NH x sizeof(T) transient bytes,
@@ -115,9 +116,12 @@ std::tuple<at::Tensor, at::Tensor> conv_fused_bwd_cuda(
       if (split_bwd && !tab.has_value() && Groups<scalar_t, CFG, EPL_OF<scalar_t, CFG, true>, true>::NG > 1) \
         gh2 = at::zeros({vec.size(0), NH}, x.options());                                         \
       a.gh2 = gh2.defined() ? gh2.data_ptr<scalar_t>() : nullptr;                                 \
-      if (tab.has_value()) gshb = at::zeros({vec.size(0), CFG::SH_DIM + 1}, x.options());          \
+      if (tab.has_value()) gshb = at::empty({vec.size(0), CFG::SH_DIM + 1}, x.options());          \
       a.gshb = gshb.defined() ? gshb.data_ptr<scalar_t>() : nullptr;                              \
-      if (!first_layer(ID, a, true)) launch<scalar_t, CFG, EPL_OF<scalar_t, CFG, true>, true>(a); \
+      if (!first_layer(ID, a, true)) {   /* the first-layer kernel writes its rows, the generic one adds */ \
+        if (gshb.defined()) gshb.zero_();                                                         \
+        launch<scalar_t, CFG, EPL_OF<scalar_t, CFG, true>, true>(a);                              \
+      }                                                                                           \
     });                                                                                            \
     break;                                                                                         \
   }

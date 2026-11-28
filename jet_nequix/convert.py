@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from e3nn import o3
-from jet_mlip import neighbors, ops, reference, tables
+from jet_mlip import ase_graph, neighbors, ops, reference, tables
 
 from common.radial_table import DEFAULT_N, interpolate, make_radial_table
 
@@ -209,13 +209,35 @@ class RMSNorm(torch.nn.Module):
         return torch.cat(out, dim=-1)
 
 
+def _ase_graph(calc):
+    """The calculator's graph step (jet_mlip.ase_graph), made at its first call: the patched node_energies on the
+    graph's static buffers with the pair list's CSR, as jet_nequix.mliap runs it under LAMMPS."""
+    if getattr(calc, 'jet_graph', None) is None:
+        def step(node_energies):
+            def forward(g, vec):
+                global CSR
+                CSR = (g.s_rowptr, g.s_perm)
+                try:
+                    return node_energies(vec, g.s_types, g.s_ei[1], g.s_ei[0])
+                finally:
+                    CSR = None
+            return forward
+        fn = calc.model.node_energies
+        # compiled: inductor fuses the layer norm / gate glue between the fused convolutions (jet_nequix.mliap).
+        # H200, mp-1, 5632 atoms: 19.0 -> 17.9 ms per call for 8.4 s of compile
+        calc.jet_graph = ase_graph.AseGraph(step(fn), calc.device, calc.cutoff,
+                                            compile=lambda: step(torch.compile(fn, dynamic=False)))
+    return calc.jet_graph
+
+
 def _hook_ase():
     """ASE: the torch NequixCalculator of a patched model builds its graph on the GPU. Wraps
     NequixCalculator.calculate once: for a patched model on CUDA it is upstream's torch branch with
     jet_mlip.neighbors in place of preprocess_graph's matscipy list and the tensors made on the device (senders = j,
-    receivers = i, shifts fp32, the cell only when fully periodic, as upstream). Everything else (jax, an unpatched
-    model, use_compile before its first call, JET_ASE_GPU_NL=0) takes upstream's calculate. No-op when
-    nequix.calculator is not loaded (LAMMPS)."""
+    receivers = i, shifts fp32, the cell only when fully periodic, as upstream). From the second call in a row with
+    the same atom count on, the step is replayed from a CUDA graph (_ase_graph; JET_ASE_GRAPH=0: off) on the same fp32
+    edge vectors. Everything else (jax, an unpatched model, use_compile before its first call, JET_ASE_GPU_NL=0) takes
+    upstream's calculate. No-op when nequix.calculator is not loaded (LAMMPS)."""
     mod = sys.modules.get('nequix.calculator')
     if mod is None or getattr(mod.NequixCalculator.calculate, 'jet', False):
         return
@@ -231,8 +253,20 @@ def _hook_ase():
         dev, n = self.device, len(atoms)
         pos = torch.as_tensor(atoms.positions, device=dev)   # fp64 for the list, as matscipy gets it
         i, j, shift = neighbors.neighbor_list(pos, atoms.cell.array, atoms.pbc, self.cutoff)
-        species = torch.as_tensor(list(map(self.atom_indices.__getitem__, atoms.numbers.tolist())), device=dev)
+        if getattr(self, 'jet_z', None) is None or not np.array_equal(self.jet_z[0], atoms.numbers):   # 0.6 ms, 5632 atoms
+            self.jet_z = atoms.numbers.copy(), torch.as_tensor(
+                list(map(self.atom_indices.__getitem__, atoms.numbers.tolist())), device=dev)
+        species = self.jet_z[1]
         cell = torch.as_tensor(atoms.cell.array, dtype=torch.float32, device=dev)[None] if atoms.pbc.all() else None
+        if _ase_graph(self).due(n, i.numel()):
+            p = pos.float()
+            vec = p[j] - p[i] if cell is None else p[j] - p[i] + shift.float() @ cell[0]   # upstream's fp32 vectors
+            e, forces, w = self.jet_graph.compute(species, i, j, vec, pos)
+            self.results['energy'] = self.results['free_energy'] = e.sum().item()
+            self.results['forces'] = forces.float().cpu().numpy()
+            self.results['stress'] = None if cell is None else full_3x3_to_voigt_6_stress(
+                ((w + w.t()) / (2 * atoms.get_volume())).float().cpu().numpy())
+            return
         n_node, n_edge = (torch.tensor([k], dtype=torch.int32, device=dev) for k in (n, i.numel()))
         n_graph = torch.zeros(n, dtype=torch.int64, device=dev)
         e, forces, stress = self.model(species, pos.float(), shift.float(), torch.stack([j, i]), cell, n_node, n_edge,

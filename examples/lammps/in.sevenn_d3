@@ -9,9 +9,10 @@ boundary        p p p
 newton          on
 
 variable        model index 7net-0_jet.pt
+variable        d3 index pbe                # D3(BJ) functional of the model's training data: pbe, r2scan, ...
 read_data       ecemc_9520.data
 
-pair_style      hybrid/overlay jet/e3gnn jet/d3 9000 1600 damp_bj pbe
+pair_style      hybrid/overlay jet/e3gnn jet/d3 9000 1600 damp_bj ${d3}
 pair_coeff      * * jet/e3gnn ${model} C H O
 pair_coeff      * * jet/d3 C H O
 

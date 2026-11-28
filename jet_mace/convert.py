@@ -24,6 +24,14 @@ try:   # the mace patch whose first blocks leave skip_tp to the convolution (an 
     from mace.modules.macetp_hook import macetp_skip_done as _SKIP_HOOK
 except ImportError:
     _SKIP_HOOK = None
+try:   # the mace patch whose blocks leave `linear` to the convolution (v0.4.5's has no hook: linear would run twice)
+    from mace.modules.macetp_hook import macetp_lin_done as _LIN_HOOK
+except ImportError:
+    _LIN_HOOK = None
+try:   # ... and whose residual blocks leave their 1/avg_num_neighbors to the fused linear (an older patch divides again)
+    from mace.modules.macetp_hook import macetp_avg_done as _AVG_HOOK
+except ImportError:
+    _AVG_HOOK = None
 
 
 def linear_paths(lin):
@@ -85,6 +93,7 @@ class MaceTPConv(torch.nn.Module):
 
     lin = None   # (paths, dim_out) of the block's Linear when the convolution applies it (class default: older pickles)
     skip = False   # lin_w also holds the block's 1/avg_num_neighbors and skip_tp: one map per element (fold_skip)
+    avg = False   # lin_w also holds a residual block's 1/avg_num_neighbors (the patched block then skips its division)
     layer = 0   # index of the block (class default: older pickles, where every block gathers its own table index)
 
     def __init__(self, model, i, radial_table: int = DEFAULT_N, layout: str = 'mul_ir', species=None):
@@ -115,7 +124,8 @@ class MaceTPConv(torch.nn.Module):
             self._build_table(species)
         # the block's Linear after the convolution, on the kernel's mul_ir output (its irreps_in, the simplified irreps_mid,
         # is the same layout): one CUDA op instead of a layout copy of the layer's largest tensor, a GEMM per path and a cat
-        lw = linear_paths(block.linear) if isinstance(block.linear, o3.Linear) and self.n_table > 0 else None
+        lw = linear_paths(block.linear) if (isinstance(block.linear, o3.Linear) and self.n_table > 0
+                                            and _LIN_HOOK is not None) else None
         # layer 0 of the non-residual block types: linear, 1/avg_num_neighbors and skip_tp (irreps_out -> irreps_out, per
         # element) as one map per element. Layer 0 only: it sees the element of every row on several LAMMPS ranks too
         if lw is not None and i == 0 and _SKIP_HOOK is not None and type(block).__name__ in (
@@ -123,6 +133,9 @@ class MaceTPConv(torch.nn.Module):
             folded = fold_skip(block, *lw)
             if folded is not None:
                 lw, self.skip = folded, True
+        # residual block: 1/avg_num_neighbors into the linear's weights, instead of a division of the whole message per call
+        if lw is not None and _AVG_HOOK is not None and type(block).__name__ == 'RealAgnosticResidualInteractionBlock':
+            lw, self.avg = ((lw[0].double() / float(block.avg_num_neighbors)).to(lw[0].dtype), lw[1]), True
         if lw is not None:
             self.register_buffer('lin_w', lw[0].clone(), persistent=False)
             self.lin = (lw[1], block.linear.irreps_out.dim)   # paths, dim_out
@@ -214,7 +227,13 @@ class MaceTPConv(torch.nn.Module):
         out = outs[0] if self.n_split == 1 else self._merge(outs)
         if self.lin is None:
             return to_ir_mul(out, self.blocks_out) if self.ir_mul else out
+        if _LIN_HOOK is None:   # a model deployed with the linear folded, loaded where the mace patch is older
+            raise RuntimeError('jet_mace: this model applies the block linear in the convolution, which the installed '
+                               'mace patch does not know: re-apply it (python -m common.patch_tool mace)')
         species = one_hot = None
+        if self.avg and _AVG_HOOK is None:
+            raise RuntimeError('jet_mace: this model holds 1/avg_num_neighbors in the fused linear, which the installed mace '
+                               'patch does not know: re-apply it (python -m common.patch_tool mace)')
         if self.skip:
             if _SKIP_HOOK is None:
                 raise RuntimeError('jet_mace: this model applies skip_tp in the convolution, which the installed mace '
@@ -282,4 +301,6 @@ def patch_model(model, radial_table: int = DEFAULT_N, cueq: bool = False, specie
     density = ('RealAgnosticDensityInteractionBlock', 'RealAgnosticDensityResidualInteractionBlock')
     model.macetp_no_sh = radial_table > 0 and all(n in plain + density for n in names)
     model.macetp_all_fused = model.macetp_no_sh and all(n in plain for n in names)
+    from . import ase_graph   # ASE: the calculator replays its later calls from a CUDA graph
+    ase_graph.hook()
     return model.eval()   # the fused path is eval-only (mace_mp calculators hand over models in train mode); .train() for tp3

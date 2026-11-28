@@ -12,6 +12,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 
 namespace jet_mlip {
@@ -64,6 +65,7 @@ __global__ void csr_place_kernel(const int* __restrict__ dst, const int* __restr
 std::tuple<at::Tensor, at::Tensor> build_csr_masked(const at::Tensor& dst, const at::Tensor& mask, int64_t n_nodes) {
   TORCH_CHECK(dst.dim() == 1 && dst.is_cuda() && mask.is_cuda() && mask.numel() == dst.numel(),
               "build_csr_masked: dst, mask (E,) CUDA");
+  const c10::cuda::CUDAGuard guard(dst.device());   // the kernels below go to the current device's stream
   const auto d = dst.to(at::kInt).contiguous(), m = mask.to(at::kInt).contiguous();
   const int E = (int)d.numel(), n = (int)n_nodes;
   auto buf = at::zeros({n_nodes + 3}, d.options());

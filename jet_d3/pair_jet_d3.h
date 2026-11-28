@@ -52,6 +52,12 @@ namespace LAMMPS_NS {
         bool ortho;         // a is diagonal: fraction * h is the cartesian distance
     };
 
+    // Cell grid of the packed order, for the tile lists (see k_d3_tiles)
+    struct D3Grid {
+        int bins[3];        // cells per direction
+        float extmax[3];    // largest fractional half extent of a block per direction
+    };
+
     // Element tables on the device, indexed by LAMMPS type (1-based, stride ntypes+1).
     struct D3Tables {
         int np1;
@@ -101,6 +107,7 @@ namespace LAMMPS_NS {
         void gather_atoms();
         void set_cell(D3Cell&, double lat[3][3]);
         void load_atom_info(const double lat[3][3], const D3Cell &cell);
+        void build_tiles(const D3Cell &cell, int nib, const int *d_ib, const float *bounds);
         void launch(bool ev);
         void launch_multi_async(bool ev);
         void finish_multi(int, int);
@@ -126,6 +133,7 @@ namespace LAMMPS_NS {
         cudaStream_t stream = nullptr;     // all D3 GPU work runs and is waited for on this stream
         bool multi = false;                // comm->nprocs > 1: all N atoms replicated, images (see launch_multi_async)
         bool fp64_sums = false;            // pair sums in fp64 instead of float-float (see allocate())
+        bool scan_all = false;             // JET_D3_SCAN=1: no tile lists in large boxes either (debugging, see allocate())
 
         // per-atom device buffers (natoms: the local atoms on one rank, all atoms on several)
         int n_save = -1;
@@ -139,7 +147,17 @@ namespace LAMMPS_NS {
         std::vector<unsigned char> h_iloc; // multi: per packed atom, 1 if this rank owns it
         std::vector<int> h_iblocks;        // multi: packed blocks that hold at least one local atom
         int niblocks = 0;                  // multi: h_iblocks.size()
-        bool use_cells = false;            // prefilter per 32-atom block (see launch())
+        bool use_cells = false;            // large box: per-block bounds, pair kernels over the tile lists (see launch())
+        // tile lists (use_cells): the near block pairs of the pair kernels, rebuilt every step
+        D3Grid grid;
+        std::vector<int> h_bstart;         // per cell: the first block at home there (ncells + 1)
+        std::vector<long long> h_off;      // per i-role block: tile counts, then offsets (vdW, CN)
+        int *d_bstart = nullptr;
+        long long *d_off = nullptr;
+        size_t bstart_cap = 0, off_cap = 0;
+        int *d_tl[2] = {nullptr, nullptr};   // (I, J) per tile: vdW cut-off (forces), CN cut-off (cn, dcn)
+        long long tl_cap[2] = {0, 0};        // allocated tiles
+        long long ntl[2] = {0, 0};           // tiles of the current step
         double *d_cn = nullptr;
         double *d_dc6i = nullptr;          // = d_cn + n (one allocation)
         unsigned char *d_iloc = nullptr;   // multi: packed ownership flag

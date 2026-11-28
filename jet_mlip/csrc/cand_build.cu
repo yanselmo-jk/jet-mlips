@@ -8,6 +8,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 
 #include <cmath>
@@ -60,6 +61,7 @@ __global__ void cand_kernel(int ncenters, const double* __restrict__ x, const in
 std::tuple<at::Tensor, at::Tensor> cand_build(const at::Tensor& x, int64_t ncenters, double cut_sq) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kDouble && x.dim() == 2 && x.size(1) == 3 && x.is_contiguous(),
               "x: (nall, 3) float64 contiguous CUDA");
+  const c10::cuda::CUDAGuard guard(x.device());   // the kernels below go to the current device's stream
   TORCH_CHECK(ncenters >= 0 && ncenters <= x.size(0) && cut_sq > 0, "0 <= ncenters <= nall, cut_sq > 0");
   const auto i32 = x.options().dtype(at::kInt);
   at::Tensor ptr = at::zeros({ncenters + 1}, i32);
