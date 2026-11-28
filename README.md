@@ -76,7 +76,15 @@ python -m common.patch_tool mace     # MACE only
 Nothing in JET needs the network: give local files instead of names and downloads. Step by step:
 [docs/offline-installation.md](docs/offline-installation.md).
 
-## 3. Use
+## 3. Check and test
+
+```bash
+python -m pytest tests/<family>_jet              # in that family's env, GPU
+python -m pytest jet_mlip/tests                  # kernel and shared LAMMPS wrapper
+python -m pytest tests/test_jet_d3_ase.py        # ASE D3 calculator (if jet_d3/ase is built)
+```
+
+## 4. Use
 
 ### ASE
 
@@ -216,14 +224,6 @@ mpirun -np N lmp -k on g N -sf kk -pk kokkos newton on neigh half gpu/aware off 
 
 Worth it from ~50k atoms per GPU (3 H200: 360k atoms 1.9-2.2x faster).
 
-## 4. Check and test
-
-```bash
-python -m pytest tests/<family>_jet              # in that family's env, GPU
-python -m pytest jet_mlip/tests                  # kernel and shared LAMMPS wrapper
-python -m pytest tests/test_jet_d3_ase.py        # ASE D3 calculator (if jet_d3/ase is built)
-```
-
 ## 5. Update
 
 1. Get the new version, in the same folder or as a new one:
@@ -241,7 +241,7 @@ python -m pytest tests/test_jet_d3_ase.py        # ASE D3 calculator (if jet_d3/
    ```
 
 3. Repeat section 2 (rebuild `jet_mlip`, reinstall `.`, re-apply the package patch, and rebuild `jet_d3/ase` if used),
-   rebuild LAMMPS (`bash lammps/build_lammps.sh`, section 3), and deploy your models again.
+   rebuild LAMMPS (`bash lammps/build_lammps.sh`, section 4), and deploy your models again.
 
 ## Citation
 

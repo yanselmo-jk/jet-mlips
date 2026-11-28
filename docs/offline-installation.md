@@ -66,7 +66,7 @@ machine with the same OS and CUDA driver generation, then build there (the kerne
 
    Every supported model with its deploy line: [examples/lammps/lammps_md.ipynb](../examples/lammps/lammps_md.ipynb) (replace names with local files; for SevenNet `jet/e3gnn`, use `sevenn get_model <model> --enable_jet -o model.pt`).
 
-5. Run ([README.md](../README.md) section 3):
+5. Run ([README.md](../README.md) section 4):
 
    ```lammps
    pair_style jet/mliap medium_jet.pt     # = mliap unified medium_jet.pt 0, KOKKOS only

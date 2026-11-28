@@ -22,12 +22,11 @@ if importlib.util.find_spec('GGNN') is None:
     pytest.skip('GGNN not installed', allow_module_level=True)
 CKPTS = {
     'v1': os.environ.get('EQUFLASH_CKPT'),
-    'v2': os.environ.get('EQUFLASH2_CKPT')
-          or str(Path.home() / 'mlip-accel/models/equflash/equflashv2_oam.pt'),
+    'v2': os.environ.get('EQUFLASH2_CKPT'),
 }
 CKPTS = {k: v for k, v in CKPTS.items() if v and Path(v).exists()}
 if not CKPTS:
-    pytest.skip('EQUFLASH_CKPT / EQUFLASH2_CKPT not set', allow_module_level=True)
+    pytest.skip('EQUFLASH_CKPT / EQUFLASH2_CKPT not set or missing', allow_module_level=True)
 
 from jet_equflash import convert  # noqa: E402
 

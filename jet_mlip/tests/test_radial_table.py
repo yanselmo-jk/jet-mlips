@@ -24,7 +24,7 @@ if not jet_mlip.is_available() or not ops.has_op('conv_fused'):
 DEV = 'cuda'
 NANO_L1 = CFGS[1]
 BOX = os.environ.get('JET_BOX5K', '')   # box5k: 5568-atom electrolyte, LAMMPS data file (atomic style)
-T32C = '/home/yanselmo/0_projects-material/3_mlip_distill/work/smoke/distill/T32c/train_mm/checkpoint_best.pth'
+T32C = os.environ.get('JET_TEST_T32C', '')   # optional distilled student checkpoint (modal 'dft')
 MODELS = {'nano': ('7net-nano-5.5', None), '7net-0': ('7net-0', None), 'T32c': (T32C, 'dft')}
 NS = [1024, 2048, 4096, 8192]
 Z = {1: 3, 2: 6, 3: 1, 4: 8, 5: 7, 6: 9, 7: 16, 8: 15, 9: 5}   # box5k type -> Z
@@ -189,7 +189,7 @@ def test_model_forces_table(name, box):
     "Radial table" has the full N sweep). Set JET_TABLE_NS to re-measure that sweep."""
     model, modal = MODELS[name]
     if not (model.startswith('7net') or os.path.exists(model)):
-        pytest.skip(f'{model} missing')
+        pytest.skip(f'{name}: set JET_TEST_T32C to the checkpoint' if not model else f'{model} missing')
     try:
         _, f_e3nn, ms0 = _energy_force_ms(model, box, None, modal)
     except RuntimeError:   # e3nn 7net-0 does not fit in 12 GB on the 5568-atom box

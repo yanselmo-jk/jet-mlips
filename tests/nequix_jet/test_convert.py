@@ -5,6 +5,7 @@ No jax: `nequix/__init__.py` imports it, so the torch implementation is loaded t
 `jet_nequix.convert.load_model` and `preprocess_graph` is copied from nequix/data.py (see below)."""
 import copy
 import importlib.util
+import os
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +21,7 @@ from e3nn import o3  # noqa: E402
 from jet_nequix import convert  # noqa: E402
 from jet_nequix.convert import bessel_basis, load_model, polynomial_cutoff  # noqa: E402
 
-MODELS = Path(__file__).resolve().parents[2] / 'work/scratch/nequix_models'
+MODELS = os.environ.get('NEQUIX_DIR')   # folder holding nequix-mp-1.pt
 
 
 def structures():
@@ -46,7 +47,9 @@ def fp64_default():
 
 @pytest.fixture(scope='module')
 def model(fp64_default):
-    path = MODELS / 'nequix-mp-1.pt'
+    if not MODELS:
+        pytest.skip('NEQUIX_DIR not set')
+    path = Path(MODELS) / 'nequix-mp-1.pt'
     if not path.exists():
         pytest.skip(f'{path} not present')
     m, config = load_model(str(path), False)
